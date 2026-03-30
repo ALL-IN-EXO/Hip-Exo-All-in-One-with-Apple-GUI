@@ -12,7 +12,7 @@ set -e
 
 REMOTE="origin"
 MAIN_BRANCH="main"
-REPO_URL="https://github.com/ALL-IN-EXO/Hip-Exo-All-in-One-with-Apple-"
+REPO_URL="https://github.com/ALL-IN-EXO/Hip-Exo-All-in-One-with-Apple-GUI"
 
 # ── 参数检查 ──────────────────────────────────────────────
 if [ $# -lt 2 ]; then
