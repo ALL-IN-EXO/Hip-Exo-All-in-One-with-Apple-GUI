@@ -9,7 +9,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from filter_library import IIRFilter
+from filter_library import IIRFilter, compute_iir_coeffs
+
+# Default torque filter: 5Hz 2nd-order Butterworth at 100Hz sample rate
+_DEFAULT_B5, _DEFAULT_A5 = compute_iir_coeffs(5.0, 'butterworth', 100.0, 2)
 
 
 class LSTMNetworkLegDcp(nn.Module):
@@ -19,14 +22,15 @@ class LSTMNetworkLegDcp(nn.Module):
                  kd=1.0,
                  # ====== 网络结构 ======
                  n_input=2, n_layer_1=256, num_layers=2, n_output=1,
-                 # ====== torque前滤波器系数 ======
+                 # ====== torque前滤波器系数 (默认 5Hz 2nd-order Butterworth @100Hz) ======
                  # 3Hz:  b=[0.0006, 0.0012, 0.0006], a=[1.0, -1.9289, 0.9314]
+                 # 5Hz:  computed by compute_iir_coeffs(5.0,'butterworth',100,2)
                  # 6Hz:  b=[0.0055, 0.0111, 0.0055], a=[1.0, -1.7786, 0.8008]
                  # 12Hz: b=[0.0461, 0.0923, 0.0461], a=[1.0, -1.3073, 0.4918]
                  # 15Hz: b=[0.0675, 0.1349, 0.0675], a=[1.0, -1.1430, 0.4128]
                  # 20Hz: b=[0.0913, 0.1826, 0.0913], a=[1.0, -0.9824, 0.3477]
-                 b=np.array([0.0913, 0.1826, 0.0913]),
-                 a=np.array([1.0, -0.9824, 0.3477])
+                 b=_DEFAULT_B5,
+                 a=_DEFAULT_A5
                  ):
         super(LSTMNetworkLegDcp, self).__init__()
 

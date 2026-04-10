@@ -10,9 +10,9 @@
  *   3) Teensy 读取 RPi 返回的扭矩作为输出
  *
  * Serial8 协议:
- *   Teensy→Pi: [0xA5 0x5A] [32] [0x01] [Lpos(4B)] [Rpos(4B)]
- *              [Lvel(4B)] [Rvel(4B)] [exo_delay(4B)] [logtag(11B)] [cksum(1B)]
- *              总长 = 36 bytes
+ *   Teensy→Pi: [0xA5 0x5A] [28] [0x01] [Lpos(4B)] [Rpos(4B)]
+ *              [Lvel(4B)] [Rvel(4B)] [logtag(11B)] [cksum(1B)]
+ *              总长 = 32 bytes
  *
  *   Pi→Teensy: [0xAA 0x55] [tauL(4B)] [tauR(4B)] [Lp(4B)] [Ld(4B)]
  *              [Rp(4B)] [Rd(4B)]
@@ -45,7 +45,6 @@ public:
 
   // 外部可设置的 logtag (用于转发给 RPi)
   char logtag[11];
-  float exo_delay;
 
   // RPi 上行状态 (供 BLE 透传给 GUI)
   uint8_t rpi_status_buf[40];

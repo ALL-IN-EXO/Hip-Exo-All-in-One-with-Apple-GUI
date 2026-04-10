@@ -1,0 +1,181 @@
+# RL Auto Delay Optimization Design
+
+## 1. 目的与范围
+
+本文档描述 `RPi_Unified/RL_controller_torch.py` 中 RL 自动 Delay 调参功能的设计思路与实现细节，目标是：
+
+- 在不改网络结构的前提下，通过运行时 `delay_ms` 优化助力时序
+- 优先提升正功占比（`power_ratio`）
+- 在满足 `power_ratio >= 0.95` 后，继续提升单位时间正功（`pos_per_s`）
+- 只在“有效运动”状态下调参，避免静止/噪声导致误调
+
+本功能仅作用于 RL 通道（Teensy↔RPi↔GUI 的 RL 透传路径）。
+
+---
+
+## 2. 关键结论（先说结论）
+
+1. `delay` 不直接改变扭矩幅值，只改变扭矩与关节速度的相位关系。  
+2. 在固定 `runtime_scale` 下，`tau` 序列幅值本身不变，但 `P = tau * omega` 的正负分布会变化。  
+3. 因此，调 `delay` 可以显著改变 `power_ratio` 与 `pos_per_s`。  
+4. 仅最大化 `power_ratio` 有“假优解”风险（例如总体功率很小也能比值很高），所以采用双目标：
+   - 主目标：`ratio >= 0.95`
+   - 次目标：在满足主目标后最大化 `pos_per_s`
+
+---
+
+## 3. 实时功率指标定义
+
+对每条腿在窗口内计算：
+
+- 即时功率：`power(t) = tau(t) * vel(t) * pi/180`（`vel` 单位 deg/s，转 rad/s）
+- 正功：`W+ = sum(power > 0) / CTRL_HZ`
+- 负功绝对值：`|W-| = sum(abs(power < 0)) / CTRL_HZ`
+- 正功占比：`ratio = W+ / (W+ + |W-|)`
+- 每秒正功：`pos_per_s = W+ / T_total`
+- 每秒负功：`neg_per_s = -|W-| / T_total`
+
+双腿合成时：
+
+- `ratio = 0.5 * (ratio_L + ratio_R)`
+- `pos_per_s = pos_per_s_L + pos_per_s_R`
+- `neg_per_s = neg_per_s_L + neg_per_s_R`
+
+对应代码：
+
+- `compute_leg_power_metrics(...)`
+- `evaluate_delay_candidate(...)`
+
+---
+
+## 4. 窗口策略（按步态周期自适应）
+
+为了兼顾稳定性与响应速度，窗口长度自适应：
+
+1. 从左右髋角历史估计步频（自相关法）：`estimate_gait_freq_hz(...)`
+2. 按 `AUTO_WINDOW_CYCLES / gait_freq_hz` 得到目标窗口
+3. 限制在 `[AUTO_WINDOW_MIN_S, AUTO_WINDOW_MAX_S]`（默认 4~12s）
+4. 若步频不可用，回退到 `AUTO_WINDOW_FALLBACK_S`（默认 8s）
+
+优点：
+
+- 走慢时窗口自动更长，抗噪更好
+- 走快时窗口自动变短，响应更快
+
+---
+
+## 5. 有效运动门控（只在有效运动时调参）
+
+每次评估先判定 `auto_motion_valid`：
+
+- `mean_abs_vel >= AUTO_VALID_MIN_MEAN_ABS_VEL_DPS`
+- `abs_power_per_s >= AUTO_VALID_MIN_ABS_POWER_W`
+
+只有 `auto_motion_valid == True` 才允许改 `delay`。  
+这可避免静止、摆腿幅度过小、信号噪声主导时的错误调参。
+
+---
+
+## 6. Delay 优化策略
+
+执行节奏：
+
+- 控制主环保持 100Hz（推理与下发不变）
+- 自动调参在 1Hz 侧环执行（`AUTO_UPDATE_INTERVAL_S = 1.0`）
+
+每次 1Hz 评估流程：
+
+1. 计算“当前 delay”指标（当前 `ratio/pos_per_s/...`）
+2. 若运动有效且满足 `dwell` 时间（默认 2s），扫描候选 delay：
+   - 区间：`current_delay ± 100ms`
+   - 步长：`10ms`
+3. 对每个候选 delay 复算窗口指标
+4. 选优规则 `pick_best_delay_candidate(...)`：
+   - 优先候选集 `ratio >= 0.95`
+   - 在该集合内最大化 `pos_per_s`
+   - 若无人满足 0.95，则回退到全局最大 `ratio`
+5. 为防抖与突变：
+   - 每次实际改变量限制为 `<= 20ms`
+   - 变化后重置 dwell 计时
+
+这是一种“局部扫描 + 约束步进”的在线优化，不阻塞 100Hz 控制链路。
+
+---
+
+## 7. 通信与 GUI 交互
+
+### 7.1 GUI -> RPi（40B passthrough）
+
+- `payload[20]` bit0: `auto_delay_enable`
+
+### 7.2 RPi -> GUI（AA56 状态 40B）
+
+新增字段：
+
+- `[20]` bit0: auto enable, bit1: motion valid
+- `[24..27]` `power_ratio` (float32)
+- `[28..31]` `pos_per_s` (float32)
+- `[32..35]` `neg_per_s` (float32)
+- `[36..39]` `best_delay_ms` (float32)
+
+GUI RL 面板增加：
+
+- `Auto Delay` 开关
+- 实时状态行：`ratio / +P/s / -P/s / best delay / motion valid`
+
+---
+
+## 8. 为什么这个方案可行
+
+1. 物理上可解释：目标直接来自 `tau` 与 `omega` 的功率耦合。  
+2. 计算量可控：1Hz 扫描约 21 个候选（±100ms, 10ms step），在 Pi5 上负担很小。  
+3. 工程上安全：只在有效运动调参 + dwell + 限步长，不会高频抖动。  
+4. 可观测：GUI 可实时看到当前指标和建议 delay，便于人工监督。
+
+---
+
+## 9. 参数建议（当前默认）
+
+- `AUTO_TARGET_RATIO = 0.95`
+- `AUTO_UPDATE_INTERVAL_S = 1.0`
+- `AUTO_DWELL_S = 2.0`
+- `AUTO_SCAN_HALF_RANGE_MS = 100.0`
+- `AUTO_SCAN_STEP_MS = 10.0`
+- `AUTO_MAX_STEP_MS = 20.0`
+- 窗口：`4~12s`（fallback 8s）
+
+如需更稳：
+
+- 增大 `AUTO_DWELL_S`（例如 3~4s）
+- 增大窗口下限（例如 5~6s）
+
+如需更快：
+
+- 缩小 dwell 或缩小窗口上限
+- 但会增加误调概率
+
+---
+
+## 10. 已知边界与后续增强
+
+当前边界：
+
+- 仅优化 delay，不自动改 `runtime_scale`
+- 指标基于近窗口统计，不是长期全局最优
+- 门控阈值目前在代码常量中配置
+
+可选增强：
+
+1. 将门控阈值和调参参数暴露到 GUI
+2. 增加“连续 N 次有效窗口才允许调参”
+3. 增加滞回区：若 `ratio` 在 0.95 附近，减少来回切换
+4. 将左右腿目标分开，支持非对称 gait
+
+---
+
+## 11. 代码定位
+
+- 自动调参与指标核心：`RPi_Unified/RL_controller_torch.py`
+- GUI 开关与显示：`GUI_RL_update/GUI.py`
+- 协议透传：`All_in_one_hip_controller_RL_update/Controller_RL.h/.cpp`
+

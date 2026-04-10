@@ -8,7 +8,6 @@
 Controller_RL::Controller_RL() {
   reset();
   memset(logtag, 0, sizeof(logtag));
-  exo_delay = 0.0f;
   memset(rpi_status_buf, 0, sizeof(rpi_status_buf));
   rpi_status_valid = false;
 }
@@ -44,21 +43,20 @@ uint8_t Controller_RL::cksum8(const uint8_t* p, size_t n) {
 
 void Controller_RL::send_imu_to_pi(float Lpos_rad, float Rpos_rad,
                                     float Lvel, float Rvel) {
-  // 36 bytes: 4(header) + 31(payload) + 1(checksum)
-  uint8_t pkt[36];
+  // 32 bytes: 4(header) + 27(payload) + 1(checksum)
+  uint8_t pkt[32];
   pkt[0] = 0xA5;
   pkt[1] = 0x5A;
-  pkt[2] = 32;      // TYPE(1) + payload(31)
+  pkt[2] = 28;      // TYPE(1) + payload(27)
   pkt[3] = 0x01;    // IMU packet type
 
   memcpy(&pkt[4],  &Lpos_rad, 4);
   memcpy(&pkt[8],  &Rpos_rad, 4);
   memcpy(&pkt[12], &Lvel,     4);
   memcpy(&pkt[16], &Rvel,     4);
-  memcpy(&pkt[20], &exo_delay, 4);
-  memcpy(&pkt[24], logtag,    11);
+  memcpy(&pkt[20], logtag,    11);
 
-  pkt[35] = cksum8(&pkt[3], 32);
+  pkt[31] = cksum8(&pkt[3], 28);
   PI_SERIAL.write(pkt, sizeof(pkt));
 }
 

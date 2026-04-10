@@ -5,7 +5,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-（开发中的变更暂时写在这里）
+### Changed
+- Serial8 IMU 帧去除 `exo_delay` 字段: Teensy→RPi 从 `5×float32 + 11B logtag` 改为 `4×float32 + 11B logtag`，总帧长由 36B 改为 32B
+- `RPi_Unified/RL_controller_torch.py` 同步更新 IMU 解析逻辑 (TYPE=0x01 payload 从 31B 改为 27B)
+- RL 延迟统一使用运行时参数 `runtime_delay_ms`（GUI passthrough 下发），不再读取包内 `exo_delay`
+- RL 自动延迟优化（可开关）:
+  - RPi 新增实时功率指标计算（`power_ratio` / `pos_per_s` / `neg_per_s`）
+  - 仅在“有效运动”窗口内执行 1Hz 延迟调参（局部扫描 + 步长限制 + dwell 防抖）
+  - GUI RL 面板新增 `Auto Delay` 开关，并显示 RPi 回传的实时指标与推荐延迟
+  - GUI 的左右 `Power Sign` 子图标题增加 RPi 回传的 `+Ratio(%)` 与 `Auto/motion` 状态
+  - GUI 优化：`Auto Delay` 打开后锁定 `Torque Delay` 输入框，并实时同步显示 RPi 当前生效的 delay
+  - GUI 优化：`Power Sign` 子图右侧新增图内 overlay 指标（`+Ratio(%)` + `Auto/motion`），替代标题塞字
+
+### Fixed
+- RL 自动延迟 motion 门控解耦 `runtime_scale`：评估内部固定用 scale=1.0，避免 GUI 把 scale 调小时 `abs_power_per_s` 永远达不到阈值导致 auto 失效；显示的 `pos_per_s`/`neg_per_s` 在回传前再乘 scale，保持实际功率语义
+- RL 自动延迟新增冷启动 dwell：检测到 `auto_delay_enable` False→True 上升沿时重置 `auto_last_change_ts`，首轮扫描需等满 `AUTO_DWELL_S` 让 history 先填充
+- GUI cfg 到达时清空 `hist_tau_src/vel/ang` 缓冲并重置 `auto_last_eval_ts`，避免滤波器/scale/delay 切换后窗口混入旧配置数据做评估
+- RL 自动延迟 dwell 改为与自适应窗口挂钩：`effective_dwell = max(AUTO_DWELL_S, auto_window_s + 1.0)`，每次改 delay 后必须等到评估窗口 100% 为新 delay 稳态数据才允许下一次调整，避免旧 delay 的物理响应污染评估
+
+### Documentation
+- 更新 `Docs/SYSTEM_ARCHITECTURE.md` 中 Serial8 帧长与 IMU 帧定义
+- 更新 `RPi_Unified/README.md` 中 Teensy→Pi IMU 帧字段说明
+- 新增 `Docs/RL_AUTO_DELAY_OPTIMIZATION.md`：自动 delay 调参的设计思路、功率指标定义、门控条件与优化流程
 
 ---
 

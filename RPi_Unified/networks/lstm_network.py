@@ -62,12 +62,17 @@ class LSTMNetwork(nn.Module):
         p_out = p_out[:, -1, :]
         p_out = torch.relu(p_out)
         p_out = self.p_fc3(p_out)
-        return p_out.detach().numpy().squeeze()
+        return p_out.detach().numpy().reshape(-1)  # always 1-d, guards against 0-d scalar
 
     def get_predicted_action(self, L_IMU_angle, R_IMU_angle, L_IMU_Vel, R_IMU_Vel):
         state = np.array([L_IMU_angle, R_IMU_angle, L_IMU_Vel, R_IMU_Vel])
         state_tensor = torch.tensor(state[np.newaxis, :], dtype=torch.float32)
         action = self.forward(state_tensor)
+        # Guard: if model has only 1 output (e.g. legdcp weights loaded into LSTMNetwork),
+        # use the same value for both legs
+        if action.size < 2:
+            v = float(action[0])
+            return v, v
         return action[0], action[1]
 
     def generate_assistance(self, L_IMU_angle, R_IMU_angle, L_IMU_Vel, R_IMU_Vel):
