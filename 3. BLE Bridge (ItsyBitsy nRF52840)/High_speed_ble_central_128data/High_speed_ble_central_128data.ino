@@ -26,7 +26,7 @@ uint32_t rx_count = 0;
 uint8_t data_rs232_rx[247] = { 0 };
 uint8_t data_ble_rx[247] = { 0 };
 uint16_t serial_frame_idx = 0;
-const char kTargetName[] = "Juncheng";
+const char kTargetName[] = "Shutong";
 
 uint32_t gui_in_bytes_total = 0;
 uint32_t gui_in_bytes_sec = 0;

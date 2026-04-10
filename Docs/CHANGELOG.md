@@ -5,6 +5,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `tools/run_rl_on_pi.sh`: 一键 SSH 启动 Pi5 上的 `RL_controller_torch.py`，复用 `rpi_sync.py` 的默认连接参数（host/user/password/remote_dir），支持命令行或交互菜单选择 `--nn` 参数（`dnn` / `lstm` / `lstm_leg_dcp` / `lstm_pd`），额外参数会透传给远端 python 脚本
+
 ### Changed
 - Serial8 IMU 帧去除 `exo_delay` 字段: Teensy→RPi 从 `5×float32 + 11B logtag` 改为 `4×float32 + 11B logtag`，总帧长由 36B 改为 32B
 - `RPi_Unified/RL_controller_torch.py` 同步更新 IMU 解析逻辑 (TYPE=0x01 payload 从 31B 改为 27B)
@@ -41,6 +44,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - GUI cfg 到达时清空 `hist_tau_src/vel/ang` 缓冲并重置 `auto_last_eval_ts`，避免滤波器/scale/delay 切换后窗口混入旧配置数据做评估
 - RL 自动延迟 dwell 增加 `AUTO_DWELL_ADAPTIVE` 开关：`True` 走自适应 `max(AUTO_DWELL_S, auto_window_s + 1.0)` 等窗口 100% 新数据，`False`（默认）固定 `AUTO_DWELL_S`；常量默认值从 2.0s 提高到 3.0s
 - GUI `Power Sign` overlay 明确标注：`+Ratio` 标为 `(L+R avg)`、功率数值新增第二行 `+P / -P (L+R total)`，消除"两条 strip 显示同一个均值"时的歧义；底部 `Auto Delay(RPi)` 状态行同步补齐标注
+- `RPi_Unified/RL_controller_torch.py` 首次启动时若 `./output/` 目录不存在会在写 CSV 前报错；新增 `os.makedirs('./output', exist_ok=True)` 自动创建目录
 
 ### Documentation
 - 更新 `Docs/SYSTEM_ARCHITECTURE.md` 中 Serial8 帧长与 IMU 帧定义

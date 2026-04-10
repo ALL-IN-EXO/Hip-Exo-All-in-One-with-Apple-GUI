@@ -90,7 +90,7 @@ void setup(void)
 
   Bluefruit.begin();
   Bluefruit.setTxPower(4);    // Check bluefruit.h for supported values
-  Bluefruit.setName("Juncheng");         // 设置名称
+  Bluefruit.setName("Shutong");         // 设置名称
   Bluefruit.Periph.setConnectCallback(connect_callback);
   Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
   Bluefruit.Periph.setConnInterval(6, 12); // 7.5 - 15 ms
