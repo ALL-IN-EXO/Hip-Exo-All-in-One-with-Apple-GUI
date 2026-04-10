@@ -563,6 +563,15 @@ class MainWindow(QWidget):
         self._last_gait_freq = None
         self._pwr_band_scale_right = 5.0
         self._pwr_band_scale_left = 5.0
+        # Display-only power deglitch guards (do NOT affect controller torque path).
+        # Purpose: suppress occasional IMU velocity spikes from creating unrealistic
+        # one-frame power bursts on GUI.
+        self._pwr_vel_abs_limit_dps = 900.0
+        self._pwr_vel_jump_limit_dps = 500.0
+        self._pwr_vel_good_L = 0.0
+        self._pwr_vel_good_R = 0.0
+        self._pwr_glitch_count_L = 0
+        self._pwr_glitch_count_R = 0
         self._rl_cfg_tx_seq = 0
         self._rl_last_tx_ts = 0.0
 
@@ -884,8 +893,16 @@ class MainWindow(QWidget):
         self.sb_rl_torque_delay = make_dspin(0.0, 0.0, 1000.0, 10.0, 0,
                                              "RL torque delay absolute (ms), 0~1000")
         self.sb_rl_torque_delay.valueChanged.disconnect(self._tx_params)
+        self.lbl_rl_torque_delay_auto = QLabel("L=--.- ms | R=--.- ms")
+        self.lbl_rl_torque_delay_auto.setStyleSheet(
+            f"color:{C.text2}; font-size:13px; background:transparent;"
+        )
+        self.lbl_rl_torque_delay_auto.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.rl_delay_stack = QStackedWidget()
+        self.rl_delay_stack.addWidget(self.sb_rl_torque_delay)      # index 0: manual input
+        self.rl_delay_stack.addWidget(self.lbl_rl_torque_delay_auto)  # index 1: auto display
         rl_lay.addWidget(QLabel("Torque Delay (ms)"), 3, 0)
-        rl_lay.addWidget(self.sb_rl_torque_delay, 3, 1)
+        rl_lay.addWidget(self.rl_delay_stack, 3, 1)
 
         # Row 4: Filter Type
         self.cmb_rl_filter_type = QComboBox()
@@ -1338,9 +1355,20 @@ class MainWindow(QWidget):
         self.sb_rl_torque_delay.setValue(delay)
         self.sb_rl_torque_delay.blockSignals(False)
 
+    def _set_rl_delay_pair_text(self):
+        if not hasattr(self, "lbl_rl_torque_delay_auto"):
+            return
+        if self._rpi_status_valid:
+            txt = f"L={self._rpi_delay_ms_L:.1f} ms | R={self._rpi_delay_ms_R:.1f} ms"
+        else:
+            txt = "L=--.- ms | R=--.- ms"
+        self.lbl_rl_torque_delay_auto.setText(txt)
+
     def _update_rl_delay_input_mode(self):
         """Auto Delay ON: lock delay input and mirror active delay from RPi status."""
-        if not hasattr(self, "sb_rl_torque_delay") or not hasattr(self, "chk_rl_auto_delay"):
+        if (not hasattr(self, "sb_rl_torque_delay") or
+                not hasattr(self, "chk_rl_auto_delay") or
+                not hasattr(self, "rl_delay_stack")):
             return
         auto_on = self.chk_rl_auto_delay.isChecked()
         self.sb_rl_torque_delay.setEnabled(not auto_on)
@@ -1348,8 +1376,11 @@ class MainWindow(QWidget):
             self.sb_rl_torque_delay.setToolTip("Auto Delay ON: follows RPi active runtime delay.")
             if self._rpi_status_valid:
                 self._set_rl_delay_spinbox_value(self._rpi_delay_ms)
+            self._set_rl_delay_pair_text()
+            self.rl_delay_stack.setCurrentIndex(1)
         else:
             self.sb_rl_torque_delay.setToolTip("RL torque delay absolute (ms), 0~1000")
+            self.rl_delay_stack.setCurrentIndex(0)
 
     def _update_rl_panel_for_nn_type(self):
         """根据 RPi 报告的 nn_type 调整 RL 面板控件可见性"""
@@ -1672,6 +1703,21 @@ class MainWindow(QWidget):
         self._prev_L_angle = 0.0
         self._prev_R_angle = 0.0
         self._prev_wall_time = 0.0
+        self._pwr_vel_good_L = 0.0
+        self._pwr_vel_good_R = 0.0
+        self._pwr_glitch_count_L = 0
+        self._pwr_glitch_count_R = 0
+
+    def _sanitize_power_velocity(self, vel_raw: float, prev_good: float):
+        """Display-only velocity guard for power calculation."""
+        v = float(vel_raw)
+        if not isfinite(v):
+            return float(prev_good), False
+        if abs(v) > float(self._pwr_vel_abs_limit_dps):
+            return float(prev_good), False
+        if abs(v - float(prev_good)) > float(self._pwr_vel_jump_limit_dps):
+            return float(prev_good), False
+        return v, True
 
     def _on_win_size_changed(self, val):
         self.win_size = val
@@ -2251,36 +2297,34 @@ class MainWindow(QWidget):
             if not valid:
                 line1 = f"+Ratio --.-% | WAIT"
                 line2 = f"+P --.-- W  -P --.-- W"
-                line3 = f"delay --.- ms"
-                return line1, line2, line3
+                return line1, line2
             ratio_clamped = max(0.0, min(1.0, float(ratio)))
             ratio_pct = ratio_clamped * 100.0
             auto_txt = "ON" if self._rpi_auto_delay_enable else "OFF"
             motion_txt = "VALID" if motion_valid else "HOLD"
             line1 = f"+Ratio {ratio_pct:.1f}% | {auto_txt}/{motion_txt}"
             line2 = f"+P {float(pos_w):+.2f} W  -P {float(neg_w):+.2f} W"
-            line3 = f"delay {float(delay_ms):.1f} ms"
-            return line1, line2, line3
+            return line1, line2
 
         valid = bool(self._rpi_status_valid)
-        l1_L, l2_L, l3_L = _format_leg_overlay(
+        l1_L, l2_L = _format_leg_overlay(
             "L", self._rpi_power_ratio_L, self._rpi_pos_per_s_L,
             self._rpi_neg_per_s_L, self._rpi_delay_ms_L,
             self._rpi_auto_motion_valid_L, valid,
         )
-        l1_R, l2_R, l3_R = _format_leg_overlay(
+        l1_R, l2_R = _format_leg_overlay(
             "R", self._rpi_power_ratio_R, self._rpi_pos_per_s_R,
             self._rpi_neg_per_s_R, self._rpi_delay_ms_R,
             self._rpi_auto_motion_valid_R, valid,
         )
 
         overlay_tmpl = (
-            f"<div style='color:{{col}}; font-size:15pt; font-weight:600; "
+            f"<div style='color:{{col}}; font-size:13pt; font-weight:600; "
             f"background:rgba(0,0,0,0); text-align:right;'>"
-            f"{{l1}}<br/>{{l2}}<br/>{{l3}}</div>"
+            f"{{l1}}<br/>{{l2}}</div>"
         )
-        html_L = overlay_tmpl.format(col=C.purple, l1=l1_L, l2=l2_L, l3=l3_L)
-        html_R = overlay_tmpl.format(col=C.purple, l1=l1_R, l2=l2_R, l3=l3_R)
+        html_L = overlay_tmpl.format(col=C.purple, l1=l1_L, l2=l2_L)
+        html_R = overlay_tmpl.format(col=C.purple, l1=l1_R, l2=l2_R)
 
         if hasattr(self, 'pwr_strip_left_overlay'):
             self.pwr_strip_left_overlay.setHtml(html_L)
@@ -2302,7 +2346,7 @@ class MainWindow(QWidget):
         dx = max(1e-6, float(x1 - x0))
         dy = max(1e-6, float(y1 - y0))
         x = x1 - 0.012 * dx
-        y = y1 - 0.02 * dy
+        y = y1 - 0.005 * dy
         overlay_item.setPos(x, y)
 
     def _update_tag_panel(self, now=None):
@@ -2776,8 +2820,19 @@ class MainWindow(QWidget):
         # Use command torque for all brands for consistent sign and behavior.
         L_tau_for_pwr = L_tau_d
         R_tau_for_pwr = R_tau_d
-        L_pwr = L_vel * L_tau_for_pwr * (pi / 180.0)
-        R_pwr = R_vel * R_tau_for_pwr * (pi / 180.0)
+        # Guard display power against occasional one-frame IMU velocity glitches.
+        L_vel_pwr, okL = self._sanitize_power_velocity(L_vel, self._pwr_vel_good_L)
+        R_vel_pwr, okR = self._sanitize_power_velocity(R_vel, self._pwr_vel_good_R)
+        if okL:
+            self._pwr_vel_good_L = L_vel_pwr
+        else:
+            self._pwr_glitch_count_L += 1
+        if okR:
+            self._pwr_vel_good_R = R_vel_pwr
+        else:
+            self._pwr_glitch_count_R += 1
+        L_pwr = L_vel_pwr * L_tau_for_pwr * (pi / 180.0)
+        R_pwr = R_vel_pwr * R_tau_for_pwr * (pi / 180.0)
         self.L_pwr_buf.append(L_pwr * vL)
         self.R_pwr_buf.append(R_pwr * vR)
 

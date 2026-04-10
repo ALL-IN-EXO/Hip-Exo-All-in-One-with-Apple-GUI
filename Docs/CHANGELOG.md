@@ -16,6 +16,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - GUI 的左右 `Power Sign` 子图标题增加 RPi 回传的 `+Ratio(%)` 与 `Auto/motion` 状态
   - GUI 优化：`Auto Delay` 打开后锁定 `Torque Delay` 输入框，并实时同步显示 RPi 当前生效的 delay
   - GUI 优化：`Power Sign` 子图右侧新增图内 overlay 指标（`+Ratio(%)` + `Auto/motion`），替代标题塞字
+  - GUI 细化：`Auto Delay` 打开时，`Torque Delay (ms)` 行改为灰色只读 `L/R` 显示；`Power Sign` overlay 改为两行并上移，避免左腿文本被裁切
+  - GUI 细化：功率显示增加“仅显示路径”的速度去毛刺（绝对值/跳变阈值守卫），抑制 IMU 单帧速度尖峰导致的瞬时异常大负功率
 - RL 自动延迟改为左右腿独立 (per-leg L/R delay)：
   - RPi `runtime_delay_ms` 拆成 `runtime_delay_ms_L/R`，auto 关闭或 cfg 下发时两腿同步到 GUI 基础 delay；auto 打开后两腿独立扫描、独立 dwell、独立推荐
   - `evaluate_delay_candidate` 改为 `evaluate_delay_candidate_leg`，每侧只用本腿 `tau/vel` 做评估
