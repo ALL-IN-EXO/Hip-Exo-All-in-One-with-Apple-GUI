@@ -24,7 +24,7 @@ RPi_Unified - 统一树莓派 RL 控制器入口
   记得共地。
 """
 
-import serial, struct, time, csv, datetime, math, argparse
+import os, serial, struct, time, csv, datetime, math, argparse
 import numpy as np
 import torch
 from collections import deque
@@ -355,6 +355,7 @@ kcontrol = 0.1
 
 # ========= 日志文件 =========
 ts = datetime.datetime.now()
+os.makedirs('./output', exist_ok=True)
 root = './output/PI5_' + motion_type + '-'
 logf = root + ts.strftime('%Y%m%d-%H%M%S') + '.csv'
 

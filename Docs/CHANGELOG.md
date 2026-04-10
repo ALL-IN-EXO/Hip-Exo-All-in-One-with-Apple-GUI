@@ -3,7 +3,16 @@
 All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [2026-04-10] Shutong
+
+### Changed
+- `RPi_Unified/run.sh` 支持选择神经网络类型：无参数时进入交互菜单（dnn / lstm / lstm_leg_dcp / lstm_pd），也可命令行直接指定 `./run.sh <nn>`；脚本自身定位取代硬编码 `cd RPi_Unified`，并新增 `#!/bin/bash` shebang 与可执行权限
+
+### Fixed
+- `RPi_Unified/RL_controller_torch.py` 首次启动时若 `./output/` 目录不存在会在写 CSV 前报错；新增 `os.makedirs('./output', exist_ok=True)` 自动创建目录
+
+---
+
 
 ### Changed
 - Serial8 IMU 帧去除 `exo_delay` 字段: Teensy→RPi 从 `5×float32 + 11B logtag` 改为 `4×float32 + 11B logtag`，总帧长由 36B 改为 32B
@@ -50,6 +59,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - 新增 `Docs/RL_AUTO_DELAY_OPTIMIZATION.md`：自动 delay 调参的设计思路、功率指标定义、门控条件与优化流程
 
 ---
+
 
 ## [v3.0] - 2026-03-20
 

@@ -28,9 +28,9 @@ import sys
 import time
 
 
-DEFAULT_HOST = "192.168.31.34"
-DEFAULT_USER = "aboutberlin"
-DEFAULT_REMOTE_DIR = "/home/aboutberlin/Desktop/RPi_Unified"
+DEFAULT_HOST = "192.168.31.196"
+DEFAULT_USER = "biodyn-pi5"
+DEFAULT_REMOTE_DIR = "/home/biodyn-pi5/Desktop/RPi_Unified"
 DEFAULT_PASSWORD = "a1231111"
 
 
