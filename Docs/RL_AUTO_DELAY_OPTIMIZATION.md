@@ -8,6 +8,7 @@
 - 优先提升正功占比（`power_ratio`）
 - 在满足 `power_ratio >= 0.95` 后，继续提升单位时间正功（`pos_per_s`）
 - 只在“有效运动”状态下调参，避免静止/噪声导致误调
+- **左右腿独立优化**：auto 打开后 L/R 各自扫描、各自 dwell、各自 best delay，支持非对称 gait
 
 本功能仅作用于 RL 通道（Teensy↔RPi↔GUI 的 RL 透传路径）。
 
@@ -35,16 +36,17 @@
 - 每秒正功：`pos_per_s = W+ / T_total`
 - 每秒负功：`neg_per_s = -|W-| / T_total`
 
-双腿合成时：
+左右腿独立评估与独立优化。GUI 的 overlay 仍展示双腿汇总（仅用于人类阅读）：
 
-- `ratio = 0.5 * (ratio_L + ratio_R)`
-- `pos_per_s = pos_per_s_L + pos_per_s_R`
-- `neg_per_s = neg_per_s_L + neg_per_s_R`
+- `ratio_avg = 0.5 * (ratio_L + ratio_R)`
+- `pos_per_s_total = pos_per_s_L + pos_per_s_R`
+- `neg_per_s_total = neg_per_s_L + neg_per_s_R`
 
 对应代码：
 
-- `compute_leg_power_metrics(...)`
-- `evaluate_delay_candidate(...)`
+- `compute_leg_power_metrics(...)` — 单腿功率指标
+- `evaluate_delay_candidate_leg(...)` — 单腿候选 delay 评估（取代早期的双腿合成版本）
+- `_auto_step_leg(...)` — 单腿自动 delay 状态机（main 内嵌闭包，按 L/R 各调一次）
 
 ---
 
@@ -66,13 +68,14 @@
 
 ## 5. 有效运动门控（只在有效运动时调参）
 
-每次评估先判定 `auto_motion_valid`：
+每次评估对 L/R 分别判定 `auto_motion_valid_L/R`：
 
 - `mean_abs_vel >= AUTO_VALID_MIN_MEAN_ABS_VEL_DPS`
 - `abs_power_per_s >= AUTO_VALID_MIN_ABS_POWER_W`
 
-只有 `auto_motion_valid == True` 才允许改 `delay`。  
-这可避免静止、摆腿幅度过小、信号噪声主导时的错误调参。
+只有该侧 `motion_valid == True` 才允许改该侧 `delay`。  
+评估统一使用 `scale = 1.0`（ratio / 候选排序对 `runtime_scale` 不变），回传给 GUI 的 `pos_per_s / neg_per_s` 再乘 `runtime_scale` 保留真实功率语义。  
+这可避免静止、摆腿幅度过小、信号噪声主导、以及 GUI 调小 scale 导致 `abs_power_per_s` 永远不过阈值的错误门控。
 
 ---
 
@@ -83,22 +86,30 @@
 - 控制主环保持 100Hz（推理与下发不变）
 - 自动调参在 1Hz 侧环执行（`AUTO_UPDATE_INTERVAL_S = 1.0`）
 
-每次 1Hz 评估流程：
+每次 1Hz 评估流程（对 L/R 各独立执行一次）：
 
-1. 计算“当前 delay”指标（当前 `ratio/pos_per_s/...`）
-2. 若运动有效且满足 `dwell` 时间（默认 2s），扫描候选 delay：
-   - 区间：`current_delay ± 100ms`
+1. 计算本侧“当前 delay”指标（当前 `ratio/pos_per_s/...`）
+2. 若本侧运动有效且满足 `dwell` 时间，扫描候选 delay：
+   - 区间：`current_delay_side ± 100ms`
    - 步长：`10ms`
-3. 对每个候选 delay 复算窗口指标
+3. 对每个候选 delay 用**本侧** `tau/vel` 复算窗口指标
 4. 选优规则 `pick_best_delay_candidate(...)`：
    - 优先候选集 `ratio >= 0.95`
    - 在该集合内最大化 `pos_per_s`
    - 若无人满足 0.95，则回退到全局最大 `ratio`
 5. 为防抖与突变：
    - 每次实际改变量限制为 `<= 20ms`
-   - 变化后重置 dwell 计时
+   - 变化后重置本侧 dwell 计时（`auto_last_change_ts_L/R` 各自维护）
 
-这是一种“局部扫描 + 约束步进”的在线优化，不阻塞 100Hz 控制链路。
+Dwell 策略由 `AUTO_DWELL_ADAPTIVE` 开关控制（默认 `False`）：
+- `False`：固定 `AUTO_DWELL_S`（默认 3.0s）
+- `True`：`max(AUTO_DWELL_S, auto_window_s + 1.0)`，等窗口 100% 由新 cfg 下的数据填满
+
+冷启动：在 cfg 把 `auto_delay_enable` 由 False→True 上升沿时，`auto_last_change_ts_L/R` 被重置为当前时间，首轮扫描需等满 dwell；同时 `hist_tau_src/vel/ang` 三条历史缓冲被清空，避免评估窗口混入切换前的旧 scale / delay / filter 数据。
+
+非 auto 模式：`runtime_delay_ms_L = runtime_delay_ms_R = cfg['delay_ms']`，两腿跟随 GUI 单值；auto 一旦打开，两腿从同一基准起独立漂移。
+
+这是一种“局部扫描 + 约束步进”的在线优化，L/R 各自一份轻量状态机，不阻塞 100Hz 控制链路。
 
 ---
 

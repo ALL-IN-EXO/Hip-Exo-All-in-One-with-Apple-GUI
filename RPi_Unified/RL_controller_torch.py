@@ -147,7 +147,10 @@ delay_buf_R = deque([0.0] * BUF_SIZE, maxlen=BUF_SIZE)
 # ---- Auto Delay Optimization (RL only) ----
 AUTO_TARGET_RATIO = 0.95
 AUTO_UPDATE_INTERVAL_S = 1.0
-AUTO_DWELL_S = 2.0
+AUTO_DWELL_S = 3.0
+# True : effective_dwell = max(AUTO_DWELL_S, auto_window_s + 1.0) —— 等窗口 100% 新数据
+# False: effective_dwell = AUTO_DWELL_S                           —— 固定常数, 追踪更快
+AUTO_DWELL_ADAPTIVE = False
 AUTO_SCAN_HALF_RANGE_MS = 100.0
 AUTO_SCAN_STEP_MS = 10.0
 AUTO_MAX_STEP_MS = 20.0
@@ -361,7 +364,7 @@ csv_header = [
     'raw_LExoTorque', 'raw_RExoTorque',
     'filtered_LExoTorque', 'filtered_RExoTorque',
     'L_P', 'L_D', 'R_P', 'R_D',
-    'scale_runtime', 'torque_delay_ms',
+    'scale_runtime', 'torque_delay_ms_L', 'torque_delay_ms_R',
     'tag',
 ]
 
@@ -494,27 +497,25 @@ def compute_leg_power_metrics(tau_src: np.ndarray, vel_dps: np.ndarray, delay_fr
     }
 
 
-def evaluate_delay_candidate(delay_ms: float, tau_src_L: np.ndarray, tau_src_R: np.ndarray,
-                             vel_L: np.ndarray, vel_R: np.ndarray,
-                             window_frames: int):
+def evaluate_delay_candidate_leg(delay_ms: float, tau_src: np.ndarray,
+                                 vel: np.ndarray, window_frames: int):
+    """
+    Evaluate one leg under a candidate delay. scale is fixed to 1.0 — ratio is
+    scale-invariant, and pos_per_s ordering between candidates at the same scale
+    is also scale-invariant, so per-leg selection is unaffected. Display scaling
+    is applied by the caller (runtime_scale * pos_per_s).
+    """
     d_frames = int(round(float(delay_ms) / dt_ms))
-    mL = compute_leg_power_metrics(tau_src_L, vel_L, d_frames, window_frames, 1.0)
-    mR = compute_leg_power_metrics(tau_src_R, vel_R, d_frames, window_frames, 1.0)
-    if mL is None or mR is None:
+    m = compute_leg_power_metrics(tau_src, vel, d_frames, window_frames, 1.0)
+    if m is None:
         return None
-
-    ratio = 0.5 * (mL['ratio'] + mR['ratio'])
-    pos_per_s = mL['pos_per_s'] + mR['pos_per_s']
-    neg_per_s = mL['neg_per_s'] + mR['neg_per_s']
-    abs_power_per_s = mL['abs_power_per_s'] + mR['abs_power_per_s']
-    mean_abs_vel = 0.5 * (mL['mean_abs_vel'] + mR['mean_abs_vel'])
     return {
         'delay_ms': float(delay_ms),
-        'ratio': float(ratio),
-        'pos_per_s': float(pos_per_s),
-        'neg_per_s': float(neg_per_s),
-        'abs_power_per_s': float(abs_power_per_s),
-        'mean_abs_vel': float(mean_abs_vel),
+        'ratio': float(m['ratio']),
+        'pos_per_s': float(m['pos_per_s']),
+        'neg_per_s': float(m['neg_per_s']),
+        'abs_power_per_s': float(m['abs_power_per_s']),
+        'mean_abs_vel': float(m['mean_abs_vel']),
     }
 
 
@@ -714,15 +715,30 @@ def send_torque(ser: serial.Serial, tau_L: float, tau_R: float, L_p, L_d, R_p, R
     ser.flush()
 
 
+def _pack_i16(buf: bytearray, off: int, value: float, scale_factor: float):
+    """Clamp + pack a float into int16 little-endian at buf[off..off+1]."""
+    v = int(round(float(value) * float(scale_factor)))
+    if v < -32768:
+        v = -32768
+    elif v > 32767:
+        v = 32767
+    struct.pack_into('<h', buf, off, v)
+
+
 def send_status(ser: serial.Serial, filter_source, filter_type_code,
-                filter_order, enable_mask, cutoff_hz, scale, delay_ms,
-                auto_enable=False, auto_motion_valid=False,
-                power_ratio=0.0, pos_per_s=0.0, neg_per_s=0.0, best_delay_ms=0.0):
+                filter_order, enable_mask, cutoff_hz, scale,
+                delay_ms_L, delay_ms_R,
+                auto_enable=False,
+                motion_valid_L=False, motion_valid_R=False,
+                ratio_L=0.0, ratio_R=0.0,
+                pos_per_s_L=0.0, pos_per_s_R=0.0,
+                neg_per_s_L=0.0, neg_per_s_R=0.0,
+                best_delay_L=0.0, best_delay_R=0.0):
     """
     向 Teensy 发送 RPi 状态 (header=AA 56), Teensy 转存到 rpi_uplink_buf → BLE → GUI
-    40 bytes payload:
+    40 bytes payload (v3, int16-packed L/R pairs):
       [0-1] magic 'RL'
-      [2]   version
+      [2]   version = 3
       [3]   nn_type (0=dnn,1=lstm,2=lstm_leg_dcp,3=lstm_pd)
       [4]   filter_source (0=base, 1=runtime_override)
       [5]   filter_type_code (1=butter, 2=bessel, 3=cheby2)
@@ -730,18 +746,23 @@ def send_status(ser: serial.Serial, filter_source, filter_type_code,
       [7]   enable_mask (bit0=vel, bit1=ref, bit2=torque)
       [8..11]  cutoff_hz  float32
       [12..15] scale      float32
-      [16..19] delay_ms   float32
-      [20] auto_flags (bit0=auto_enable, bit1=motion_valid)
+      [16..17] delay_ms_L    int16 ×10   (0.1ms)
+      [18..19] delay_ms_R    int16 ×10
+      [20]     auto_flags bit0=auto_enable, bit1=motion_valid_L, bit2=motion_valid_R
       [21..23] reserved
-      [24..27] power_ratio float32
-      [28..31] pos_per_s   float32
-      [32..35] neg_per_s   float32
-      [36..39] best_delay_ms float32
+      [24..25] ratio_L       int16 ×10000 (0.01%)
+      [26..27] ratio_R       int16 ×10000
+      [28..29] pos_per_s_L   int16 ×100   (0.01 W)
+      [30..31] pos_per_s_R   int16 ×100
+      [32..33] neg_per_s_L   int16 ×100
+      [34..35] neg_per_s_R   int16 ×100
+      [36..37] best_delay_L  int16 ×10    (0.1ms)
+      [38..39] best_delay_R  int16 ×10
     """
     buf = bytearray(40)
     buf[0] = 0x52  # 'R'
     buf[1] = 0x4C  # 'L'
-    buf[2] = 0x02  # version
+    buf[2] = 0x03  # version 3 (per-leg L/R packed int16)
     buf[3] = NN_TYPE_CODE.get(NN_TYPE, 0) & 0xFF
     buf[4] = int(filter_source) & 0xFF
     buf[5] = int(filter_type_code) & 0xFF
@@ -749,17 +770,29 @@ def send_status(ser: serial.Serial, filter_source, filter_type_code,
     buf[7] = int(enable_mask) & 0xFF
     struct.pack_into('<f', buf, 8, float(cutoff_hz))
     struct.pack_into('<f', buf, 12, float(scale))
-    struct.pack_into('<f', buf, 16, float(delay_ms))
+
+    _pack_i16(buf, 16, delay_ms_L, 10.0)
+    _pack_i16(buf, 18, delay_ms_R, 10.0)
+
     auto_flags = 0
     if auto_enable:
         auto_flags |= 0x01
-    if auto_motion_valid:
+    if motion_valid_L:
         auto_flags |= 0x02
+    if motion_valid_R:
+        auto_flags |= 0x04
     buf[20] = auto_flags & 0xFF
-    struct.pack_into('<f', buf, 24, float(power_ratio))
-    struct.pack_into('<f', buf, 28, float(pos_per_s))
-    struct.pack_into('<f', buf, 32, float(neg_per_s))
-    struct.pack_into('<f', buf, 36, float(best_delay_ms))
+    # buf[21..23] = 0 (reserved)
+
+    _pack_i16(buf, 24, ratio_L, 10000.0)
+    _pack_i16(buf, 26, ratio_R, 10000.0)
+    _pack_i16(buf, 28, pos_per_s_L, 100.0)
+    _pack_i16(buf, 30, pos_per_s_R, 100.0)
+    _pack_i16(buf, 32, neg_per_s_L, 100.0)
+    _pack_i16(buf, 34, neg_per_s_R, 100.0)
+    _pack_i16(buf, 36, best_delay_L, 10.0)
+    _pack_i16(buf, 38, best_delay_R, 10.0)
+
     packet = b'\xAA\x56' + bytes(buf)
     ser.write(packet)
     ser.flush()
@@ -776,14 +809,26 @@ def main():
     runtime_scale = 1.0
     # LegDcp default delay: 100ms; others: 0ms
     runtime_delay_ms = 100.0 if NN_TYPE == 'lstm_leg_dcp' else 0.0
+    # 每腿当前实际生效的 delay (auto 模式下独立漂移; 非 auto 模式与 runtime_delay_ms 同步)
+    runtime_delay_ms_L = runtime_delay_ms
+    runtime_delay_ms_R = runtime_delay_ms
+
     auto_delay_enable = False
     auto_last_eval_ts = 0.0
-    auto_last_change_ts = 0.0
-    auto_cur_ratio = 0.0
-    auto_cur_pos_per_s = 0.0
-    auto_cur_neg_per_s = 0.0
-    auto_best_delay_ms = runtime_delay_ms
-    auto_motion_valid = False
+    auto_last_change_ts_L = 0.0
+    auto_last_change_ts_R = 0.0
+
+    auto_cur_ratio_L = 0.0
+    auto_cur_ratio_R = 0.0
+    auto_cur_pos_per_s_L = 0.0
+    auto_cur_pos_per_s_R = 0.0
+    auto_cur_neg_per_s_L = 0.0
+    auto_cur_neg_per_s_R = 0.0
+    auto_best_delay_ms_L = runtime_delay_ms
+    auto_best_delay_ms_R = runtime_delay_ms
+    auto_motion_valid_L = False
+    auto_motion_valid_R = False
+
     auto_gait_freq_hz = 0.0
     auto_window_s = AUTO_WINDOW_FALLBACK_S
 
@@ -842,14 +887,24 @@ def main():
 
                 runtime_scale = cfg['scale']
                 runtime_delay_ms = cfg['delay_ms']
+                # GUI 下发单个 delay → 同时赋给 L/R，不管 auto 是否打开。
+                # auto ON 时 L/R 之后会从这个基线独立漂移；auto OFF 时 L/R 永远跟这个值。
+                runtime_delay_ms_L = runtime_delay_ms
+                runtime_delay_ms_R = runtime_delay_ms
+
                 prev_auto_delay_enable = auto_delay_enable
                 auto_delay_enable = bool(cfg.get('auto_delay_enable', auto_delay_enable))
                 if not auto_delay_enable:
-                    auto_motion_valid = False
-                    auto_cur_ratio = 0.0
-                    auto_cur_pos_per_s = 0.0
-                    auto_cur_neg_per_s = 0.0
-                    auto_best_delay_ms = runtime_delay_ms
+                    auto_motion_valid_L = False
+                    auto_motion_valid_R = False
+                    auto_cur_ratio_L = 0.0
+                    auto_cur_ratio_R = 0.0
+                    auto_cur_pos_per_s_L = 0.0
+                    auto_cur_pos_per_s_R = 0.0
+                    auto_cur_neg_per_s_L = 0.0
+                    auto_cur_neg_per_s_R = 0.0
+                    auto_best_delay_ms_L = runtime_delay_ms
+                    auto_best_delay_ms_R = runtime_delay_ms
 
                 # cfg change invalidates history (filter/scale/delay 都会让旧窗口数据不再代表当前配置):
                 # 清空 history + 重置评估节拍，避免用跨配置数据做评估。
@@ -864,7 +919,8 @@ def main():
                 _now_wall = time.time()
                 auto_last_eval_ts = _now_wall
                 if auto_delay_enable and not prev_auto_delay_enable:
-                    auto_last_change_ts = _now_wall
+                    auto_last_change_ts_L = _now_wall
+                    auto_last_change_ts_R = _now_wall
 
                 if NN_TYPE == 'dnn':
                     apply_runtime_filter_to_dnn(
@@ -895,8 +951,8 @@ def main():
                 delay_buf_R.extend([0.0] * BUF_SIZE)
 
                 print(
-                    f"[RPi CFG] scale={runtime_scale:.3f}, delay={runtime_delay_ms:.1f}ms, "
-                    f"auto_delay={'ON' if auto_delay_enable else 'OFF'}"
+                    f"[RPi CFG] scale={runtime_scale:.3f}, delay={runtime_delay_ms:.1f}ms "
+                    f"(L/R snapped), auto_delay={'ON' if auto_delay_enable else 'OFF'}"
                 )
                 continue
 
@@ -918,8 +974,6 @@ def main():
                 Rpos = -Rpos
                 Lvel = -Lvel
                 Rvel = -Rvel
-
-            delay_ms = max(0.0, min(MAX_RUNTIME_DELAY_MS, float(runtime_delay_ms)))
 
             now = time.time() - start
 
@@ -972,64 +1026,127 @@ def main():
                 auto_window_s = auto_window_seconds(auto_gait_freq_hz)
                 window_frames = max(16, int(round(auto_window_s * CTRL_HZ)))
 
-                cur_eval = evaluate_delay_candidate(
-                    runtime_delay_ms, tau_src_L_np, tau_src_R_np,
-                    vel_L_np, vel_R_np, window_frames
-                )
-                if cur_eval is not None:
-                    auto_cur_ratio = cur_eval['ratio']
-                    auto_cur_pos_per_s = cur_eval['pos_per_s'] * float(runtime_scale)
-                    auto_cur_neg_per_s = cur_eval['neg_per_s'] * float(runtime_scale)
-                    auto_best_delay_ms = cur_eval['delay_ms']
-                    auto_motion_valid = (
-                        cur_eval['mean_abs_vel'] >= AUTO_VALID_MIN_MEAN_ABS_VEL_DPS and
-                        cur_eval['abs_power_per_s'] >= AUTO_VALID_MIN_ABS_POWER_W
-                    )
+                # Dwell 两种模式（见常量 AUTO_DWELL_ADAPTIVE）：
+                #   adaptive=True  → max(AUTO_DWELL_S, auto_window_s + 1.0), 等窗口填满新数据
+                #   adaptive=False → 固定 AUTO_DWELL_S, 响应更快（默认）
+                if AUTO_DWELL_ADAPTIVE:
+                    effective_dwell_s = max(AUTO_DWELL_S, auto_window_s + 1.0)
                 else:
-                    auto_cur_ratio = 0.0
-                    auto_cur_pos_per_s = 0.0
-                    auto_cur_neg_per_s = 0.0
-                    auto_best_delay_ms = runtime_delay_ms
-                    auto_motion_valid = False
+                    effective_dwell_s = AUTO_DWELL_S
 
-                # Dwell 与自适应窗口挂钩：每次改 delay 后至少等 window_s + 1s，
-                # 保证评估窗口里 100% 都是新 delay 稳态下的数据，不会被上次 delay
-                # 残留的物理响应污染。
-                effective_dwell_s = max(AUTO_DWELL_S, auto_window_s + 1.0)
-                if auto_motion_valid and (now_wall - auto_last_change_ts) >= effective_dwell_s:
-                    d_lo = max(0.0, runtime_delay_ms - AUTO_SCAN_HALF_RANGE_MS)
-                    d_hi = min(MAX_RUNTIME_DELAY_MS, runtime_delay_ms + AUTO_SCAN_HALF_RANGE_MS)
-                    cand_delays = np.arange(d_lo, d_hi + 0.5 * AUTO_SCAN_STEP_MS, AUTO_SCAN_STEP_MS, dtype=np.float32)
-                    if cand_delays.size == 0:
-                        cand_delays = np.array([runtime_delay_ms], dtype=np.float32)
+                def _auto_step_leg(side_tau_np, side_vel_np, cur_delay_ms,
+                                   last_change_ts):
+                    """
+                    Run one 1Hz evaluation + optional scan/apply for a single leg.
+                    Returns a dict with new state for that leg.
+                    """
+                    cur = evaluate_delay_candidate_leg(
+                        cur_delay_ms, side_tau_np, side_vel_np, window_frames
+                    )
+                    if cur is None:
+                        return {
+                            'ratio': 0.0,
+                            'pos_per_s': 0.0,
+                            'neg_per_s': 0.0,
+                            'best_delay_ms': float(cur_delay_ms),
+                            'motion_valid': False,
+                            'new_delay_ms': float(cur_delay_ms),
+                            'last_change_ts': float(last_change_ts),
+                            'changed': False,
+                        }
 
-                    candidates = []
-                    for c_delay in cand_delays:
-                        c_eval = evaluate_delay_candidate(
-                            float(c_delay), tau_src_L_np, tau_src_R_np,
-                            vel_L_np, vel_R_np, window_frames
+                    motion_valid = (
+                        cur['mean_abs_vel'] >= AUTO_VALID_MIN_MEAN_ABS_VEL_DPS and
+                        cur['abs_power_per_s'] >= AUTO_VALID_MIN_ABS_POWER_W
+                    )
+                    pos_per_s_disp = cur['pos_per_s'] * float(runtime_scale)
+                    neg_per_s_disp = cur['neg_per_s'] * float(runtime_scale)
+                    best_delay_ms = float(cur_delay_ms)
+                    new_delay_ms = float(cur_delay_ms)
+                    new_last_change = float(last_change_ts)
+                    changed = False
+
+                    if motion_valid and (now_wall - last_change_ts) >= effective_dwell_s:
+                        d_lo = max(0.0, cur_delay_ms - AUTO_SCAN_HALF_RANGE_MS)
+                        d_hi = min(MAX_RUNTIME_DELAY_MS, cur_delay_ms + AUTO_SCAN_HALF_RANGE_MS)
+                        cand_delays = np.arange(
+                            d_lo, d_hi + 0.5 * AUTO_SCAN_STEP_MS,
+                            AUTO_SCAN_STEP_MS, dtype=np.float32
                         )
-                        if c_eval is not None:
-                            candidates.append(c_eval)
+                        if cand_delays.size == 0:
+                            cand_delays = np.array([cur_delay_ms], dtype=np.float32)
 
-                    best = pick_best_delay_candidate(candidates, runtime_delay_ms, AUTO_TARGET_RATIO)
-                    if best is not None:
-                        auto_best_delay_ms = best['delay_ms']
-                        step_ms = max(-AUTO_MAX_STEP_MS, min(AUTO_MAX_STEP_MS, auto_best_delay_ms - runtime_delay_ms))
-                        if abs(step_ms) >= 0.5:
-                            runtime_delay_ms = max(0.0, min(MAX_RUNTIME_DELAY_MS, runtime_delay_ms + step_ms))
-                            auto_last_change_ts = now_wall
-                            status_dirty = True
+                        cands = []
+                        for c_delay in cand_delays:
+                            ev = evaluate_delay_candidate_leg(
+                                float(c_delay), side_tau_np, side_vel_np, window_frames
+                            )
+                            if ev is not None:
+                                cands.append(ev)
 
-            # ---- delay buffer ----
-            delay_ms = max(0.0, min(MAX_RUNTIME_DELAY_MS, float(runtime_delay_ms)))
-            delay_frames = int(round(delay_ms / dt_ms))
-            delay_frames = max(0, min(delay_frames, BUF_SIZE - 1))
+                        best = pick_best_delay_candidate(cands, cur_delay_ms, AUTO_TARGET_RATIO)
+                        if best is not None:
+                            best_delay_ms = best['delay_ms']
+                            step_ms = max(
+                                -AUTO_MAX_STEP_MS,
+                                min(AUTO_MAX_STEP_MS, best_delay_ms - cur_delay_ms)
+                            )
+                            if abs(step_ms) >= 0.5:
+                                new_delay_ms = max(
+                                    0.0,
+                                    min(MAX_RUNTIME_DELAY_MS, cur_delay_ms + step_ms)
+                                )
+                                new_last_change = now_wall
+                                changed = True
+
+                    return {
+                        'ratio': cur['ratio'],
+                        'pos_per_s': pos_per_s_disp,
+                        'neg_per_s': neg_per_s_disp,
+                        'best_delay_ms': best_delay_ms,
+                        'motion_valid': motion_valid,
+                        'new_delay_ms': new_delay_ms,
+                        'last_change_ts': new_last_change,
+                        'changed': changed,
+                    }
+
+                state_L = _auto_step_leg(
+                    tau_src_L_np, vel_L_np, runtime_delay_ms_L, auto_last_change_ts_L
+                )
+                state_R = _auto_step_leg(
+                    tau_src_R_np, vel_R_np, runtime_delay_ms_R, auto_last_change_ts_R
+                )
+
+                auto_cur_ratio_L = state_L['ratio']
+                auto_cur_pos_per_s_L = state_L['pos_per_s']
+                auto_cur_neg_per_s_L = state_L['neg_per_s']
+                auto_best_delay_ms_L = state_L['best_delay_ms']
+                auto_motion_valid_L = state_L['motion_valid']
+                auto_last_change_ts_L = state_L['last_change_ts']
+                if state_L['changed']:
+                    runtime_delay_ms_L = state_L['new_delay_ms']
+                    status_dirty = True
+
+                auto_cur_ratio_R = state_R['ratio']
+                auto_cur_pos_per_s_R = state_R['pos_per_s']
+                auto_cur_neg_per_s_R = state_R['neg_per_s']
+                auto_best_delay_ms_R = state_R['best_delay_ms']
+                auto_motion_valid_R = state_R['motion_valid']
+                auto_last_change_ts_R = state_R['last_change_ts']
+                if state_R['changed']:
+                    runtime_delay_ms_R = state_R['new_delay_ms']
+                    status_dirty = True
+
+            # ---- delay buffer (per-leg) ----
+            delay_ms_L_eff = max(0.0, min(MAX_RUNTIME_DELAY_MS, float(runtime_delay_ms_L)))
+            delay_ms_R_eff = max(0.0, min(MAX_RUNTIME_DELAY_MS, float(runtime_delay_ms_R)))
+            delay_frames_L = max(0, min(int(round(delay_ms_L_eff / dt_ms)), BUF_SIZE - 1))
+            delay_frames_R = max(0, min(int(round(delay_ms_R_eff / dt_ms)), BUF_SIZE - 1))
 
             delay_buf_L.appendleft(delay_input_L)
             delay_buf_R.appendleft(delay_input_R)
-            L_cmd_shifted = delay_buf_L[delay_frames]
-            R_cmd_shifted = delay_buf_R[delay_frames]
+            L_cmd_shifted = delay_buf_L[delay_frames_L]
+            R_cmd_shifted = delay_buf_R[delay_frames_R]
 
             L_cmd_final = L_cmd_shifted * runtime_scale
             R_cmd_final = R_cmd_shifted * runtime_scale
@@ -1042,13 +1159,20 @@ def main():
             if status_dirty or (frame_count % STATUS_SEND_INTERVAL == 0):
                 send_status(ser, cur_filter_source, cur_filter_type_code,
                             cur_filter_order, cur_enable_mask, cur_cutoff_hz,
-                            runtime_scale, runtime_delay_ms,
+                            runtime_scale,
+                            delay_ms_L=runtime_delay_ms_L,
+                            delay_ms_R=runtime_delay_ms_R,
                             auto_enable=auto_delay_enable,
-                            auto_motion_valid=auto_motion_valid,
-                            power_ratio=auto_cur_ratio,
-                            pos_per_s=auto_cur_pos_per_s,
-                            neg_per_s=auto_cur_neg_per_s,
-                            best_delay_ms=auto_best_delay_ms)
+                            motion_valid_L=auto_motion_valid_L,
+                            motion_valid_R=auto_motion_valid_R,
+                            ratio_L=auto_cur_ratio_L,
+                            ratio_R=auto_cur_ratio_R,
+                            pos_per_s_L=auto_cur_pos_per_s_L,
+                            pos_per_s_R=auto_cur_pos_per_s_R,
+                            neg_per_s_L=auto_cur_neg_per_s_L,
+                            neg_per_s_R=auto_cur_neg_per_s_R,
+                            best_delay_L=auto_best_delay_ms_L,
+                            best_delay_R=auto_best_delay_ms_R)
                 status_dirty = False
 
             # ---- 日志 ----
@@ -1069,7 +1193,8 @@ def main():
                 'R_P': f'{R_p:.6f}',
                 'R_D': f'{R_d:.6f}',
                 'scale_runtime': f'{runtime_scale:.4f}',
-                'torque_delay_ms': f'{delay_ms:.3f}',
+                'torque_delay_ms_L': f'{delay_ms_L_eff:.3f}',
+                'torque_delay_ms_R': f'{delay_ms_R_eff:.3f}',
                 'tag': tag_to_log,
             }
 

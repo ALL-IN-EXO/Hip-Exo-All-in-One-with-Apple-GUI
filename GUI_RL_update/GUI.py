@@ -41,7 +41,9 @@ ALGO_NAMES = {ALGO_EG: "EG", ALGO_SAMSUNG: "Samsung", ALGO_RL: "RL", ALGO_TEST: 
 # RPi passthrough payload format (40 bytes, packed into BLE payload[58:98])
 RPI_PT_MAGIC0 = 0x52  # 'R'
 RPI_PT_MAGIC1 = 0x4C  # 'L'
-RPI_PT_VERSION = 0x01
+RPI_PT_VERSION = 0x01            # downlink (GUI → RPi) passthrough version
+RPI_STATUS_VERSION_LEGACY = 0x02  # uplink status v2: single-leg float32 metrics
+RPI_STATUS_VERSION_PER_LEG = 0x03  # uplink status v3: per-leg int16-packed metrics
 
 # Filter type codes (keep in sync with RL_controller_torch.py)
 RL_FILTER_TYPES = [
@@ -566,14 +568,30 @@ class MainWindow(QWidget):
 
         # RPi status (received via BLE uplink passthrough)
         self._rpi_nn_type = -1          # -1=unknown, 0=dnn, 1=lstm, 2=lstm_leg_dcp, 3=lstm_pd
+        self._rpi_status_version = 0    # 2 = legacy float, 3 = per-leg int16 pairs
         self._rpi_filter_source = 0     # 0=base, 1=runtime_override
         self._rpi_filter_type_code = 0
         self._rpi_filter_order = 2
         self._rpi_enable_mask = 0
         self._rpi_cutoff_hz = 0.0
         self._rpi_scale = 1.0
-        self._rpi_delay_ms = 0.0
+        # Per-leg delay / metrics (v3). For v2 fallback, both L and R store same value.
+        self._rpi_delay_ms_L = 0.0
+        self._rpi_delay_ms_R = 0.0
         self._rpi_auto_delay_enable = False
+        self._rpi_auto_motion_valid_L = False
+        self._rpi_auto_motion_valid_R = False
+        self._rpi_power_ratio_L = 0.0
+        self._rpi_power_ratio_R = 0.0
+        self._rpi_pos_per_s_L = 0.0
+        self._rpi_pos_per_s_R = 0.0
+        self._rpi_neg_per_s_L = 0.0
+        self._rpi_neg_per_s_R = 0.0
+        self._rpi_best_delay_ms_L = 0.0
+        self._rpi_best_delay_ms_R = 0.0
+        # Legacy aliases — kept so other code paths referencing the old single-value
+        # fields don't break. They now mirror the L/R averages.
+        self._rpi_delay_ms = 0.0
         self._rpi_auto_motion_valid = False
         self._rpi_power_ratio = 0.0
         self._rpi_pos_per_s = 0.0
@@ -1419,11 +1437,16 @@ class MainWindow(QWidget):
             en_t = "ON" if (self._rpi_enable_mask & 0x04) else "OFF"
             auto_en = "ON" if self._rpi_auto_delay_enable else "OFF"
 
+            # 非 auto 模式下 L/R 同步; auto 模式下可能分离 → 显示 "L/R" 对
+            if abs(self._rpi_delay_ms_L - self._rpi_delay_ms_R) < 0.5:
+                delay_str = f"Delay={self._rpi_delay_ms_L:.0f}ms"
+            else:
+                delay_str = f"Delay L/R={self._rpi_delay_ms_L:.0f}/{self._rpi_delay_ms_R:.0f}ms"
             if self._rpi_nn_type == 0:  # DNN
                 current_str = (
                     f"[{src}] {ftype} {self._rpi_cutoff_hz:.1f}Hz order={self._rpi_filter_order} | "
                     f"Vel={en_v} Ref={en_r} Torque={en_t} | "
-                    f"Scale={self._rpi_scale:.2f} Delay={self._rpi_delay_ms:.0f}ms | Auto={auto_en}"
+                    f"Scale={self._rpi_scale:.2f} {delay_str} | Auto={auto_en}"
                 )
             else:  # LSTM
                 current_str = (
@@ -1431,7 +1454,7 @@ class MainWindow(QWidget):
                 )
                 if en_t == "ON" and self._rpi_filter_type_code > 0:
                     current_str += f" {ftype} {self._rpi_cutoff_hz:.1f}Hz order={self._rpi_filter_order}"
-                current_str += f" | Scale={self._rpi_scale:.2f} Delay={self._rpi_delay_ms:.0f}ms | Auto={auto_en}"
+                current_str += f" | Scale={self._rpi_scale:.2f} {delay_str} | Auto={auto_en}"
             self.lbl_rpi_current_filter.setText(f"RPi Active: {current_str}")
         else:
             self.lbl_rpi_current_filter.setText("RPi Active: waiting for status...")
@@ -1464,12 +1487,17 @@ class MainWindow(QWidget):
 
         if hasattr(self, "lbl_rl_auto_state"):
             if self._rpi_status_valid:
-                motion = "VALID" if self._rpi_auto_motion_valid else "HOLD"
                 auto_state = "ON" if self._rpi_auto_delay_enable else "OFF"
+                mL = "VALID" if self._rpi_auto_motion_valid_L else "HOLD"
+                mR = "VALID" if self._rpi_auto_motion_valid_R else "HOLD"
                 self.lbl_rl_auto_state.setText(
-                    f"Auto Delay(RPi): {auto_state} | motion={motion} | "
-                    f"ratio={self._rpi_power_ratio:.3f} | +P/s={self._rpi_pos_per_s:+.2f}W | "
-                    f"-P/s={self._rpi_neg_per_s:+.2f}W | best={self._rpi_best_delay_ms:.0f}ms"
+                    f"Auto Delay(RPi): {auto_state}\n"
+                    f"  L: motion={mL} | ratio={self._rpi_power_ratio_L:.3f} | "
+                    f"+P={self._rpi_pos_per_s_L:+.2f}W | -P={self._rpi_neg_per_s_L:+.2f}W | "
+                    f"delay={self._rpi_delay_ms_L:.0f}ms | best={self._rpi_best_delay_ms_L:.0f}ms\n"
+                    f"  R: motion={mR} | ratio={self._rpi_power_ratio_R:.3f} | "
+                    f"+P={self._rpi_pos_per_s_R:+.2f}W | -P={self._rpi_neg_per_s_R:+.2f}W | "
+                    f"delay={self._rpi_delay_ms_R:.0f}ms | best={self._rpi_best_delay_ms_R:.0f}ms"
                 )
             else:
                 self.lbl_rl_auto_state.setText("Auto Delay: waiting for RPi status...")
@@ -2212,31 +2240,54 @@ class MainWindow(QWidget):
         self._position_power_ratio_overlay(strip, overlay)
 
     def _update_power_strip_titles(self):
-        """Keep strip titles static, and show ratio via in-plot overlay."""
+        """Keep strip titles static, and show per-leg ratio/power via in-plot overlay."""
         if not hasattr(self, 'pwr_strip_right') or not hasattr(self, 'pwr_strip_left'):
             return
         self.pwr_strip_right.setTitle("Right Leg Power Sign", color=C.text2, size='10pt')
         self.pwr_strip_left.setTitle("Left Leg Power Sign", color=C.text2, size='10pt')
-        if self._rpi_status_valid:
-            ratio = max(0.0, min(1.0, float(self._rpi_power_ratio)))
-            ratio_pct = ratio * 100.0
-            auto_txt = "ON" if self._rpi_auto_delay_enable else "OFF"
-            motion_txt = "VALID" if self._rpi_auto_motion_valid else "HOLD"
-            text = f"+Ratio {ratio_pct:.1f}% | {auto_txt}/{motion_txt}"
-        else:
-            text = "+Ratio --.-% | WAIT"
 
-        # Overlay text appears inside strip (right side), not in title.
-        overlay_html = (
-            f"<div style='color:{C.purple}; font-size:10pt; font-weight:600; "
-            f"background:rgba(0,0,0,0);'>{text}</div>"
+        def _format_leg_overlay(side_label, ratio, pos_w, neg_w, delay_ms,
+                                motion_valid, valid):
+            if not valid:
+                line1 = f"+Ratio --.-% | WAIT"
+                line2 = f"+P --.-- W  -P --.-- W"
+                line3 = f"delay --.- ms"
+                return line1, line2, line3
+            ratio_clamped = max(0.0, min(1.0, float(ratio)))
+            ratio_pct = ratio_clamped * 100.0
+            auto_txt = "ON" if self._rpi_auto_delay_enable else "OFF"
+            motion_txt = "VALID" if motion_valid else "HOLD"
+            line1 = f"+Ratio {ratio_pct:.1f}% | {auto_txt}/{motion_txt}"
+            line2 = f"+P {float(pos_w):+.2f} W  -P {float(neg_w):+.2f} W"
+            line3 = f"delay {float(delay_ms):.1f} ms"
+            return line1, line2, line3
+
+        valid = bool(self._rpi_status_valid)
+        l1_L, l2_L, l3_L = _format_leg_overlay(
+            "L", self._rpi_power_ratio_L, self._rpi_pos_per_s_L,
+            self._rpi_neg_per_s_L, self._rpi_delay_ms_L,
+            self._rpi_auto_motion_valid_L, valid,
         )
-        if hasattr(self, 'pwr_strip_right_overlay'):
-            self.pwr_strip_right_overlay.setHtml(overlay_html)
-            self._position_power_ratio_overlay(self.pwr_strip_right, self.pwr_strip_right_overlay)
+        l1_R, l2_R, l3_R = _format_leg_overlay(
+            "R", self._rpi_power_ratio_R, self._rpi_pos_per_s_R,
+            self._rpi_neg_per_s_R, self._rpi_delay_ms_R,
+            self._rpi_auto_motion_valid_R, valid,
+        )
+
+        overlay_tmpl = (
+            f"<div style='color:{{col}}; font-size:15pt; font-weight:600; "
+            f"background:rgba(0,0,0,0); text-align:right;'>"
+            f"{{l1}}<br/>{{l2}}<br/>{{l3}}</div>"
+        )
+        html_L = overlay_tmpl.format(col=C.purple, l1=l1_L, l2=l2_L, l3=l3_L)
+        html_R = overlay_tmpl.format(col=C.purple, l1=l1_R, l2=l2_R, l3=l3_R)
+
         if hasattr(self, 'pwr_strip_left_overlay'):
-            self.pwr_strip_left_overlay.setHtml(overlay_html)
+            self.pwr_strip_left_overlay.setHtml(html_L)
             self._position_power_ratio_overlay(self.pwr_strip_left, self.pwr_strip_left_overlay)
+        if hasattr(self, 'pwr_strip_right_overlay'):
+            self.pwr_strip_right_overlay.setHtml(html_R)
+            self._position_power_ratio_overlay(self.pwr_strip_right, self.pwr_strip_right_overlay)
 
     def _position_power_ratio_overlay(self, strip, overlay_item):
         if overlay_item is None or strip is None:
@@ -2251,7 +2302,7 @@ class MainWindow(QWidget):
         dx = max(1e-6, float(x1 - x0))
         dy = max(1e-6, float(y1 - y0))
         x = x1 - 0.012 * dx
-        y = y1 - 0.10 * dy
+        y = y1 - 0.02 * dy
         overlay_item.setPos(x, y)
 
     def _update_tag_panel(self, now=None):
@@ -2326,12 +2377,25 @@ class MainWindow(QWidget):
             self._rpi_online = False
             self._rpi_last_rx_time = 0.0
             self._rpi_nn_type = -1
+            self._rpi_status_version = 0
             self._rpi_auto_delay_enable = False
             self._rpi_auto_motion_valid = False
+            self._rpi_auto_motion_valid_L = False
+            self._rpi_auto_motion_valid_R = False
             self._rpi_power_ratio = 0.0
+            self._rpi_power_ratio_L = 0.0
+            self._rpi_power_ratio_R = 0.0
             self._rpi_pos_per_s = 0.0
+            self._rpi_pos_per_s_L = 0.0
+            self._rpi_pos_per_s_R = 0.0
             self._rpi_neg_per_s = 0.0
+            self._rpi_neg_per_s_L = 0.0
+            self._rpi_neg_per_s_R = 0.0
             self._rpi_best_delay_ms = 0.0
+            self._rpi_best_delay_ms_L = 0.0
+            self._rpi_best_delay_ms_R = 0.0
+            self._rpi_delay_ms_L = 0.0
+            self._rpi_delay_ms_R = 0.0
             if hasattr(self, 'lbl_rpi_nn_type'):
                 self.lbl_rpi_nn_type.setText("RPi: waiting...")
                 self.lbl_rpi_nn_type.setStyleSheet(
@@ -2560,7 +2624,11 @@ class MainWindow(QWidget):
 
         # === Parse RPi uplink passthrough [58..97] ===
         rpi_blob = payload[58:98]
-        if len(rpi_blob) >= 20 and rpi_blob[0] == RPI_PT_MAGIC0 and rpi_blob[1] == RPI_PT_MAGIC1 and rpi_blob[2] >= RPI_PT_VERSION:
+        if (len(rpi_blob) >= 20 and rpi_blob[0] == RPI_PT_MAGIC0 and
+                rpi_blob[1] == RPI_PT_MAGIC1 and
+                rpi_blob[2] >= RPI_STATUS_VERSION_LEGACY):
+            version = rpi_blob[2]
+            self._rpi_status_version = version
             self._rpi_nn_type = rpi_blob[3]
             self._rpi_filter_source = rpi_blob[4]
             self._rpi_filter_type_code = rpi_blob[5]
@@ -2568,20 +2636,62 @@ class MainWindow(QWidget):
             self._rpi_enable_mask = rpi_blob[7]
             self._rpi_cutoff_hz = struct.unpack_from('<f', rpi_blob, 8)[0]
             self._rpi_scale = struct.unpack_from('<f', rpi_blob, 12)[0]
-            self._rpi_delay_ms = struct.unpack_from('<f', rpi_blob, 16)[0]
-            auto_flags = rpi_blob[20] if len(rpi_blob) > 20 else 0
-            self._rpi_auto_delay_enable = bool(auto_flags & 0x01)
-            self._rpi_auto_motion_valid = bool(auto_flags & 0x02)
-            if len(rpi_blob) >= 40:
-                self._rpi_power_ratio = struct.unpack_from('<f', rpi_blob, 24)[0]
-                self._rpi_pos_per_s = struct.unpack_from('<f', rpi_blob, 28)[0]
-                self._rpi_neg_per_s = struct.unpack_from('<f', rpi_blob, 32)[0]
-                self._rpi_best_delay_ms = struct.unpack_from('<f', rpi_blob, 36)[0]
+
+            if version >= RPI_STATUS_VERSION_PER_LEG and len(rpi_blob) >= 40:
+                # v3: int16-packed L/R pairs
+                self._rpi_delay_ms_L = struct.unpack_from('<h', rpi_blob, 16)[0] / 10.0
+                self._rpi_delay_ms_R = struct.unpack_from('<h', rpi_blob, 18)[0] / 10.0
+                auto_flags = rpi_blob[20]
+                self._rpi_auto_delay_enable = bool(auto_flags & 0x01)
+                self._rpi_auto_motion_valid_L = bool(auto_flags & 0x02)
+                self._rpi_auto_motion_valid_R = bool(auto_flags & 0x04)
+                self._rpi_power_ratio_L = struct.unpack_from('<h', rpi_blob, 24)[0] / 10000.0
+                self._rpi_power_ratio_R = struct.unpack_from('<h', rpi_blob, 26)[0] / 10000.0
+                self._rpi_pos_per_s_L = struct.unpack_from('<h', rpi_blob, 28)[0] / 100.0
+                self._rpi_pos_per_s_R = struct.unpack_from('<h', rpi_blob, 30)[0] / 100.0
+                self._rpi_neg_per_s_L = struct.unpack_from('<h', rpi_blob, 32)[0] / 100.0
+                self._rpi_neg_per_s_R = struct.unpack_from('<h', rpi_blob, 34)[0] / 100.0
+                self._rpi_best_delay_ms_L = struct.unpack_from('<h', rpi_blob, 36)[0] / 10.0
+                self._rpi_best_delay_ms_R = struct.unpack_from('<h', rpi_blob, 38)[0] / 10.0
             else:
-                self._rpi_power_ratio = 0.0
-                self._rpi_pos_per_s = 0.0
-                self._rpi_neg_per_s = 0.0
-                self._rpi_best_delay_ms = self._rpi_delay_ms
+                # v2 legacy: single-leg float32 — mirror to both L/R for display.
+                delay_ms = struct.unpack_from('<f', rpi_blob, 16)[0]
+                auto_flags = rpi_blob[20] if len(rpi_blob) > 20 else 0
+                self._rpi_auto_delay_enable = bool(auto_flags & 0x01)
+                motion_valid = bool(auto_flags & 0x02)
+                self._rpi_auto_motion_valid_L = motion_valid
+                self._rpi_auto_motion_valid_R = motion_valid
+                self._rpi_delay_ms_L = delay_ms
+                self._rpi_delay_ms_R = delay_ms
+                if len(rpi_blob) >= 40:
+                    ratio = struct.unpack_from('<f', rpi_blob, 24)[0]
+                    pos_w = struct.unpack_from('<f', rpi_blob, 28)[0]
+                    neg_w = struct.unpack_from('<f', rpi_blob, 32)[0]
+                    best_d = struct.unpack_from('<f', rpi_blob, 36)[0]
+                else:
+                    ratio = 0.0
+                    pos_w = 0.0
+                    neg_w = 0.0
+                    best_d = delay_ms
+                self._rpi_power_ratio_L = ratio
+                self._rpi_power_ratio_R = ratio
+                self._rpi_pos_per_s_L = 0.5 * pos_w
+                self._rpi_pos_per_s_R = 0.5 * pos_w
+                self._rpi_neg_per_s_L = 0.5 * neg_w
+                self._rpi_neg_per_s_R = 0.5 * neg_w
+                self._rpi_best_delay_ms_L = best_d
+                self._rpi_best_delay_ms_R = best_d
+
+            # Legacy aliases for any other code paths: expose averaged/combined.
+            self._rpi_delay_ms = 0.5 * (self._rpi_delay_ms_L + self._rpi_delay_ms_R)
+            self._rpi_auto_motion_valid = (
+                self._rpi_auto_motion_valid_L or self._rpi_auto_motion_valid_R
+            )
+            self._rpi_power_ratio = 0.5 * (self._rpi_power_ratio_L + self._rpi_power_ratio_R)
+            self._rpi_pos_per_s = self._rpi_pos_per_s_L + self._rpi_pos_per_s_R
+            self._rpi_neg_per_s = self._rpi_neg_per_s_L + self._rpi_neg_per_s_R
+            self._rpi_best_delay_ms = 0.5 * (self._rpi_best_delay_ms_L + self._rpi_best_delay_ms_R)
+
             self._rpi_last_rx_time = time.time()
             self._rpi_online = True
             prev_nn = getattr(self, '_prev_rpi_nn_type', -1)
