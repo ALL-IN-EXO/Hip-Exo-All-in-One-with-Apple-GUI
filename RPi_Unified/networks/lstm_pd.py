@@ -1,8 +1,9 @@
 """
 LSTMNetworkPD - LSTM神经网络控制器 (PD位置误差控制, 每条腿独立)
-输入: 4维 → 拆成2条腿各2维 (角度+速度), 堆叠后送入LSTM
+输入: 4维 -> 拆成2条腿各2维 (角度+速度), 堆叠后送入LSTM
 输出: 2维 (左/右腿目标位置)
 torque = (action - qTd) * kp - dqTd * kd
+分解记录: P = (action - qTd) * kp, D = -dqTd * kd, 所以 torque = P + D
 滤波器: 只需torque前滤波 (exo_filter)
 """
 
@@ -94,7 +95,7 @@ class LSTMNetworkPD(nn.Module):
         self.L_p = (action[0] - self.qTd_L) * self.kp
         self.R_p = (action[1] - self.qTd_R) * self.kp
 
-        # D control
+        # D control (signed contribution term, includes the minus sign from " - dqTd*kd ")
         self.L_d = -self.dqTd_L * self.kd
         self.R_d = -self.dqTd_R * self.kd
 

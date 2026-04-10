@@ -2,6 +2,7 @@ import serial
 from serial.tools import list_ports
 import struct
 import time
+import csv
 from math import *
 from collections import deque
 from PyQt5 import QtWidgets, QtCore, QtGui
@@ -550,7 +551,7 @@ class MainWindow(QWidget):
         self._visual_sign_L = 1
         self._visual_sign_R = 1
         self._brand_request = 0
-        self._brand_pending = 1  # 1=SIG, 2=TMOTOR
+        self._brand_pending = 2  # 1=SIG, 2=TMOTOR (default: TMOTOR)
         self._current_brand = 0
         self._algo_select = ALGO_EG
         self._algo_pending = ALGO_EG
@@ -564,7 +565,7 @@ class MainWindow(QWidget):
         self._rl_last_tx_ts = 0.0
 
         # RPi status (received via BLE uplink passthrough)
-        self._rpi_nn_type = -1          # -1=unknown, 0=dnn, 1=lstm, 2=lstm_leg_dcp
+        self._rpi_nn_type = -1          # -1=unknown, 0=dnn, 1=lstm, 2=lstm_leg_dcp, 3=lstm_pd
         self._rpi_filter_source = 0     # 0=base, 1=runtime_override
         self._rpi_filter_type_code = 0
         self._rpi_filter_order = 2
@@ -572,6 +573,12 @@ class MainWindow(QWidget):
         self._rpi_cutoff_hz = 0.0
         self._rpi_scale = 1.0
         self._rpi_delay_ms = 0.0
+        self._rpi_auto_delay_enable = False
+        self._rpi_auto_motion_valid = False
+        self._rpi_power_ratio = 0.0
+        self._rpi_pos_per_s = 0.0
+        self._rpi_neg_per_s = 0.0
+        self._rpi_best_delay_ms = 0.0
         self._rpi_status_valid = False
         self._rpi_last_rx_time = 0.0      # 上次收到 RPi 状态的时间
         self._rpi_online = False           # RPi 在线标志
@@ -610,6 +617,20 @@ class MainWindow(QWidget):
         os.makedirs(log_dir, exist_ok=True)
         filename = datetime.now().strftime("%Y%m%d_%H%M%S") + ".csv"
         self.csv_path = os.path.join(log_dir, filename)
+        self._csv_file = open(self.csv_path, 'w', newline='')
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_writer.writerow([
+            't_s', 'L_angle_deg', 'R_angle_deg',
+            'L_cmd_Nm', 'R_cmd_Nm', 'L_est_Nm', 'R_est_Nm',
+            'L_vel_dps', 'R_vel_dps', 'L_pwr_W', 'R_pwr_W',
+            'gait_freq_Hz',
+        ])
+        self._csv_last_flush = 0.0
+
+        # Wheel guard: scroll wheel only changes spinbox value when it has focus
+        for sb in self.findChildren((QDoubleSpinBox, QSpinBox)):
+            sb.setFocusPolicy(Qt.StrongFocus)
+            sb.installEventFilter(self)
 
         self._apply_theme()
 
@@ -868,10 +889,16 @@ class MainWindow(QWidget):
         filt_row = QHBoxLayout()
         self.chk_rl_vr_filter = QCheckBox("Vel+Ref")
         self.chk_rl_torque_filter = QCheckBox("Torque")
+        self.chk_rl_auto_delay = QCheckBox("Auto Delay")
         self.chk_rl_vr_filter.setChecked(True)
         self.chk_rl_torque_filter.setChecked(True)
+        self.chk_rl_auto_delay.setChecked(False)
+        self.chk_rl_vr_filter.stateChanged.connect(self._update_rl_filter_state_label)
+        self.chk_rl_torque_filter.stateChanged.connect(self._update_rl_filter_state_label)
+        self.chk_rl_auto_delay.stateChanged.connect(self._on_rl_auto_delay_toggled)
         filt_row.addWidget(self.chk_rl_vr_filter)
         filt_row.addWidget(self.chk_rl_torque_filter)
+        filt_row.addWidget(self.chk_rl_auto_delay)
         filt_row.addStretch(1)
         self.lbl_rl_filter_en = QLabel("Filter Enable")
         rl_lay.addWidget(self.lbl_rl_filter_en, 6, 0)
@@ -892,6 +919,14 @@ class MainWindow(QWidget):
             f"color:{C.text2}; font-size:11px; background:transparent; padding-top:2px;"
         )
         rl_lay.addWidget(self.lbl_rl_filter_state, 8, 0, 1, 2)
+
+        # Row 9: Auto-delay telemetry (from RPi status uplink)
+        self.lbl_rl_auto_state = QLabel("Auto Delay: waiting for RPi status...")
+        self.lbl_rl_auto_state.setWordWrap(True)
+        self.lbl_rl_auto_state.setStyleSheet(
+            f"color:{C.purple}; font-size:11px; background:transparent; padding-top:1px;"
+        )
+        rl_lay.addWidget(self.lbl_rl_auto_state, 9, 0, 1, 2)
         self.algo_stack.addWidget(rl_panel)
 
         # -- Test panel (sin wave) --
@@ -1256,6 +1291,10 @@ class MainWindow(QWidget):
         struct.pack_into('<f', pt, 8, float(self.sb_rl_scale.value()))
         struct.pack_into('<f', pt, 12, float(self.sb_rl_torque_delay.value()))
         struct.pack_into('<f', pt, 16, float(self.sb_rl_cutoff_hz.value()))
+        auto_flags = 0
+        if self.chk_rl_auto_delay.isChecked():
+            auto_flags |= 0x01
+        pt[20] = auto_flags & 0xFF
         return pt
 
     def _on_apply_rl_clicked(self):
@@ -1264,6 +1303,35 @@ class MainWindow(QWidget):
             return
         self._tx_params()
         self._update_rl_filter_state_label()
+        # Re-affirm motor direction after RPi params are sent
+        QTimer.singleShot(150, self._tx_params)
+
+    def _on_rl_auto_delay_toggled(self, _state):
+        self._update_rl_delay_input_mode()
+        self._update_rl_filter_state_label()
+
+    def _set_rl_delay_spinbox_value(self, delay_ms: float):
+        if not hasattr(self, "sb_rl_torque_delay"):
+            return
+        delay = max(0.0, min(1000.0, float(delay_ms)))
+        if abs(float(self.sb_rl_torque_delay.value()) - delay) < 0.05:
+            return
+        self.sb_rl_torque_delay.blockSignals(True)
+        self.sb_rl_torque_delay.setValue(delay)
+        self.sb_rl_torque_delay.blockSignals(False)
+
+    def _update_rl_delay_input_mode(self):
+        """Auto Delay ON: lock delay input and mirror active delay from RPi status."""
+        if not hasattr(self, "sb_rl_torque_delay") or not hasattr(self, "chk_rl_auto_delay"):
+            return
+        auto_on = self.chk_rl_auto_delay.isChecked()
+        self.sb_rl_torque_delay.setEnabled(not auto_on)
+        if auto_on:
+            self.sb_rl_torque_delay.setToolTip("Auto Delay ON: follows RPi active runtime delay.")
+            if self._rpi_status_valid:
+                self._set_rl_delay_spinbox_value(self._rpi_delay_ms)
+        else:
+            self.sb_rl_torque_delay.setToolTip("RL torque delay absolute (ms), 0~1000")
 
     def _update_rl_panel_for_nn_type(self):
         """根据 RPi 报告的 nn_type 调整 RL 面板控件可见性"""
@@ -1298,15 +1366,31 @@ class MainWindow(QWidget):
             self.chk_rl_torque_filter.setChecked(True)
             self.chk_rl_torque_filter.blockSignals(False)
 
-        # 按网络类型预设推荐参数
+        # ---- 按网络类型设置推荐预设 ----
+        # nn=0: DNN     → scale=0.50, delay=200ms, cutoff=2.5Hz, Butterworth, Vel+Ref+Torque ON
+        # nn=1: LSTM    → scale=1.00, delay=0ms,   cutoff=5.0Hz, Butterworth, Torque ON
+        # nn=2: LegDcp  → scale=1.00, delay=100ms, cutoff=5.0Hz, Butterworth, Torque ON
+        # nn=3: LSTM-PD → scale=1.00, delay=200ms, cutoff=2.5Hz, Butterworth, Torque ON
+        _presets = {
+            0: dict(scale=0.50, delay=200.0, cutoff=2.5,  vr=True,  torque=True),
+            1: dict(scale=1.00, delay=0.0,   cutoff=5.0,  vr=False, torque=True),
+            2: dict(scale=1.00, delay=100.0, cutoff=5.0,  vr=False, torque=True),
+            3: dict(scale=1.00, delay=200.0, cutoff=2.5,  vr=False, torque=True),
+        }
+        preset = _presets.get(nn, _presets[1])
+        self.sb_rl_scale.setValue(preset['scale'])
+        self.sb_rl_torque_delay.setValue(preset['delay'])
+        self.sb_rl_cutoff_hz.setValue(preset['cutoff'])
+        # Filter type combo: index 0 = Butterworth for all presets
+        self.cmb_rl_filter_type.blockSignals(True)
+        self.cmb_rl_filter_type.setCurrentIndex(0)
+        self.cmb_rl_filter_type.blockSignals(False)
         if is_dnn:
-            self.sb_rl_scale.setValue(0.50)
-            self.sb_rl_torque_delay.setValue(200.0)
-            self.sb_rl_cutoff_hz.setValue(2.5)
-            self.chk_rl_vr_filter.setChecked(True)
-            self.chk_rl_torque_filter.setChecked(True)
-        else:
-            self.sb_rl_scale.setValue(1.00)
+            self.chk_rl_vr_filter.setChecked(preset['vr'])
+        self.chk_rl_torque_filter.blockSignals(True)
+        self.chk_rl_torque_filter.setChecked(preset['torque'])
+        self.chk_rl_torque_filter.blockSignals(False)
+        self._update_rl_delay_input_mode()
 
     def _update_rpi_offline_ui(self):
         """RPi 超时断线时更新 UI"""
@@ -1316,10 +1400,14 @@ class MainWindow(QWidget):
         self.lbl_rpi_nn_type.setStyleSheet(
             f"color:{C.red}; font-size:13px; font-weight:600; background:transparent;")
         self.lbl_rpi_current_filter.setText("RPi Active: no connection")
+        if hasattr(self, "lbl_rl_auto_state"):
+            self.lbl_rl_auto_state.setText("Auto Delay: no connection")
+        self._update_power_strip_titles()
 
     def _update_rl_filter_state_label(self):
         if not hasattr(self, "lbl_rl_filter_state"):
             return
+        self._update_rl_delay_input_mode()
 
         # --- RPi current filter display (from uplink) ---
         if self._rpi_status_valid:
@@ -1329,12 +1417,13 @@ class MainWindow(QWidget):
             en_v = "ON" if (self._rpi_enable_mask & 0x01) else "OFF"
             en_r = "ON" if (self._rpi_enable_mask & 0x02) else "OFF"
             en_t = "ON" if (self._rpi_enable_mask & 0x04) else "OFF"
+            auto_en = "ON" if self._rpi_auto_delay_enable else "OFF"
 
             if self._rpi_nn_type == 0:  # DNN
                 current_str = (
                     f"[{src}] {ftype} {self._rpi_cutoff_hz:.1f}Hz order={self._rpi_filter_order} | "
                     f"Vel={en_v} Ref={en_r} Torque={en_t} | "
-                    f"Scale={self._rpi_scale:.2f} Delay={self._rpi_delay_ms:.0f}ms"
+                    f"Scale={self._rpi_scale:.2f} Delay={self._rpi_delay_ms:.0f}ms | Auto={auto_en}"
                 )
             else:  # LSTM
                 current_str = (
@@ -1342,7 +1431,7 @@ class MainWindow(QWidget):
                 )
                 if en_t == "ON" and self._rpi_filter_type_code > 0:
                     current_str += f" {ftype} {self._rpi_cutoff_hz:.1f}Hz order={self._rpi_filter_order}"
-                current_str += f" | Scale={self._rpi_scale:.2f} Delay={self._rpi_delay_ms:.0f}ms"
+                current_str += f" | Scale={self._rpi_scale:.2f} Delay={self._rpi_delay_ms:.0f}ms | Auto={auto_en}"
             self.lbl_rpi_current_filter.setText(f"RPi Active: {current_str}")
         else:
             self.lbl_rpi_current_filter.setText("RPi Active: waiting for status...")
@@ -1352,6 +1441,7 @@ class MainWindow(QWidget):
         filt_name = RL_FILTER_TYPES[idx][0]
         vr = "ON" if self.chk_rl_vr_filter.isChecked() else "OFF"
         tq = "ON" if self.chk_rl_torque_filter.isChecked() else "OFF"
+        ad = "ON" if self.chk_rl_auto_delay.isChecked() else "OFF"
         cutoff = float(self.sb_rl_cutoff_hz.value())
         delay = float(self.sb_rl_torque_delay.value())
         scale = float(self.sb_rl_scale.value())
@@ -1360,17 +1450,30 @@ class MainWindow(QWidget):
                 state = (
                     f"GUI Sent(seq={self._rl_cfg_tx_seq}): "
                     f"{filt_name} {cutoff:.1f}Hz, Vel+Ref={vr}, Torque={tq}, "
-                    f"Scale={scale:.2f}, Delay={delay:.0f}ms"
+                    f"Scale={scale:.2f}, Delay={delay:.0f}ms, Auto={ad}"
                 )
             else:
                 state = (
                     f"GUI Pending: "
                     f"{filt_name} {cutoff:.1f}Hz, Vel+Ref={vr}, Torque={tq}, "
-                    f"Scale={scale:.2f}, Delay={delay:.0f}ms"
+                    f"Scale={scale:.2f}, Delay={delay:.0f}ms, Auto={ad}"
                 )
         else:
             state = f"Algo={ALGO_NAMES.get(self._algo_select, '?')}. Override sent only when RL active."
         self.lbl_rl_filter_state.setText(state)
+
+        if hasattr(self, "lbl_rl_auto_state"):
+            if self._rpi_status_valid:
+                motion = "VALID" if self._rpi_auto_motion_valid else "HOLD"
+                auto_state = "ON" if self._rpi_auto_delay_enable else "OFF"
+                self.lbl_rl_auto_state.setText(
+                    f"Auto Delay(RPi): {auto_state} | motion={motion} | "
+                    f"ratio={self._rpi_power_ratio:.3f} | +P/s={self._rpi_pos_per_s:+.2f}W | "
+                    f"-P/s={self._rpi_neg_per_s:+.2f}W | best={self._rpi_best_delay_ms:.0f}ms"
+                )
+            else:
+                self.lbl_rl_auto_state.setText("Auto Delay: waiting for RPi status...")
+        self._update_power_strip_titles()
 
     # ================================================================ Test waveform
     def _on_test_waveform_changed(self, index):
@@ -1393,6 +1496,9 @@ class MainWindow(QWidget):
             # Send a short burst to survive occasional BLE/UART frame loss.
             for k in range(4):
                 QTimer.singleShot(35 * k, self._tx_params)
+            # Re-affirm motor direction after firmware processes algo change
+            # (firmware may re-initialize direction state on algo switch)
+            QTimer.singleShot(35 * 4 + 100, self._tx_params)
 
     # ================================================================ Callbacks
     def _on_brand_changed(self, index):
@@ -1605,8 +1711,7 @@ class MainWindow(QWidget):
             strip.getAxis('left').setTextPen(C.text2)
             strip.getAxis('bottom').setPen(C.plot_fg)
             strip.getAxis('bottom').setTextPen(C.plot_fg)
-        self.pwr_strip_right.setTitle("Right Leg Power Sign", color=C.text2, size='10pt')
-        self.pwr_strip_left.setTitle("Left Leg Power Sign", color=C.text2, size='10pt')
+        self._update_power_strip_titles()
         self.pwr_strip_right_zero.setPen(pg.mkPen(C.separator, width=1.2))
         self.pwr_strip_left_zero.setPen(pg.mkPen(C.separator, width=1.2))
         self.pwr_strip_right_pos.setPen(pg.mkPen(C.green, width=1.2))
@@ -1944,6 +2049,9 @@ class MainWindow(QWidget):
         self.pwr_strip_right.addItem(self.pwr_strip_right_zero)
         self.pwr_strip_right.addItem(self.pwr_strip_right_pos)
         self.pwr_strip_right.addItem(self.pwr_strip_right_neg)
+        self.pwr_strip_right_overlay = pg.TextItem(anchor=(1, 0))
+        self.pwr_strip_right_overlay.setZValue(20)
+        self.pwr_strip_right.addItem(self.pwr_strip_right_overlay)
         self.pwr_strip_right.setYRange(-5.0, 5.0, padding=0.02)
         self.plot_layout.addWidget(self.pwr_strip_right, 0)
 
@@ -2032,8 +2140,25 @@ class MainWindow(QWidget):
         self.pwr_strip_left.addItem(self.pwr_strip_left_zero)
         self.pwr_strip_left.addItem(self.pwr_strip_left_pos)
         self.pwr_strip_left.addItem(self.pwr_strip_left_neg)
+        self.pwr_strip_left_overlay = pg.TextItem(anchor=(1, 0))
+        self.pwr_strip_left_overlay.setZValue(20)
+        self.pwr_strip_left.addItem(self.pwr_strip_left_overlay)
         self.pwr_strip_left.setYRange(-5.0, 5.0, padding=0.02)
         self.plot_layout.addWidget(self.pwr_strip_left, 0)
+        self._update_power_strip_titles()
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel and isinstance(obj, (QDoubleSpinBox, QSpinBox)):
+            if not obj.hasFocus():
+                event.ignore()
+                return True
+        return super().eventFilter(obj, event)
+
+    def closeEvent(self, event):
+        if hasattr(self, '_csv_file') and self._csv_file and not self._csv_file.closed:
+            self._csv_file.flush()
+            self._csv_file.close()
+        super().closeEvent(event)
 
     def _apply_plot_visibility(self):
         show_a = self.chk_plot_angle.isChecked()
@@ -2051,8 +2176,7 @@ class MainWindow(QWidget):
         show_p = self.chk_plot_pwr.isChecked()
         for a in ['L_pwr_line', 'R_pwr_line']:
             if hasattr(self, a): getattr(self, a).setVisible(show_p)
-        for a in ['pwr_strip_right', 'pwr_strip_left']:
-            if hasattr(self, a): getattr(self, a).setVisible(show_p)
+        # Power Sign strip charts are always visible; they are NOT controlled by the Pwr legend checkbox
 
     def _update_power_strip(self, t, y, side):
         if not t or not y:
@@ -2062,12 +2186,14 @@ class MainWindow(QWidget):
             pos_curve = self.pwr_strip_right_pos
             neg_curve = self.pwr_strip_right_neg
             strip = self.pwr_strip_right
+            overlay = self.pwr_strip_right_overlay
             smooth_attr = '_pwr_band_scale_right'
         else:
             zero = self.pwr_strip_left_zero
             pos_curve = self.pwr_strip_left_pos
             neg_curve = self.pwr_strip_left_neg
             strip = self.pwr_strip_left
+            overlay = self.pwr_strip_left_overlay
             smooth_attr = '_pwr_band_scale_left'
 
         pos = [v if v > 0.0 else 0.0 for v in y]
@@ -2083,6 +2209,50 @@ class MainWindow(QWidget):
         smoothed = prev * 0.88 + target * 0.12
         setattr(self, smooth_attr, smoothed)
         strip.setYRange(-smoothed, smoothed, padding=0.02)
+        self._position_power_ratio_overlay(strip, overlay)
+
+    def _update_power_strip_titles(self):
+        """Keep strip titles static, and show ratio via in-plot overlay."""
+        if not hasattr(self, 'pwr_strip_right') or not hasattr(self, 'pwr_strip_left'):
+            return
+        self.pwr_strip_right.setTitle("Right Leg Power Sign", color=C.text2, size='10pt')
+        self.pwr_strip_left.setTitle("Left Leg Power Sign", color=C.text2, size='10pt')
+        if self._rpi_status_valid:
+            ratio = max(0.0, min(1.0, float(self._rpi_power_ratio)))
+            ratio_pct = ratio * 100.0
+            auto_txt = "ON" if self._rpi_auto_delay_enable else "OFF"
+            motion_txt = "VALID" if self._rpi_auto_motion_valid else "HOLD"
+            text = f"+Ratio {ratio_pct:.1f}% | {auto_txt}/{motion_txt}"
+        else:
+            text = "+Ratio --.-% | WAIT"
+
+        # Overlay text appears inside strip (right side), not in title.
+        overlay_html = (
+            f"<div style='color:{C.purple}; font-size:10pt; font-weight:600; "
+            f"background:rgba(0,0,0,0);'>{text}</div>"
+        )
+        if hasattr(self, 'pwr_strip_right_overlay'):
+            self.pwr_strip_right_overlay.setHtml(overlay_html)
+            self._position_power_ratio_overlay(self.pwr_strip_right, self.pwr_strip_right_overlay)
+        if hasattr(self, 'pwr_strip_left_overlay'):
+            self.pwr_strip_left_overlay.setHtml(overlay_html)
+            self._position_power_ratio_overlay(self.pwr_strip_left, self.pwr_strip_left_overlay)
+
+    def _position_power_ratio_overlay(self, strip, overlay_item):
+        if overlay_item is None or strip is None:
+            return
+        vr = strip.viewRange()
+        if not vr or len(vr) != 2:
+            return
+        x0, x1 = vr[0]
+        y0, y1 = vr[1]
+        if not (isfinite(x0) and isfinite(x1) and isfinite(y0) and isfinite(y1)):
+            return
+        dx = max(1e-6, float(x1 - x0))
+        dy = max(1e-6, float(y1 - y0))
+        x = x1 - 0.012 * dx
+        y = y1 - 0.10 * dy
+        overlay_item.setPos(x, y)
 
     def _update_tag_panel(self, now=None):
         if not hasattr(self, 'lbl_tag_state'):
@@ -2156,11 +2326,19 @@ class MainWindow(QWidget):
             self._rpi_online = False
             self._rpi_last_rx_time = 0.0
             self._rpi_nn_type = -1
+            self._rpi_auto_delay_enable = False
+            self._rpi_auto_motion_valid = False
+            self._rpi_power_ratio = 0.0
+            self._rpi_pos_per_s = 0.0
+            self._rpi_neg_per_s = 0.0
+            self._rpi_best_delay_ms = 0.0
             if hasattr(self, 'lbl_rpi_nn_type'):
                 self.lbl_rpi_nn_type.setText("RPi: waiting...")
                 self.lbl_rpi_nn_type.setStyleSheet(
                     f"color:{C.orange}; font-size:13px; font-weight:600; background:transparent;")
                 self.lbl_rpi_current_filter.setText("RPi Active: waiting for status...")
+                if hasattr(self, 'lbl_rl_auto_state'):
+                    self.lbl_rl_auto_state.setText("Auto Delay: waiting for RPi status...")
             self.conn_dot.set_state('connected')
             self.btn_connect.setText("Connected")
             self._set_power_ui(self.sb_max_torque_cfg.value() > 0.0)
@@ -2382,7 +2560,7 @@ class MainWindow(QWidget):
 
         # === Parse RPi uplink passthrough [58..97] ===
         rpi_blob = payload[58:98]
-        if len(rpi_blob) >= 20 and rpi_blob[0] == RPI_PT_MAGIC0 and rpi_blob[1] == RPI_PT_MAGIC1 and rpi_blob[2] == RPI_PT_VERSION:
+        if len(rpi_blob) >= 20 and rpi_blob[0] == RPI_PT_MAGIC0 and rpi_blob[1] == RPI_PT_MAGIC1 and rpi_blob[2] >= RPI_PT_VERSION:
             self._rpi_nn_type = rpi_blob[3]
             self._rpi_filter_source = rpi_blob[4]
             self._rpi_filter_type_code = rpi_blob[5]
@@ -2391,6 +2569,19 @@ class MainWindow(QWidget):
             self._rpi_cutoff_hz = struct.unpack_from('<f', rpi_blob, 8)[0]
             self._rpi_scale = struct.unpack_from('<f', rpi_blob, 12)[0]
             self._rpi_delay_ms = struct.unpack_from('<f', rpi_blob, 16)[0]
+            auto_flags = rpi_blob[20] if len(rpi_blob) > 20 else 0
+            self._rpi_auto_delay_enable = bool(auto_flags & 0x01)
+            self._rpi_auto_motion_valid = bool(auto_flags & 0x02)
+            if len(rpi_blob) >= 40:
+                self._rpi_power_ratio = struct.unpack_from('<f', rpi_blob, 24)[0]
+                self._rpi_pos_per_s = struct.unpack_from('<f', rpi_blob, 28)[0]
+                self._rpi_neg_per_s = struct.unpack_from('<f', rpi_blob, 32)[0]
+                self._rpi_best_delay_ms = struct.unpack_from('<f', rpi_blob, 36)[0]
+            else:
+                self._rpi_power_ratio = 0.0
+                self._rpi_pos_per_s = 0.0
+                self._rpi_neg_per_s = 0.0
+                self._rpi_best_delay_ms = self._rpi_delay_ms
             self._rpi_last_rx_time = time.time()
             self._rpi_online = True
             prev_nn = getattr(self, '_prev_rpi_nn_type', -1)
@@ -2479,6 +2670,22 @@ class MainWindow(QWidget):
         R_pwr = R_vel * R_tau_for_pwr * (pi / 180.0)
         self.L_pwr_buf.append(L_pwr * vL)
         self.R_pwr_buf.append(R_pwr * vR)
+
+        # === CSV logging (always on) ===
+        if hasattr(self, '_csv_writer'):
+            self._csv_writer.writerow([
+                f'{t:.3f}',
+                f'{L_angle:.3f}', f'{R_angle:.3f}',
+                f'{L_tau_d:.4f}', f'{R_tau_d:.4f}',
+                f'{L_tau:.4f}',   f'{R_tau:.4f}',
+                f'{L_vel:.3f}',   f'{R_vel:.3f}',
+                f'{L_pwr:.4f}',   f'{R_pwr:.4f}',
+                f'{gait_freq:.3f}',
+            ])
+            now_wall = time.time()
+            if now_wall - self._csv_last_flush > 1.0:
+                self._csv_file.flush()
+                self._csv_last_flush = now_wall
 
         self._update_counter += 1
         eco = self.sw_eco.isChecked()

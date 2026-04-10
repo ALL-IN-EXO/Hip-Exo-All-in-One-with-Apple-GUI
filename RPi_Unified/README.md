@@ -214,7 +214,7 @@ Pi RX (GPIO15) ← Teensy TX8 (pin 35)
 
 二进制帧: `A5 5A [LEN] [TYPE] [payload] [CHKSUM]`
 
-- TYPE=0x01 (IMU): 5×float32 (Lpos, Rpos, Lvel, Rvel, exo_delay) + 11字节 logtag
+- TYPE=0x01 (IMU): 4×float32 (Lpos, Rpos, Lvel, Rvel) + 11字节 logtag
 - TYPE=0x02 (GUI透传): 40字节 passthrough payload
 
 ### 发送 (Pi → Teensy)

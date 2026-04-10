@@ -18,7 +18,7 @@ Teensy 4.1, SIG / T-Motor (x2), IM948 IMU (x6), BLE Transceiver for IMU, Adafrui
 | **Serial5** | 115200 | BLE Transceiver (GUI link) | **128-byte** binary frames | TX: 20 Hz, RX: event-driven | RX/TX |
 | **Serial6** | 460800 | IMU Right Thigh (via BLE transceiver) | IM948 binary | 100 Hz | RX/TX |
 | **Serial7** | 460800 | IMU Left Thigh (via BLE transceiver) | IM948 binary | 100 Hz | RX/TX |
-| **Serial8** | 115200 | Raspberry Pi 5 | Binary frames (36B TX / 26B RX) | 100 Hz | RX/TX |
+| **Serial8** | 115200 | Raspberry Pi 5 | Binary frames (32B TX / 26B RX) | 100 Hz | RX/TX |
 | **CAN3** | 1 Mbps | Motors (x2) | CAN 2.0 (SIG/T-Motor) | 100 Hz | RX/TX |
 
 ---
@@ -438,7 +438,7 @@ RPi 每 50 帧 (~0.5s @100Hz) 发送状态帧 (header `AA 56` + 40B):
 ### 10.6 Serial8 通讯协议 (Teensy ↔ RPi)
 
 **Teensy → RPi (下行)**:
-- IMU 数据帧: `A5 5A [LEN=32] [TYPE=0x01] [5×float32 + 11B logtag] [CHKSUM]`
+- IMU 数据帧: `A5 5A [LEN=28] [TYPE=0x01] [4×float32 + 11B logtag] [CHKSUM]`
 - GUI 透传帧: `A5 5A [LEN=41] [TYPE=0x02] [40B payload] [CHKSUM]`
 
 **RPi → Teensy (上行)**:
