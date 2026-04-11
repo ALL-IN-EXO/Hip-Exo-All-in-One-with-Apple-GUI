@@ -27,11 +27,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - GUI 优化：`Power Sign` 子图右侧新增图内 overlay 指标（`+Ratio(%)` + `Auto/motion`），替代标题塞字
   - GUI 细化：`Auto Delay` 打开时，`Torque Delay (ms)` 行改为灰色只读 `L/R` 显示；`Power Sign` overlay 改为两行并上移，避免左腿文本被裁切
   - GUI 细化：功率显示增加“仅显示路径”的速度去毛刺（绝对值/跳变阈值守卫），抑制 IMU 单帧速度尖峰导致的瞬时异常大负功率
+  - GUI 稳定性：`Power Sign` 左腿 strip 与右腿统一隐藏底轴数值，修复大字 overlay 偶发被挤压/不可见；RPi 状态解析新增范围与跳变校验，丢弃异常帧以避免 delay/power 瞬时跳变显示
 - RL 自动延迟改为左右腿独立 (per-leg L/R delay)：
   - RPi `runtime_delay_ms` 拆成 `runtime_delay_ms_L/R`，auto 关闭或 cfg 下发时两腿同步到 GUI 基础 delay；auto 打开后两腿独立扫描、独立 dwell、独立推荐
   - `evaluate_delay_candidate` 改为 `evaluate_delay_candidate_leg`，每侧只用本腿 `tau/vel` 做评估
   - auto 状态机内部 `_auto_step_leg(...)` 对 L/R 各调一次，各自返回更新后的 delay / best / metrics
   - 推理输出的 delay buffer 按 `delay_frames_L/R` 分别移相
+- LSTM-PD 默认扭矩倍率下调为 `scale=0.40`（GUI 预设与 RPi 启动默认对齐）
+- RPi 新增 `lstm_pd` 专用可选 zero-mean 输出平衡（开关在 `RL_controller_torch.py` 顶部参数区）：
+  - 仅作用于 `--nn lstm_pd`
+  - 作用位置为“滤波后、delay 前”
+  - 通过滑窗均值去偏置，目标是让扭矩围绕 0 更对称
   - CSV 日志 `torque_delay_ms` 拆为 `torque_delay_ms_L / torque_delay_ms_R`
 - Serial8 `AA 56` RPi→Teensy 状态帧版本号由 `0x02` 升为 `0x03`，仍保持 40B 载荷不变：
   - `[16..17] delay_ms_L (int16 ×10)`、`[18..19] delay_ms_R (int16 ×10)`
