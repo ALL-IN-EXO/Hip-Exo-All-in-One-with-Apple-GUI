@@ -609,6 +609,10 @@ class MainWindow(QWidget):
         self._rpi_status_valid = False
         self._rpi_last_rx_time = 0.0      # 上次收到 RPi 状态的时间
         self._rpi_online = False           # RPi 在线标志
+        # RPi status display guards: reject obviously corrupted passthrough samples.
+        self._rpi_delay_max_ms = 1000.0
+        self._rpi_power_abs_max_w = 200.0
+        self._rpi_delay_jump_guard_ms = 300.0
 
         # Connection health
         self._last_rx_time = 0.0
@@ -1419,12 +1423,12 @@ class MainWindow(QWidget):
         # nn=0: DNN     → scale=0.50, delay=200ms, cutoff=2.5Hz, Butterworth, Vel+Ref+Torque ON
         # nn=1: LSTM    → scale=1.00, delay=0ms,   cutoff=5.0Hz, Butterworth, Torque ON
         # nn=2: LegDcp  → scale=1.00, delay=100ms, cutoff=5.0Hz, Butterworth, Torque ON
-        # nn=3: LSTM-PD → scale=1.00, delay=200ms, cutoff=2.5Hz, Butterworth, Torque ON
+        # nn=3: LSTM-PD → scale=0.40, delay=200ms, cutoff=2.5Hz, Butterworth, Torque ON
         _presets = {
             0: dict(scale=0.50, delay=200.0, cutoff=2.5,  vr=True,  torque=True),
             1: dict(scale=1.00, delay=0.0,   cutoff=5.0,  vr=False, torque=True),
             2: dict(scale=1.00, delay=100.0, cutoff=5.0,  vr=False, torque=True),
-            3: dict(scale=1.00, delay=200.0, cutoff=2.5,  vr=False, torque=True),
+            3: dict(scale=0.40, delay=200.0, cutoff=2.5,  vr=False, torque=True),
         }
         preset = _presets.get(nn, _presets[1])
         self.sb_rl_scale.setValue(preset['scale'])
@@ -2196,6 +2200,9 @@ class MainWindow(QWidget):
         self.pwr_strip_left.getAxis('left').setLabel('', units='W')
         self.pwr_strip_left.getAxis('left').setPen(C.text2)
         self.pwr_strip_left.getAxis('left').setTextPen(C.text2)
+        # Keep same compact vertical layout as right strip; otherwise overlay text
+        # can be clipped because bottom tick labels consume strip height.
+        self.pwr_strip_left.getAxis('bottom').setStyle(showValues=False)
         self.pwr_strip_left.getAxis('bottom').setPen(C.plot_fg)
         self.pwr_strip_left.getAxis('bottom').setTextPen(C.plot_fg)
         self.pwr_strip_left_zero = pg.PlotDataItem(pen=pg.mkPen(C.separator, width=1.2))
@@ -2346,7 +2353,11 @@ class MainWindow(QWidget):
         dx = max(1e-6, float(x1 - x0))
         dy = max(1e-6, float(y1 - y0))
         x = x1 - 0.012 * dx
-        y = y1 - 0.005 * dy
+        # Left overlay is slightly higher than right.
+        if overlay_item is getattr(self, 'pwr_strip_left_overlay', None):
+            y = y1 - 0.001 * dy
+        else:
+            y = y1 - 0.005 * dy
         overlay_item.setPos(x, y)
 
     def _update_tag_panel(self, now=None):
@@ -2683,30 +2694,54 @@ class MainWindow(QWidget):
 
             if version >= RPI_STATUS_VERSION_PER_LEG and len(rpi_blob) >= 40:
                 # v3: int16-packed L/R pairs
-                self._rpi_delay_ms_L = struct.unpack_from('<h', rpi_blob, 16)[0] / 10.0
-                self._rpi_delay_ms_R = struct.unpack_from('<h', rpi_blob, 18)[0] / 10.0
+                dL = struct.unpack_from('<h', rpi_blob, 16)[0] / 10.0
+                dR = struct.unpack_from('<h', rpi_blob, 18)[0] / 10.0
                 auto_flags = rpi_blob[20]
-                self._rpi_auto_delay_enable = bool(auto_flags & 0x01)
-                self._rpi_auto_motion_valid_L = bool(auto_flags & 0x02)
-                self._rpi_auto_motion_valid_R = bool(auto_flags & 0x04)
-                self._rpi_power_ratio_L = struct.unpack_from('<h', rpi_blob, 24)[0] / 10000.0
-                self._rpi_power_ratio_R = struct.unpack_from('<h', rpi_blob, 26)[0] / 10000.0
-                self._rpi_pos_per_s_L = struct.unpack_from('<h', rpi_blob, 28)[0] / 100.0
-                self._rpi_pos_per_s_R = struct.unpack_from('<h', rpi_blob, 30)[0] / 100.0
-                self._rpi_neg_per_s_L = struct.unpack_from('<h', rpi_blob, 32)[0] / 100.0
-                self._rpi_neg_per_s_R = struct.unpack_from('<h', rpi_blob, 34)[0] / 100.0
-                self._rpi_best_delay_ms_L = struct.unpack_from('<h', rpi_blob, 36)[0] / 10.0
-                self._rpi_best_delay_ms_R = struct.unpack_from('<h', rpi_blob, 38)[0] / 10.0
+                rL = struct.unpack_from('<h', rpi_blob, 24)[0] / 10000.0
+                rR = struct.unpack_from('<h', rpi_blob, 26)[0] / 10000.0
+                pL = struct.unpack_from('<h', rpi_blob, 28)[0] / 100.0
+                pR = struct.unpack_from('<h', rpi_blob, 30)[0] / 100.0
+                nL = struct.unpack_from('<h', rpi_blob, 32)[0] / 100.0
+                nR = struct.unpack_from('<h', rpi_blob, 34)[0] / 100.0
+                bL = struct.unpack_from('<h', rpi_blob, 36)[0] / 10.0
+                bR = struct.unpack_from('<h', rpi_blob, 38)[0] / 10.0
+
+                valid_sample = (
+                    isfinite(dL) and isfinite(dR) and isfinite(rL) and isfinite(rR) and
+                    isfinite(pL) and isfinite(pR) and isfinite(nL) and isfinite(nR) and
+                    isfinite(bL) and isfinite(bR) and
+                    (0.0 <= dL <= self._rpi_delay_max_ms) and
+                    (0.0 <= dR <= self._rpi_delay_max_ms) and
+                    (0.0 <= bL <= self._rpi_delay_max_ms) and
+                    (0.0 <= bR <= self._rpi_delay_max_ms) and
+                    (-0.02 <= rL <= 1.02) and (-0.02 <= rR <= 1.02) and
+                    (abs(pL) <= self._rpi_power_abs_max_w) and (abs(pR) <= self._rpi_power_abs_max_w) and
+                    (abs(nL) <= self._rpi_power_abs_max_w) and (abs(nR) <= self._rpi_power_abs_max_w)
+                )
+                if self._rpi_status_valid:
+                    valid_sample = valid_sample and (
+                        abs(dL - self._rpi_delay_ms_L) <= self._rpi_delay_jump_guard_ms and
+                        abs(dR - self._rpi_delay_ms_R) <= self._rpi_delay_jump_guard_ms
+                    )
+                if valid_sample:
+                    self._rpi_delay_ms_L = dL
+                    self._rpi_delay_ms_R = dR
+                    self._rpi_auto_delay_enable = bool(auto_flags & 0x01)
+                    self._rpi_auto_motion_valid_L = bool(auto_flags & 0x02)
+                    self._rpi_auto_motion_valid_R = bool(auto_flags & 0x04)
+                    self._rpi_power_ratio_L = rL
+                    self._rpi_power_ratio_R = rR
+                    self._rpi_pos_per_s_L = pL
+                    self._rpi_pos_per_s_R = pR
+                    self._rpi_neg_per_s_L = nL
+                    self._rpi_neg_per_s_R = nR
+                    self._rpi_best_delay_ms_L = bL
+                    self._rpi_best_delay_ms_R = bR
             else:
                 # v2 legacy: single-leg float32 — mirror to both L/R for display.
                 delay_ms = struct.unpack_from('<f', rpi_blob, 16)[0]
                 auto_flags = rpi_blob[20] if len(rpi_blob) > 20 else 0
-                self._rpi_auto_delay_enable = bool(auto_flags & 0x01)
                 motion_valid = bool(auto_flags & 0x02)
-                self._rpi_auto_motion_valid_L = motion_valid
-                self._rpi_auto_motion_valid_R = motion_valid
-                self._rpi_delay_ms_L = delay_ms
-                self._rpi_delay_ms_R = delay_ms
                 if len(rpi_blob) >= 40:
                     ratio = struct.unpack_from('<f', rpi_blob, 24)[0]
                     pos_w = struct.unpack_from('<f', rpi_blob, 28)[0]
@@ -2717,14 +2752,33 @@ class MainWindow(QWidget):
                     pos_w = 0.0
                     neg_w = 0.0
                     best_d = delay_ms
-                self._rpi_power_ratio_L = ratio
-                self._rpi_power_ratio_R = ratio
-                self._rpi_pos_per_s_L = 0.5 * pos_w
-                self._rpi_pos_per_s_R = 0.5 * pos_w
-                self._rpi_neg_per_s_L = 0.5 * neg_w
-                self._rpi_neg_per_s_R = 0.5 * neg_w
-                self._rpi_best_delay_ms_L = best_d
-                self._rpi_best_delay_ms_R = best_d
+                valid_sample = (
+                    isfinite(delay_ms) and isfinite(best_d) and isfinite(ratio) and
+                    isfinite(pos_w) and isfinite(neg_w) and
+                    (0.0 <= delay_ms <= self._rpi_delay_max_ms) and
+                    (0.0 <= best_d <= self._rpi_delay_max_ms) and
+                    (-0.02 <= ratio <= 1.02) and
+                    (abs(pos_w) <= 2.0 * self._rpi_power_abs_max_w) and
+                    (abs(neg_w) <= 2.0 * self._rpi_power_abs_max_w)
+                )
+                if self._rpi_status_valid:
+                    valid_sample = valid_sample and (
+                        abs(delay_ms - self._rpi_delay_ms_L) <= self._rpi_delay_jump_guard_ms
+                    )
+                if valid_sample:
+                    self._rpi_auto_delay_enable = bool(auto_flags & 0x01)
+                    self._rpi_auto_motion_valid_L = motion_valid
+                    self._rpi_auto_motion_valid_R = motion_valid
+                    self._rpi_delay_ms_L = delay_ms
+                    self._rpi_delay_ms_R = delay_ms
+                    self._rpi_power_ratio_L = ratio
+                    self._rpi_power_ratio_R = ratio
+                    self._rpi_pos_per_s_L = 0.5 * pos_w
+                    self._rpi_pos_per_s_R = 0.5 * pos_w
+                    self._rpi_neg_per_s_L = 0.5 * neg_w
+                    self._rpi_neg_per_s_R = 0.5 * neg_w
+                    self._rpi_best_delay_ms_L = best_d
+                    self._rpi_best_delay_ms_R = best_d
 
             # Legacy aliases for any other code paths: expose averaged/combined.
             self._rpi_delay_ms = 0.5 * (self._rpi_delay_ms_L + self._rpi_delay_ms_R)

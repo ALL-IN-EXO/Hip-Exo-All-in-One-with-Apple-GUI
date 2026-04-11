@@ -83,12 +83,18 @@ MAX_RUNTIME_DELAY_MS = 1000.0
 BUF_SIZE = int(round(MAX_RUNTIME_DELAY_MS / dt_ms)) + 1
 
 # ---- CSV 日志 ----
-SAVE_VERBOSE_LOG = False
+SAVE_VERBOSE_LOG = True
 
 # ---- Zero Mean (仅DNN模式) ----
 ENABLE_ZERO_MEAN       = False
 ZERO_MEAN_BUFFER_SIZE  = 200
 ZERO_MEAN_WARMUP       = 100
+
+# ---- LSTM-PD 输出去均值 (仅NN_TYPE='lstm_pd'时生效) ----
+# 作用位置: 滤波后、delay前。用于把扭矩中心拉回 0，缓解正负不对称。
+LSTM_PD_ZERO_MEAN_ENABLE = True
+LSTM_PD_ZERO_MEAN_WINDOW_S = 6.0
+LSTM_PD_ZERO_MEAN_WARMUP_S = 2.0
 
 # ---- 速度计算方式 (仅DNN模式) ----
 USE_VELOCITY_FROM_DERIVATIVE  = False
@@ -364,6 +370,7 @@ csv_header = [
     'L_command_actuator', 'R_command_actuator',
     'raw_LExoTorque', 'raw_RExoTorque',
     'filtered_LExoTorque', 'filtered_RExoTorque',
+    'pd_zm_bias_L', 'pd_zm_bias_R',
     'L_P', 'L_D', 'R_P', 'R_D',
     'scale_runtime', 'torque_delay_ms_L', 'torque_delay_ms_R',
     'tag',
@@ -807,7 +814,15 @@ def main():
     last_flush = time.time()
 
     # runtime_scale: GUI 运行时下发的最终扭矩倍率 (乘在 delay 后命令上)
-    runtime_scale = 1.0
+    # LSTM-PD 默认使用更保守的 scale=0.4，其它网络维持 1.0
+    runtime_scale = 0.4 if NN_TYPE == 'lstm_pd' else 1.0
+    pd_zm_enabled = (NN_TYPE == 'lstm_pd') and bool(LSTM_PD_ZERO_MEAN_ENABLE)
+    pd_zm_window_frames = max(8, int(round(LSTM_PD_ZERO_MEAN_WINDOW_S * CTRL_HZ)))
+    pd_zm_warmup_frames = max(1, int(round(LSTM_PD_ZERO_MEAN_WARMUP_S * CTRL_HZ)))
+    pd_zm_hist_L = deque(maxlen=pd_zm_window_frames)
+    pd_zm_hist_R = deque(maxlen=pd_zm_window_frames)
+    pd_zm_bias_L = 0.0
+    pd_zm_bias_R = 0.0
     # LegDcp default delay: 100ms; others: 0ms
     runtime_delay_ms = 100.0 if NN_TYPE == 'lstm_leg_dcp' else 0.0
     # 每腿当前实际生效的 delay (auto 模式下独立漂移; 非 auto 模式与 runtime_delay_ms 同步)
@@ -869,6 +884,11 @@ def main():
 
     print(f"\n[启动] NN_TYPE={NN_TYPE}, kp={kp}, kd={kd}")
     print(f"[启动] 串口={SER_DEV}, 波特率={BAUDRATE}")
+    if NN_TYPE == 'lstm_pd':
+        print(
+            f"[启动] lstm_pd zero-mean={'ON' if pd_zm_enabled else 'OFF'} "
+            f"(window={pd_zm_window_frames}f, warmup={pd_zm_warmup_frames}f)"
+        )
     print(f"[启动] 日志={logf}\n")
 
     with open(logf, 'w', newline='') as fcsv:
@@ -917,6 +937,11 @@ def main():
                 hist_vel_R.clear()
                 hist_ang_L.clear()
                 hist_ang_R.clear()
+                if pd_zm_enabled:
+                    pd_zm_hist_L.clear()
+                    pd_zm_hist_R.clear()
+                    pd_zm_bias_L = 0.0
+                    pd_zm_bias_R = 0.0
                 _now_wall = time.time()
                 auto_last_eval_ts = _now_wall
                 if auto_delay_enable and not prev_auto_delay_enable:
@@ -993,6 +1018,22 @@ def main():
             else:
                 filter_L_cmd = L_cmd
                 filter_R_cmd = R_cmd
+
+            # ---- lstm_pd: optional post-filter zero-mean balancing (RPi only) ----
+            if pd_zm_enabled:
+                pd_zm_hist_L.append(float(filter_L_cmd))
+                pd_zm_hist_R.append(float(filter_R_cmd))
+                if len(pd_zm_hist_L) >= pd_zm_warmup_frames:
+                    pd_zm_bias_L = float(np.mean(pd_zm_hist_L))
+                    pd_zm_bias_R = float(np.mean(pd_zm_hist_R))
+                else:
+                    pd_zm_bias_L = 0.0
+                    pd_zm_bias_R = 0.0
+                filter_L_cmd = float(filter_L_cmd) - pd_zm_bias_L
+                filter_R_cmd = float(filter_R_cmd) - pd_zm_bias_R
+            else:
+                pd_zm_bias_L = 0.0
+                pd_zm_bias_R = 0.0
 
             delay_input_L = filter_L_cmd if USE_FILTERED_FOR_DELAY else L_cmd
             delay_input_R = filter_R_cmd if USE_FILTERED_FOR_DELAY else R_cmd
@@ -1189,6 +1230,8 @@ def main():
                 'raw_RExoTorque': f'{R_cmd:.6f}',
                 'filtered_LExoTorque': f'{filter_L_cmd:.6f}',
                 'filtered_RExoTorque': f'{filter_R_cmd:.6f}',
+                'pd_zm_bias_L': f'{pd_zm_bias_L:.6f}',
+                'pd_zm_bias_R': f'{pd_zm_bias_R:.6f}',
                 'L_P': f'{L_p:.6f}',
                 'L_D': f'{L_d:.6f}',
                 'R_P': f'{R_p:.6f}',
@@ -1205,10 +1248,12 @@ def main():
                 last_flush = time.time()
 
             # ---- 控制台输出 ----
+            _zm_txt = (f' | zmL:{pd_zm_bias_L:6.2f} | zmR:{pd_zm_bias_R:6.2f}'
+                       if pd_zm_enabled else '')
             print(f'| time:{now:6.2f}s | Lθ:{Lpos:7.2f}° | Rθ:{Rpos:7.2f}° | '
                   f'Lω:{Lvel:7.2f} | Rω:{Rvel:7.2f} | '
                   f'τL:{L_cmd_final:6.2f} | τR:{R_cmd_final:6.2f} | scale:{runtime_scale:4.2f} | '
-                  f'Rp:{R_p:6.2f} | Rd:{R_d:6.2f} ')
+                  f'Rp:{R_p:6.2f} | Rd:{R_d:6.2f}{_zm_txt} ')
 
 
 if __name__ == '__main__':
