@@ -41,6 +41,12 @@ GUI_RL_update/captures/
 # Column mapping (auto-generated)
 .column_mapping.json
 
+# RPi connection profiles (personal, gitignored — see tools/rpi_profiles.conf.example)
+tools/rpi_profiles.conf
+
+# BLE device name config (personal, gitignored — see ble_device_config.h.example)
+3. BLE Bridge (ItsyBitsy nRF52840)/**/ble_device_config.h
+
 # Editor / IDE
 .vscode/
 .idea/

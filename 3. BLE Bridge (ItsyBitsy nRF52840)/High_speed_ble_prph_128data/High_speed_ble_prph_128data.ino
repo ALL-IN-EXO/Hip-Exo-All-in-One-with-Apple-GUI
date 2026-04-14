@@ -15,6 +15,10 @@
 *********************************************************************/
 
 #include <bluefruit.h>
+#include "ble_device_config.h"
+#ifndef BLE_DEVICE_NAME
+  #error "BLE_DEVICE_NAME not defined. Copy ble_device_config.h.example -> ble_device_config.h and set your name."
+#endif
 
 /* Best result is
     - 8.74 KB/s with 20 ms, MTU = 23
@@ -90,7 +94,7 @@ void setup(void)
 
   Bluefruit.begin();
   Bluefruit.setTxPower(4);    // Check bluefruit.h for supported values
-  Bluefruit.setName("Shutong");         // 设置名称
+  Bluefruit.setName(BLE_DEVICE_NAME);   // 设置名称 (defined in ble_device_config.h)
   Bluefruit.Periph.setConnectCallback(connect_callback);
   Bluefruit.Periph.setDisconnectCallback(disconnect_callback);
   Bluefruit.Periph.setConnInterval(6, 12); // 7.5 - 15 ms
