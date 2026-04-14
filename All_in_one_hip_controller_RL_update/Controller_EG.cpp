@@ -18,6 +18,7 @@ Controller_EG::Controller_EG() {
   ext_phase_frac_R_ = 0.3f;
   ext_gain_         = 0.5f;
   scale_all_        = 0.2f;
+  post_delay_ms_base_ = 0.0f;
 
   reset();
 }
@@ -26,16 +27,20 @@ void Controller_EG::reset() {
   memset(RLTx_delay_, 0, sizeof(RLTx_delay_));
   memset(flexL_hist_, 0, sizeof(flexL_hist_));
   memset(flexR_hist_, 0, sizeof(flexR_hist_));
-  doi_    = 0;
-  ext_i_  = 0;
+  memset(post_buf_L_, 0, sizeof(post_buf_L_));
+  memset(post_buf_R_, 0, sizeof(post_buf_R_));
+  doi_         = 0;
+  ext_i_       = 0;
+  post_buf_idx_ = 0;
   xL_prev_ = 0.0f;
   xR_prev_ = 0.0f;
   tau_cmd_L_filt_ = 0.0f;
   tau_cmd_R_filt_ = 0.0f;
+  ado_.reset(post_delay_ms_base_);
 }
 
 void Controller_EG::parse_params(const BleDownlinkData& dl) {
-  // GUI 默认会发 Rescaling=0（历史占位值），这里按 1.0 处理为“中性缩放”。
+  // GUI 默认会发 Rescaling=0（历史占位值），这里按 1.0 处理为”中性缩放”。
   Rescaling_gain_    = dl.Rescaling_gain;
   if (Rescaling_gain_ <= 0.0f) Rescaling_gain_ = 1.0f;
   if (Rescaling_gain_ > 10.0f) Rescaling_gain_ = 10.0f;
@@ -60,6 +65,13 @@ void Controller_EG::parse_params(const BleDownlinkData& dl) {
   ext_phase_frac_R_  = dl.ext_phase_frac_R;
   ext_gain_          = dl.ext_gain;
   scale_all_         = dl.scale_all;
+
+  post_delay_ms_base_ = (float)dl.eg_post_delay_ms;
+  if (post_delay_ms_base_ < 0.0f)    post_delay_ms_base_ = 0.0f;
+  if (post_delay_ms_base_ > 1500.0f) post_delay_ms_base_ = 1500.0f;
+
+  // 更新 auto delay 配置；rising edge 自动冷启动
+  ado_.set_config(dl.auto_delay_enable, post_delay_ms_base_);
 }
 
 float Controller_EG::smooth_gate_p(float x, float k, float p_on) {
@@ -205,6 +217,37 @@ void Controller_EG::compute(const CtrlInput& in, CtrlOutput& out) {
   if (S_R >  max_abs) S_R =  max_abs;
   if (S_R < -max_abs) S_R = -max_abs;
 
-  out.tau_L = S_L;
-  out.tau_R = S_R;
+  // === 后处理延迟缓冲 + AutoDelayOptimizer 数据推入 ===
+  // tau_src (pre-post-delay) 与 IMU 角速度一起送入 ADO ring buffer
+  ado_.push_sample(S_L, S_R, in.LTAVx, in.RTAVx);
+
+  // 写入后处理延迟缓冲
+  post_buf_L_[post_buf_idx_] = S_L;
+  post_buf_R_[post_buf_idx_] = S_R;
+
+  // 读取各腿延迟输出（delay_ms_L/R 由 ADO 管理，auto=off 时等于 base_delay_ms）
+  auto read_post = [&](const float* buf, float delay_ms) -> float {
+    int d_frames = (int)lrintf(delay_ms / (1000.0f * in.Ts));
+    if (d_frames < 0) d_frames = 0;
+    if (d_frames >= EG_POST_DELAY_BUF) d_frames = EG_POST_DELAY_BUF - 1;
+    int ridx = post_buf_idx_ - d_frames;
+    if (ridx < 0) ridx += EG_POST_DELAY_BUF;
+    return buf[ridx];
+  };
+
+  float tau_L_delayed = read_post(post_buf_L_, ado_.delay_ms_L);
+  float tau_R_delayed = read_post(post_buf_R_, ado_.delay_ms_R);
+
+  post_buf_idx_ = (post_buf_idx_ + 1) % EG_POST_DELAY_BUF;
+
+  out.tau_L = tau_L_delayed;
+  out.tau_R = tau_R_delayed;
+}
+
+void Controller_EG::tick_auto_delay(unsigned long now_us, float gait_freq_hz) {
+  ado_.tick(now_us, gait_freq_hz);
+}
+
+void Controller_EG::fill_ble_status(uint8_t* buf40) const {
+  ado_.fill_ble_status(buf40, 1.0f);
 }

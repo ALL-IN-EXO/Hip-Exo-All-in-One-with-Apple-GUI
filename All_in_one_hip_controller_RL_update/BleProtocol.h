@@ -72,9 +72,13 @@
  *     [22..23] ext_phase_frac_R ×1000 int16
  *     [24..25] ext_gain ×100          int16
  *     [26..27] scale_all ×100         int16
+ *     [29..30] eg_post_delay_ms       int16 (auto delay 后处理基础延迟 ms, 仅 EG 用)
  *   Samsung 参数 (algo=1):
  *     [5..6]   kappa ×100             int16
  *     [7..8]   delay_ms               int16
+ * --- 通用自动延迟控制 [28] ---
+ *   [28]     auto_delay_flags  uint8
+ *              bit0: auto_delay_enable (EG/Samsung/非RL 通用)
  *   RL 参数 (algo=2):
  *     (暂无 Teensy 侧参数, RPi 参数通过透传区)
  *   Test 参数 (algo=3):
@@ -235,6 +239,10 @@ struct BleDownlinkData {
   uint8_t test_waveform;    // [7] 0=const, 1=sin
   float test_freq_hz;       // [8..9]
 
+  // 通用自动延迟控制 (EG/Samsung 适用; RL 用 rpi_passthru 内的位)
+  bool    auto_delay_enable;  // payload[28] bit0
+  int16_t eg_post_delay_ms;   // payload[29..30], EG 后处理延迟基础值 (ms)
+
   // RPi 透传区
   uint8_t rpi_passthru[40]; // [58..97]
   bool    has_rpi_data;
@@ -287,6 +295,10 @@ static inline BleDownlinkData ble_parse_downlink(const uint8_t* payload) {
       d.test_freq_hz   = ble_rd_i16(payload, 8) / 100.0f;
       break;
   }
+
+  // 通用自动延迟控制 [28..30] (EG/Samsung; RL 通过 rpi_passthru 传)
+  d.auto_delay_enable = (payload[28] & 0x01) != 0;
+  d.eg_post_delay_ms  = ble_rd_i16(payload, 29);
 
   // RPi 透传区 [58..97]
   memcpy(d.rpi_passthru, &payload[58], 40);

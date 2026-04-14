@@ -577,6 +577,9 @@ class MainWindow(QWidget):
 
         # RPi status (received via BLE uplink passthrough)
         self._rpi_nn_type = -1          # -1=unknown, 0=dnn, 1=lstm, 2=lstm_leg_dcp, 3=lstm_pd
+        # Teensy-native auto delay enable flags (Samsung / EG)
+        self._sam_auto_delay_enable = False
+        self._eg_auto_delay_enable  = False
         self._rpi_status_version = 0    # 2 = legacy float, 3 = per-leg int16 pairs
         self._rpi_filter_source = 0     # 0=base, 1=runtime_override
         self._rpi_filter_type_code = 0
@@ -852,6 +855,26 @@ class MainWindow(QWidget):
             lbl.setStyleSheet(f"color:{C.text2}; font-size:11px; background:transparent;")
             eg_grid.addWidget(lbl, r*2, c)
             eg_grid.addWidget(sb, r*2+1, c)
+        # Post-delay row (below the 3-column grid; 9 items → rows 0-5, so start at row 6)
+        _eg_next_row = (((len(eg_labels) - 1) // 3) + 1) * 2
+        self.sb_eg_post_delay = make_dspin(0, 0, 1500, 10, 0)
+        self.sb_eg_post_delay.setToolTip(
+            "EG output post-delay (ms). Applied after internal Assist_delay_gain. "
+            "Auto Delay ON: optimized by Teensy-local AutoDelayOptimizer (L/R independent).")
+        self.chk_eg_auto_delay = QCheckBox("Auto Delay")
+        self.chk_eg_auto_delay.setChecked(False)
+        self.chk_eg_auto_delay.setToolTip(
+            "Teensy-local auto delay: optimizes post_delay_ms to maximize positive power ratio (L/R independent)")
+        self.chk_eg_auto_delay.stateChanged.connect(self._on_eg_auto_delay_toggled)
+        self.lbl_eg_auto_delay_state = QLabel("L=-- ms  R=-- ms")
+        self.lbl_eg_auto_delay_state.setStyleSheet(
+            f"color:{C.purple}; font-size:11px; background:transparent;")
+        _lbl_pd = QLabel("Post Delay (ms)")
+        _lbl_pd.setStyleSheet(f"color:{C.text2}; font-size:11px; background:transparent;")
+        eg_grid.addWidget(_lbl_pd, _eg_next_row, 0, 1, 2)
+        eg_grid.addWidget(self.sb_eg_post_delay, _eg_next_row, 2)
+        eg_grid.addWidget(self.chk_eg_auto_delay, _eg_next_row + 1, 0)
+        eg_grid.addWidget(self.lbl_eg_auto_delay_state, _eg_next_row + 1, 1, 1, 2)
         self.algo_stack.addWidget(eg_panel)
 
         # -- Samsung panel --
@@ -861,10 +884,20 @@ class MainWindow(QWidget):
         sam_grid.setSpacing(4)
         self.sb_sam_kappa = make_dspin(3.0, 0, 20, 0.1, 1)
         self.sb_sam_delay = make_dspin(250, 0, 1500, 10, 0)
+        self.chk_sam_auto_delay = QCheckBox("Auto Delay")
+        self.chk_sam_auto_delay.setChecked(False)
+        self.chk_sam_auto_delay.setToolTip(
+            "Teensy-local auto delay: optimizes delay_ms to maximize positive power ratio (L/R independent)")
+        self.chk_sam_auto_delay.stateChanged.connect(self._on_sam_auto_delay_toggled)
+        self.lbl_sam_auto_delay_state = QLabel("L=-- ms  R=-- ms")
+        self.lbl_sam_auto_delay_state.setStyleSheet(
+            f"color:{C.purple}; font-size:11px; background:transparent;")
         sam_grid.addWidget(QLabel("Kappa"), 0, 0)
         sam_grid.addWidget(self.sb_sam_kappa, 0, 1)
         sam_grid.addWidget(QLabel("Delay (ms)"), 1, 0)
         sam_grid.addWidget(self.sb_sam_delay, 1, 1)
+        sam_grid.addWidget(self.chk_sam_auto_delay, 2, 0)
+        sam_grid.addWidget(self.lbl_sam_auto_delay_state, 2, 1)
         self.algo_stack.addWidget(sam_panel)
 
         # -- RL panel --
@@ -1349,6 +1382,27 @@ class MainWindow(QWidget):
         self._update_rl_delay_input_mode()
         self._update_rl_filter_state_label()
 
+    def _on_sam_auto_delay_toggled(self, _state):
+        auto_on = self.chk_sam_auto_delay.isChecked()
+        self._sam_auto_delay_enable = auto_on
+        self.sb_sam_delay.setEnabled(not auto_on)
+        if auto_on:
+            self.sb_sam_delay.setToolTip("Auto Delay ON: Teensy optimizing delay_ms (L/R independent).")
+        else:
+            self.sb_sam_delay.setToolTip("")
+        self._tx_params()
+
+    def _on_eg_auto_delay_toggled(self, _state):
+        auto_on = self.chk_eg_auto_delay.isChecked()
+        self._eg_auto_delay_enable = auto_on
+        self.sb_eg_post_delay.setEnabled(not auto_on)
+        if auto_on:
+            self.sb_eg_post_delay.setToolTip("Auto Delay ON: Teensy optimizing post_delay_ms (L/R independent).")
+        else:
+            self.sb_eg_post_delay.setToolTip(
+                "EG output post-delay (ms). Applied after internal Assist_delay_gain.")
+        self._tx_params()
+
     def _set_rl_delay_spinbox_value(self, delay_ms: float):
         if not hasattr(self, "sb_rl_torque_delay"):
             return
@@ -1536,6 +1590,27 @@ class MainWindow(QWidget):
                 )
             else:
                 self.lbl_rl_auto_state.setText("Auto Delay: waiting for RPi status...")
+
+        # Samsung / EG auto delay state labels (Teensy-native source, v3 format same fields)
+        def _nonrl_auto_txt(auto_on):
+            if not self._rpi_status_valid:
+                return "L=-- ms  R=-- ms"
+            mL = "V" if self._rpi_auto_motion_valid_L else "-"
+            mR = "V" if self._rpi_auto_motion_valid_R else "-"
+            if auto_on:
+                return (f"L={self._rpi_delay_ms_L:.0f}ms({mL}) "
+                        f"R={self._rpi_delay_ms_R:.0f}ms({mR})")
+            else:
+                return (f"L={self._rpi_delay_ms_L:.0f}ms "
+                        f"R={self._rpi_delay_ms_R:.0f}ms")
+
+        if hasattr(self, "lbl_sam_auto_delay_state"):
+            self.lbl_sam_auto_delay_state.setText(
+                _nonrl_auto_txt(self._sam_auto_delay_enable))
+        if hasattr(self, "lbl_eg_auto_delay_state"):
+            self.lbl_eg_auto_delay_state.setText(
+                _nonrl_auto_txt(self._eg_auto_delay_enable))
+
         self._update_power_strip_titles()
 
     # ================================================================ Test waveform
@@ -2451,6 +2526,8 @@ class MainWindow(QWidget):
             self._rpi_best_delay_ms_R = 0.0
             self._rpi_delay_ms_L = 0.0
             self._rpi_delay_ms_R = 0.0
+            self._sam_auto_delay_enable = False
+            self._eg_auto_delay_enable  = False
             if hasattr(self, 'lbl_rpi_nn_type'):
                 self.lbl_rpi_nn_type.setText("RPi: waiting...")
                 self.lbl_rpi_nn_type.setStyleSheet(
@@ -2512,9 +2589,14 @@ class MainWindow(QWidget):
             put_s16(22, float(self.sb_ext_phase_frac_R.value()), 1000)
             put_s16(24, float(self.sb_ext_gain.value()))
             put_s16(26, float(self.sb_scale_all.value()))
+            # [28] auto_delay_enable bit0; [29..30] eg_post_delay_ms
+            payload[28] = 0x01 if self._eg_auto_delay_enable else 0x00
+            put_s16(29, float(self.sb_eg_post_delay.value()), 1)
         elif algo == ALGO_SAMSUNG:
             put_s16(5, float(self.sb_sam_kappa.value()))
             put_s16(7, float(self.sb_sam_delay.value()), 1)
+            # [28] auto_delay_enable bit0
+            payload[28] = 0x01 if self._sam_auto_delay_enable else 0x00
         elif algo == ALGO_RL:
             payload[58:98] = self._build_rl_passthrough()
         elif algo == ALGO_TEST:
