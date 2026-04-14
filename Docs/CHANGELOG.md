@@ -7,6 +7,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [v3.2] - 2026-04-14
+
+Multi-user workflow fixes: personal configuration (BLE pairing name, RPi connection info) moved out of source files into gitignored local config files, eliminating merge conflicts for multi-developer setups.
+
+### Added
+
+- **`ble_device_config.h` per-user BLE device name**:
+  - Removed hardcoded `"Shutong"` from both BLE Bridge sketches (central + peripheral)
+  - Both now `#include "ble_device_config.h"` (gitignored) and reference `BLE_DEVICE_NAME`
+  - `ble_device_config.h.example` committed in each sketch folder as template
+  - `#error` guard gives a clear compile-time message if the file is missing
+  - Eliminates merge conflicts when multiple users push different BLE names
+
+- **`tools/rpi_profiles.conf` multi-user Pi profile management**:
+  - `tools/rpi_sync.py` now reads connection info (host / user / remote_dir / password) from a gitignored `tools/rpi_profiles.conf` (INI format)
+  - `[active] profile = <name>` in the conf file selects the default profile; override at runtime with `--profile <name>`
+  - `tools/rpi_profiles.conf.example` committed as template (documents both `biodyn-pi5` and `aboutberlin` profiles)
+  - Removed the per-user commented-out `DEFAULT_*` blocks from `rpi_sync.py` that previously caused merge conflicts
+  - Clear error message if no conf file is found and required params are missing
+
+---
+
 ## [v3.1] - 2026-04-09 ~ 2026-04-13
 
 ### Added

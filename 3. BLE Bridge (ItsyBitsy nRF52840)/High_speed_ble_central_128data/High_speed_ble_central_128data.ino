@@ -18,6 +18,10 @@
    that has bleuart as peripheral is required for the demo.
 */
 #include <bluefruit.h>
+#include "ble_device_config.h"
+#ifndef BLE_DEVICE_NAME
+  #error "BLE_DEVICE_NAME not defined. Copy ble_device_config.h.example -> ble_device_config.h and set your name."
+#endif
 
 BLEClientUart clientUart; // bleuart client
 int rs232_datalength = 128;
@@ -26,7 +30,7 @@ uint32_t rx_count = 0;
 uint8_t data_rs232_rx[247] = { 0 };
 uint8_t data_ble_rx[247] = { 0 };
 uint16_t serial_frame_idx = 0;
-const char kTargetName[] = "Shutong";
+const char kTargetName[] = BLE_DEVICE_NAME;
 
 uint32_t gui_in_bytes_total = 0;
 uint32_t gui_in_bytes_sec = 0;

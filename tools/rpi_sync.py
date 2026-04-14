@@ -6,16 +6,21 @@ Default behavior:
 1) Run once: push local code to Pi (exclude output/)
 2) Watch mode: pull Pi output/ back to local output/
 
+Connection is configured via tools/rpi_profiles.conf (gitignored).
+Copy tools/rpi_profiles.conf.example → tools/rpi_profiles.conf and edit.
+
 Examples:
   python tools/rpi_sync.py
   python tools/rpi_sync.py --watch 2
   python tools/rpi_sync.py --direction pull --watch 1
   python tools/rpi_sync.py --direction both
+  python tools/rpi_sync.py --profile aboutberlin --direction push
 """
 
 from __future__ import annotations
 
 import argparse
+import configparser
 import datetime as dt
 import json
 import os
@@ -28,16 +33,55 @@ import sys
 import time
 
 
-# DEFAULT_HOST = "192.168.31.196"
-# DEFAULT_USER = "biodyn-pi5"
-# DEFAULT_REMOTE_DIR = "/home/biodyn-pi5/Desktop/RPi_Unified"
-# DEFAULT_PASSWORD = "a1231111"
+# ---------------------------------------------------------------------------
+# Multi-user Pi profile management
+#
+# Create tools/rpi_profiles.conf (gitignored) from tools/rpi_profiles.conf.example
+# to define your Pi connection.  The [active] section points to the profile to use.
+# Use --profile <name> on the command line to override at runtime.
+# ---------------------------------------------------------------------------
+
+_PROFILES_CONF = pathlib.Path(__file__).resolve().parent / "rpi_profiles.conf"
 
 
-# DEFAULT_HOST = "192.168.31.196"
-# DEFAULT_USER = "biodyn-pi5"
-# DEFAULT_REMOTE_DIR = "/home/biodyn-pi5/Desktop/RPi_Unified"
-# DEFAULT_PASSWORD = "a1231111"
+def _load_profile(profile_name: str | None) -> dict[str, str | None]:
+    """
+    Load connection info from tools/rpi_profiles.conf.
+
+    Returns a dict with keys: host, user, remote_dir, password.
+    All values may be None if the conf file is absent or the field is unset.
+    """
+    if not _PROFILES_CONF.exists():
+        return {"host": None, "user": None, "remote_dir": None, "password": None}
+
+    cfg = configparser.ConfigParser()
+    cfg.read(_PROFILES_CONF, encoding="utf-8")
+
+    # Determine which profile to use
+    if profile_name is None:
+        profile_name = cfg.get("active", "profile", fallback=None)
+
+    if profile_name is None or profile_name not in cfg:
+        # Fall back to first non-active, non-DEFAULT section
+        sections = [s for s in cfg.sections() if s.lower() != "active"]
+        if not sections:
+            return {"host": None, "user": None, "remote_dir": None, "password": None}
+        profile_name = sections[0]
+
+    sec = cfg[profile_name]
+    return {
+        "host": sec.get("host") or None,
+        "user": sec.get("user") or None,
+        "remote_dir": sec.get("remote_dir") or None,
+        "password": sec.get("password") or None,
+    }
+
+
+_PROFILE_DEFAULTS = _load_profile(None)
+DEFAULT_HOST = _PROFILE_DEFAULTS["host"]
+DEFAULT_USER = _PROFILE_DEFAULTS["user"]
+DEFAULT_REMOTE_DIR = _PROFILE_DEFAULTS["remote_dir"]
+DEFAULT_PASSWORD = _PROFILE_DEFAULTS["password"]
 
 
 def _detect_default_local_dir() -> pathlib.Path:
@@ -343,19 +387,27 @@ def parse_args() -> argparse.Namespace:
         description="Local <-> Raspberry Pi sync helper for RPi_Unified",
     )
     parser.add_argument(
+        "--profile",
+        default=None,
+        help=(
+            "Profile name from tools/rpi_profiles.conf "
+            "(overrides the [active] pointer in that file)"
+        ),
+    )
+    parser.add_argument(
         "--host",
         default=DEFAULT_HOST,
-        help=f"Pi host/IP (default: {DEFAULT_HOST})",
+        help=f"Pi host/IP (default: from profile or None)",
     )
     parser.add_argument(
         "--user",
         default=DEFAULT_USER,
-        help=f"Pi user (default: {DEFAULT_USER})",
+        help="Pi user (default: from profile)",
     )
     parser.add_argument(
         "--remote-dir",
         default=DEFAULT_REMOTE_DIR,
-        help=f"Pi deployment dir (default: {DEFAULT_REMOTE_DIR})",
+        help="Pi deployment dir (default: from profile)",
     )
     parser.add_argument(
         "--local-dir",
@@ -430,6 +482,29 @@ def run_once(args: argparse.Namespace, ssh_transport: str) -> bool:
 
 def main() -> int:
     args = parse_args()
+
+    # If --profile was given (or the module-level defaults came from no conf file),
+    # re-load the profile now so --profile overrides take effect.
+    if args.profile is not None:
+        p = _load_profile(args.profile)
+        if args.host is None:
+            args.host = p["host"]
+        if args.user is None:
+            args.user = p["user"]
+        if args.remote_dir is None:
+            args.remote_dir = p["remote_dir"]
+        if args.password is None:
+            args.password = p["password"]
+
+    # Validate required connection parameters
+    missing = [n for n, v in [("host", args.host), ("user", args.user), ("remote-dir", args.remote_dir)] if not v]
+    if missing:
+        print(
+            f"Error: missing required connection parameter(s): {', '.join(missing)}.\n"
+            f"Create tools/rpi_profiles.conf (see tools/rpi_profiles.conf.example) "
+            f"or pass --host / --user / --remote-dir on the command line."
+        )
+        return 2
 
     if shutil.which("rsync") is None:
         print("Error: rsync not found in PATH.")

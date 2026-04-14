@@ -1,0 +1,28 @@
+# rpi_profiles.conf.example
+#
+# Copy this file to tools/rpi_profiles.conf (gitignored) and fill in your Pi details.
+# Set [active] profile = <your-profile-name> to select which profile is used by default.
+# Override at runtime with:  python tools/rpi_sync.py --profile <name>
+#
+# Fields per profile:
+#   host        — Pi IP address or hostname
+#   user        — SSH login username
+#   remote_dir  — absolute path to RPi_Unified on the Pi
+#   password    — SSH password (used via sshpass); omit or leave blank to rely on SSH keys
+
+[active]
+profile = aboutberlin
+
+# --- Shutong / biodyn-pi5 ---
+[biodyn-pi5]
+host        = 192.168.31.196
+user        = biodyn-pi5
+remote_dir  = /home/biodyn-pi5/Desktop/RPi_Unified
+password    = a1231111
+
+# --- Juncheng / aboutberlin ---
+[aboutberlin]
+host        = 192.168.31.34
+user        = aboutberlin
+remote_dir  = /home/aboutberlin/Desktop/RPi_Unified
+password    = a1231111

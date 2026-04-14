@@ -2,7 +2,9 @@
 
 A multi-component control system for the hip exoskeleton, consisting of Teensy 4.1 firmware, a Raspberry Pi RL controller, and a macOS GUI. Supports runtime-switchable control algorithms (Energy Gate, Samsung, RL neural networks, Test mode) via BLE.
 
-**Current Version: v3.0** (2026-03-20) | [Full Changelog](Docs/CHANGELOG.md)
+**Current Version: v3.2** (2026-04-14) | [Full Changelog](Docs/CHANGELOG.md)
+
+**What's new in v3.2:** Multi-user workflow fixes — BLE device name moved out of source code into a gitignored `ble_device_config.h` (no more merge conflicts when two people use different pairing names); RPi connection info moved into a gitignored `tools/rpi_profiles.conf` (no more commented-out host/user blocks in `rpi_sync.py`). Both use committed `.example` templates for easy first-time setup.
 
 ## System Overview
 
@@ -61,7 +63,9 @@ Hip-Exo-All-in-One-with-Apple-GUI/
 ├── tools/                             # RPi sync tools (code deploy + data pull)
 │   ├── deploy_code.sh                 # Push RPi_Unified/ to Raspberry Pi
 │   ├── pull_data_watch.sh             # Pull output/ from Raspberry Pi (watch mode)
-│   └── rpi_sync.py                    # Underlying sync script
+│   ├── rpi_sync.py                    # Underlying sync script
+│   ├── rpi_profiles.conf.example      # Pi connection profile template (copy → rpi_profiles.conf)
+│   └── rpi_profiles.conf              # Your personal Pi profile (gitignored, not committed)
 │
 └── data_pi/                           # Data pulled from RPi (gitignored)
 ```
@@ -93,11 +97,29 @@ python RL_controller_torch.py --nn lstm_pd
 
 ### Deploy Code to RPi / Pull Data
 
+**First-time setup** — create your personal Pi connection profile (gitignored):
+
 ```bash
-./tools/deploy_code.sh           # Push RPi_Unified/ to Pi
-./tools/pull_data_watch.sh       # Continuously pull output/ from Pi (every 2s)
-./tools/pull_data_watch.sh 0     # Pull once
+cp tools/rpi_profiles.conf.example tools/rpi_profiles.conf
+# Edit rpi_profiles.conf: set [active] profile = <your-name>, fill in host/user/remote_dir/password
 ```
+
+```bash
+./tools/deploy_code.sh              # Push RPi_Unified/ to Pi (uses active profile)
+./tools/pull_data_watch.sh          # Continuously pull output/ from Pi (every 2s)
+./tools/pull_data_watch.sh 0        # Pull once
+
+# Override profile at runtime:
+python tools/rpi_sync.py --profile aboutberlin --direction push
+```
+
+### Auto Delay (Samsung / EG / RL)
+
+v3.1 adds on-device delay optimization that maximizes positive power ratio in real time:
+
+- **RL mode** (RPi): 1Hz side-loop scans ±100 ms in 10 ms steps; per-leg L/R independent; power metrics (`ratio` / `+P/s` / `-P/s`) always computed even when Auto Delay is OFF
+- **Samsung / EG mode** (Teensy-native, no RPi needed): same algorithm via `AutoDelayOptimizer` C++ class; results reported in the same 40B BLE status slot
+- Toggle via the **Auto Delay** checkbox in the GUI Samsung / EG / RL panels
 
 ## Documentation
 

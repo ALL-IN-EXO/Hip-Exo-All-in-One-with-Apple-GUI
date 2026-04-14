@@ -1,0 +1,11 @@
+// ble_device_config.h.example
+//
+// Copy this file to ble_device_config.h (gitignored) and set your BLE device name.
+// This name must match the peripheral's advertised name so the central can find it.
+// Both central and peripheral sketches must use the same name.
+//
+// The central scans for a peripheral whose advertised name equals BLE_DEVICE_NAME.
+
+#pragma once
+
+#define BLE_DEVICE_NAME  "YourName"   // <-- change to your name, e.g. "Shutong" or "Juncheng"
