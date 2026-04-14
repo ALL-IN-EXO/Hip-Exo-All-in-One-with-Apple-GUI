@@ -45,6 +45,9 @@ static unsigned long prev_print_us = 0;
 /******************** 全局硬件 ********************/
 static uint8_t imu_ok_bits = 0;
 
+// 1Hz 自动 delay 侧环时间戳 (Samsung / EG auto delay)
+static unsigned long previous_time_ado_us = 0;
+
 static inline bool is_inactive(float v) {
   return fabsf(v + 97.0f) < 0.5f;
 }
@@ -231,6 +234,7 @@ void switch_algorithm(uint8_t new_algo) {
   new_ctrl->reset();
   active_ctrl = new_ctrl;
   active_algo_id = new_algo;
+  previous_time_ado_us = micros();  // 避免切换后立即触发 1Hz ADO tick
 }
 
 /******************** setup ********************/
@@ -431,6 +435,16 @@ void loop() {
     }
   }
 
+  // === 1Hz Auto Delay 侧环 (Samsung / EG) ===
+  if (current_time - previous_time_ado_us >= 1000000UL) {
+    previous_time_ado_us = current_time;
+    if (active_algo_id == ALGO_SAMSUNG) {
+      ctrl_samsung.tick_auto_delay(current_time, gait_freq);
+    } else if (active_algo_id == ALGO_EG) {
+      ctrl_eg.tick_auto_delay(current_time, gait_freq);
+    }
+  }
+
   // === BLE 发送节拍 (20 Hz) ===
   if (current_time - previous_time_ble >= Tinterval_ble_micros) {
     previous_time_ble = current_time;
@@ -620,9 +634,19 @@ void Transmit_ble_Data() {
 
   ble_pack_uplink(data_ble, ud);
 
-  // RPi 透传上行: 如果 RL 模式且有状态数据，复制到上行缓冲
-  if (active_algo_id == ALGO_RL && ctrl_rl.rpi_status_valid) {
-    memcpy(rpi_uplink_buf, ctrl_rl.rpi_status_buf, 40);
+  // RPi 透传上行:
+  //   RL 模式: 来自 RPi Serial8 回传
+  //   Samsung/EG 模式: 来自 Teensy 本地 AutoDelayOptimizer（v3 格式）
+  if (active_algo_id == ALGO_RL) {
+    if (ctrl_rl.rpi_status_valid) {
+      memcpy(rpi_uplink_buf, ctrl_rl.rpi_status_buf, 40);
+    }
+  } else if (active_algo_id == ALGO_SAMSUNG) {
+    ctrl_samsung.fill_ble_status(rpi_uplink_buf);
+  } else if (active_algo_id == ALGO_EG) {
+    ctrl_eg.fill_ble_status(rpi_uplink_buf);
+  } else {
+    memset(rpi_uplink_buf, 0, 40);
   }
   ble_pack_rpi_uplink(data_ble, rpi_uplink_buf, 40);
 

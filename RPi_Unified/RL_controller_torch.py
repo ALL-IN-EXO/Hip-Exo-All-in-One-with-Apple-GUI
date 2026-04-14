@@ -915,15 +915,11 @@ def main():
 
                 prev_auto_delay_enable = auto_delay_enable
                 auto_delay_enable = bool(cfg.get('auto_delay_enable', auto_delay_enable))
+                # When auto turns off, clear motion_valid flags but keep last known
+                # ratio/power metrics so the GUI continues to show the most-recent values.
                 if not auto_delay_enable:
                     auto_motion_valid_L = False
                     auto_motion_valid_R = False
-                    auto_cur_ratio_L = 0.0
-                    auto_cur_ratio_R = 0.0
-                    auto_cur_pos_per_s_L = 0.0
-                    auto_cur_pos_per_s_R = 0.0
-                    auto_cur_neg_per_s_L = 0.0
-                    auto_cur_neg_per_s_R = 0.0
                     auto_best_delay_ms_L = runtime_delay_ms
                     auto_best_delay_ms_R = runtime_delay_ms
 
@@ -1046,9 +1042,12 @@ def main():
             hist_ang_L.append(float(Lpos))
             hist_ang_R.append(float(Rpos))
 
-            # ---- auto-delay optimization (1 Hz, does not touch 100 Hz inference path) ----
+            # ---- auto-delay metrics + optimization (1 Hz, does not touch 100 Hz inference path) ----
+            # Metrics are always computed regardless of auto_delay_enable so the GUI always shows
+            # live power ratio even when auto delay is OFF.  Only the "apply new delay" step is
+            # gated by auto_delay_enable.
             now_wall = time.time()
-            if auto_delay_enable and (now_wall - auto_last_eval_ts) >= AUTO_UPDATE_INTERVAL_S:
+            if (now_wall - auto_last_eval_ts) >= AUTO_UPDATE_INTERVAL_S:
                 auto_last_eval_ts = now_wall
 
                 tau_src_L_np = np.asarray(hist_tau_src_L, dtype=np.float32)
@@ -1108,7 +1107,7 @@ def main():
                     new_last_change = float(last_change_ts)
                     changed = False
 
-                    if motion_valid and (now_wall - last_change_ts) >= effective_dwell_s:
+                    if auto_delay_enable and motion_valid and (now_wall - last_change_ts) >= effective_dwell_s:
                         d_lo = max(0.0, cur_delay_ms - AUTO_SCAN_HALF_RANGE_MS)
                         d_hi = min(MAX_RUNTIME_DELAY_MS, cur_delay_ms + AUTO_SCAN_HALF_RANGE_MS)
                         cand_delays = np.arange(

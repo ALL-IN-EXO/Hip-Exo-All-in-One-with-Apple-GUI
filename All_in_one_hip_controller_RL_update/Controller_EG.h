@@ -16,12 +16,19 @@
  *   Assist_delay_gain, phase_offset_L/R,
  *   gate_k, gate_p_on, lead_frac,
  *   ext_phase_frac_L/R, ext_gain, scale_all
+ *
+ * Auto Delay (后处理延迟):
+ *   在现有 Assist_delay_gain（相位延迟）之后，再加一段
+ *   可由 AutoDelayOptimizer 自动优化的绝对 ms 延迟缓冲。
+ *   auto_delay_enable 关闭时使用 GUI 下发的 eg_post_delay_ms。
  ************************************************************/
 
 #include "Controller.h"
+#include "AutoDelayOptimizer.h"
 
-#define EG_DELAY_BUF  100
-#define EG_EXT_BUF    400
+#define EG_DELAY_BUF      100
+#define EG_EXT_BUF        400
+#define EG_POST_DELAY_BUF 200  // 200 samples @100Hz = 2s max post-delay
 
 class Controller_EG : public Controller {
 public:
@@ -32,6 +39,14 @@ public:
   void reset() override;
   const char* name() const override { return "EG"; }
   AlgoID id() const override { return ALGO_EG; }
+
+  // 1Hz 自动 delay 侧环（由 .ino 主循环调用）
+  void tick_auto_delay(unsigned long now_us, float gait_freq_hz);
+
+  // 填充 BLE 上行 RPi 透传槽（40B v3 格式）
+  void fill_ble_status(uint8_t* buf40) const;
+
+  AutoDelayOptimizer ado_;  // public: .ino 可读取状态
 
 private:
   // === 参数 ===
@@ -48,6 +63,7 @@ private:
   float ext_phase_frac_R_;
   float ext_gain_;
   float scale_all_;
+  float post_delay_ms_base_;  // GUI 下发的后处理延迟基础值 (ms)
 
   // === 内部状态 ===
   double RLTx_delay_[EG_DELAY_BUF];
@@ -61,6 +77,11 @@ private:
   float  xR_prev_;
   float  tau_cmd_L_filt_;
   float  tau_cmd_R_filt_;
+
+  // === 后处理延迟缓冲 (auto delay output stage) ===
+  float  post_buf_L_[EG_POST_DELAY_BUF];
+  float  post_buf_R_[EG_POST_DELAY_BUF];
+  int    post_buf_idx_;
 
   // === 辅助函数 ===
   static float smooth_gate_p(float x, float k, float p_on);

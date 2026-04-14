@@ -167,7 +167,22 @@ GUI RL 面板增加：
 
 ---
 
-## 10. 已知边界与后续增强
+## 10. 常见使用误区
+
+### Auto Delay OFF 时 Power Ratio 是否仍然计算？
+
+**是的，始终计算。**
+
+`auto_delay_enable = False` 只关闭"自动调参（apply new delay）"，不关闭"实时功率指标计算"。
+
+- RPi 侧：1Hz 侧环的触发条件不含 `auto_delay_enable`；`_auto_step_leg` 内部的 evaluate + scan 始终运行，仅 `apply step` 块（候选扫描并写入 `runtime_delay_ms`）被 `if auto_delay_enable` 守护。
+- Teensy ADO 侧：`tick()` 函数不再在 `!enabled` 时提前返回；`scan_leg()` 始终运行以更新 `cur_ratio_L/R` 等，仅 `delay_ms = new_delay` 赋值行被 `if (enabled && ...)` 守护。
+
+结果：GUI 的 Power Sign overlay 中 `+Ratio%` / `+P / -P` 数值在 Auto Delay OFF 时仍实时刷新，可用于人工监督当前助力质量，无需打开 Auto Delay 才能看到数字。
+
+---
+
+## 11. 已知边界与后续增强
 
 当前边界：
 

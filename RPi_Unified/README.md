@@ -201,6 +201,59 @@ LSTM_FILTER_A = np.array([1.0, -0.9824, 0.3477])
 
 ---
 
+## Auto Delay 自动延迟优化
+
+### 概述
+
+RL 控制器内置 1Hz 侧环，自动优化 `torque_delay_ms` 以最大化正功占比（`power_ratio`）。  
+目标：`ratio ≥ 0.95` → 在满足后最大化 `pos_per_s`（每秒正功）。
+
+### 开关方式
+
+通过 GUI RL 面板的 **Auto Delay** 开关控制。  
+`auto_delay_enable` 经 BLE passthrough 下发至 RPi（`rpi_passthru[20]` bit0）。
+
+### 重要：Auto OFF 时功率指标仍然实时计算
+
+**Auto Delay 关闭时，`power_ratio` / `pos_per_s` / `neg_per_s` 依然每秒更新并回传 GUI。**
+
+- 1Hz 评估不依赖 `auto_delay_enable`，每轮都执行 `evaluate_delay_candidate_leg`
+- 只有"扫描候选 + 写入新 delay"这一步才被 `if auto_delay_enable` 守护
+- 因此 GUI 的 Power Sign overlay 数字在 Auto OFF 时仍然有效，可用于人工判断助力质量
+
+### 左右腿独立
+
+v3.1 起，`runtime_delay_ms_L/R` 各自独立漂移：
+
+- Auto OFF 或 cfg 下发：两腿同步到 GUI 的单一 `delay_ms` 值
+- Auto ON：两腿各自扫描、各自 dwell（3s 默认）、各自 best delay
+
+### 功率指标定义
+
+```
+P(t) = tau(t) * vel(t) * π/180        # tau: Nm, vel: deg/s
+W+   = ∫P>0 dt / T_window             # 正功 (W·s 归一化)
+ratio = W+ / (W+ + |W-|)              # 正功占比 [0,1]
+pos_per_s = W+ / T_window             # 每秒正功 (W)
+neg_per_s = W- / T_window             # 每秒负功 (W, ≤0)
+```
+
+评估时内部固定 `scale=1.0`（与 `runtime_scale` 解耦），回传 GUI 前乘 `runtime_scale`。
+
+### 关键参数（`RL_controller_torch.py` 顶部）
+
+| 常量 | 默认值 | 说明 |
+|------|--------|------|
+| `AUTO_TARGET_RATIO` | 0.95 | 主目标：正功占比阈值 |
+| `AUTO_DWELL_S` | 3.0s | 变化后的冷却时间 |
+| `AUTO_DWELL_ADAPTIVE` | False | True=自适应 dwell≥窗口长度 |
+| `AUTO_SCAN_HALF_RANGE_MS` | 100ms | 扫描范围 ±100ms |
+| `AUTO_SCAN_STEP_MS` | 10ms | 扫描步长 |
+| `AUTO_MAX_STEP_MS` | 20ms | 单次最大变化量 |
+| 窗口 | 4~12s | 按步态周期自适应，fallback 8s |
+
+---
+
 ## 通讯协议
 
 ```
