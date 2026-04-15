@@ -3,7 +3,19 @@
 All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [v3.3] - 2026-04-15
+
+### Added
+
+- **GUI CSV 导入重播功能**（`GUI_RL_update/GUI.py`）:
+  - 在 Plot 控制区新增 `Load CSV` / `Pause` / 速度选择（`1x/2x/4x/8x`）/ `>>5s` / `Stop`
+  - 支持从本地导入历史 CSV 并按时间轴重播
+  - 支持暂停/恢复与快进（跳过 5 秒）
+  - 重播模式下复用现有曲线与读数刷新逻辑，且不会将重播数据再次写入实时日志 CSV
+- 若 CSV 缺失绘图关键词（角度/指令扭矩/估计扭矩/速度/功率），GUI 弹出映射对话框让用户选择对应列，并将结果保存到本地 `GUI_RL_update/mapping.json`
+- 功率列支持“自动计算（vel*cmd）”映射：当 CSV 无功率列时，重播阶段实时计算功率
+- `GUI_RL_update/mapping.json` 已加入 `.gitignore`，默认作为本地配置文件
+- `mapping.json` 支持多对一候选映射（每个目标字段可存多个候选列名），导入时按优先级自动匹配当前 CSV 的可用列
 
 ---
 
