@@ -16,6 +16,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - 功率列支持“自动计算（vel*cmd）”映射：当 CSV 无功率列时，重播阶段实时计算功率
 - `GUI_RL_update/mapping.json` 已加入 `.gitignore`，默认作为本地配置文件
 - `mapping.json` 支持多对一候选映射（每个目标字段可存多个候选列名），导入时按优先级自动匹配当前 CSV 的可用列
+- Replay 倍速新增 `0.2x` / `0.5x` 选项（保留 `1x/2x/4x/8x`）
+- 为重播与截图/录制相关按钮新增鼠标悬停提示（tooltip）
+- Replay 控件新增 `<<5s` 按钮，支持回退 5 秒
 
 ---
 

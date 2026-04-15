@@ -4,6 +4,7 @@ import struct
 import time
 import csv
 import json
+import bisect
 from math import *
 from collections import deque
 from PyQt5 import QtWidgets, QtCore, QtGui
@@ -654,6 +655,7 @@ class MainWindow(QWidget):
         self._replay_last_wall_time = 0.0
         self._replay_speed = 1.0
         self._replay_csv_path = ""
+        self._replay_time_axis = []
         self._replay_mapping_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "mapping.json")
         self._replay_col_mapping = self._load_replay_mapping()
@@ -1216,6 +1218,7 @@ class MainWindow(QWidget):
             }}
             QPushButton:hover {{ background-color:#4ab8ea; }}
         """)
+        self.btn_screenshot.setToolTip("Save current GUI as PNG image")
         self.btn_screenshot.clicked.connect(self._take_screenshot)
         row2.addWidget(self.btn_screenshot)
 
@@ -1223,6 +1226,7 @@ class MainWindow(QWidget):
         self.btn_record.setCursor(Qt.PointingHandCursor)
         self.btn_record.setFixedHeight(26)
         self._apply_record_idle_style()
+        self.btn_record.setToolTip("Start/stop screen recording (mp4 or image frames)")
         self.btn_record.clicked.connect(self._toggle_recording)
         row2.addWidget(self.btn_record)
 
@@ -1236,6 +1240,7 @@ class MainWindow(QWidget):
         self.btn_replay_load.setFixedHeight(26)
         self.btn_replay_load.setStyleSheet(
             "font-size:11px; padding:2px 8px; font-weight:600;")
+        self.btn_replay_load.setToolTip("Load a local CSV and start replay")
         self.btn_replay_load.clicked.connect(self._on_load_replay_csv)
         row2.addWidget(self.btn_replay_load)
 
@@ -1246,17 +1251,29 @@ class MainWindow(QWidget):
         self.btn_replay_pause.setEnabled(False)
         self.btn_replay_pause.setStyleSheet(
             "font-size:11px; padding:2px 8px; font-weight:600;")
+        self.btn_replay_pause.setToolTip("Pause or resume replay")
         self.btn_replay_pause.toggled.connect(self._on_replay_pause_toggled)
         row2.addWidget(self.btn_replay_pause)
 
         self.cmb_replay_speed = QComboBox()
-        self.cmb_replay_speed.addItems(["1x", "2x", "4x", "8x"])
-        self.cmb_replay_speed.setCurrentIndex(0)
-        self.cmb_replay_speed.setFixedWidth(62)
+        self.cmb_replay_speed.addItems(["0.2x", "0.5x", "1x", "2x", "4x", "8x"])
+        self.cmb_replay_speed.setCurrentText("1x")
+        self.cmb_replay_speed.setFixedWidth(70)
         self.cmb_replay_speed.setFixedHeight(24)
+        self.cmb_replay_speed.setToolTip("Replay speed")
         self._setup_combo(self.cmb_replay_speed)
         self.cmb_replay_speed.currentIndexChanged.connect(self._on_replay_speed_changed)
         row2.addWidget(self.cmb_replay_speed)
+
+        self.btn_replay_rw = QPushButton("<<5s")
+        self.btn_replay_rw.setCursor(Qt.PointingHandCursor)
+        self.btn_replay_rw.setFixedHeight(26)
+        self.btn_replay_rw.setEnabled(False)
+        self.btn_replay_rw.setStyleSheet(
+            "font-size:11px; padding:2px 8px; font-weight:600;")
+        self.btn_replay_rw.setToolTip("Rewind replay by 5 seconds")
+        self.btn_replay_rw.clicked.connect(self._on_replay_rewind)
+        row2.addWidget(self.btn_replay_rw)
 
         self.btn_replay_ff = QPushButton(">>5s")
         self.btn_replay_ff.setCursor(Qt.PointingHandCursor)
@@ -1264,6 +1281,7 @@ class MainWindow(QWidget):
         self.btn_replay_ff.setEnabled(False)
         self.btn_replay_ff.setStyleSheet(
             "font-size:11px; padding:2px 8px; font-weight:600;")
+        self.btn_replay_ff.setToolTip("Fast-forward replay by 5 seconds")
         self.btn_replay_ff.clicked.connect(self._on_replay_fast_forward)
         row2.addWidget(self.btn_replay_ff)
 
@@ -1273,6 +1291,7 @@ class MainWindow(QWidget):
         self.btn_replay_stop.setEnabled(False)
         self.btn_replay_stop.setStyleSheet(
             "font-size:11px; padding:2px 8px; font-weight:600;")
+        self.btn_replay_stop.setToolTip("Stop replay and return to live mode")
         self.btn_replay_stop.clicked.connect(self._on_replay_stop_clicked)
         row2.addWidget(self.btn_replay_stop)
 
@@ -2472,6 +2491,7 @@ class MainWindow(QWidget):
 
     def _set_replay_controls_active(self, active: bool):
         self.btn_replay_pause.setEnabled(active)
+        self.btn_replay_rw.setEnabled(active)
         self.btn_replay_ff.setEnabled(active)
         self.btn_replay_stop.setEnabled(active)
         if not active:
@@ -2546,6 +2566,7 @@ class MainWindow(QWidget):
 
     def _start_replay(self, samples, csv_path):
         self._replay_samples = samples
+        self._replay_time_axis = [float(s[0]) for s in samples]
         self._replay_csv_path = csv_path
         self._replay_mode = True
         self._replay_paused = False
@@ -2571,6 +2592,7 @@ class MainWindow(QWidget):
         self._replay_mode = False
         self._replay_paused = False
         self._replay_samples = []
+        self._replay_time_axis = []
         self._replay_idx = 0
         self._replay_play_t = 0.0
         self._replay_last_wall_time = 0.0
@@ -2620,8 +2642,43 @@ class MainWindow(QWidget):
             speed = float(text)
         except ValueError:
             speed = 1.0
-        self._replay_speed = max(0.25, min(16.0, speed))
+        self._replay_speed = max(0.1, min(16.0, speed))
         self._replay_last_wall_time = time.time()
+
+    def _seek_replay_time(self, target_t: float):
+        if not self._replay_mode or not self._replay_samples:
+            return
+        total = len(self._replay_samples)
+        if not self._replay_time_axis:
+            self._replay_time_axis = [float(s[0]) for s in self._replay_samples]
+        t_end = float(self._replay_time_axis[-1]) if self._replay_time_axis else 0.0
+        self._replay_play_t = max(0.0, min(t_end, float(target_t)))
+        target_idx = bisect.bisect_right(self._replay_time_axis, self._replay_play_t) - 1
+
+        self._clear_buffers()
+        self._update_counter = 0
+        if target_idx < 0:
+            self._replay_idx = 0
+            self._replay_last_wall_time = time.time()
+            self.lbl_status.setText(
+                f"Replay seek to t={self._replay_play_t:.2f}s ({self._replay_speed:.1f}x)")
+            return
+
+        start_idx = max(0, target_idx - self.win_size + 1)
+        for i in range(start_idx, target_idx + 1):
+            self._apply_replay_sample(self._replay_samples[i], i, total)
+        self._replay_idx = target_idx + 1
+        self._replay_last_wall_time = time.time()
+
+    def _on_replay_rewind(self):
+        if not self._replay_mode or not self._replay_samples:
+            return
+        target = max(0.0, self._replay_play_t - 5.0)
+        self._seek_replay_time(target)
+        if self._replay_mode:
+            self.lbl_status.setText(
+                f"Replay rewind to t={self._replay_play_t:.2f}s "
+                f"({self._replay_speed:.1f}x)")
 
     def _on_replay_fast_forward(self):
         if not self._replay_mode or not self._replay_samples:
