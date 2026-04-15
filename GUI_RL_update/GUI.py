@@ -3,6 +3,7 @@ from serial.tools import list_ports
 import struct
 import time
 import csv
+import json
 from math import *
 from collections import deque
 from PyQt5 import QtWidgets, QtCore, QtGui
@@ -53,6 +54,21 @@ RL_FILTER_TYPES = [
 ]
 
 CONN_TIMEOUT_S = 2.0
+
+REPLAY_AUTO_COMPUTE = "__AUTO_COMPUTE__"
+REPLAY_POWER_COLUMNS = {"L_pwr_W", "R_pwr_W"}
+REPLAY_PLOT_COLUMN_ALIASES = {
+    "L_angle_deg": ["L_angle_deg", "L_angle", "left_angle_deg"],
+    "R_angle_deg": ["R_angle_deg", "R_angle", "right_angle_deg"],
+    "L_cmd_Nm": ["L_cmd_Nm", "L_cmd", "left_cmd_Nm"],
+    "R_cmd_Nm": ["R_cmd_Nm", "R_cmd", "right_cmd_Nm"],
+    "L_est_Nm": ["L_est_Nm", "L_est", "left_est_Nm"],
+    "R_est_Nm": ["R_est_Nm", "R_est", "right_est_Nm"],
+    "L_vel_dps": ["L_vel_dps", "L_vel", "left_vel_dps"],
+    "R_vel_dps": ["R_vel_dps", "R_vel", "right_vel_dps"],
+    "L_pwr_W": ["L_pwr_W", "L_pwr", "left_pwr_W"],
+    "R_pwr_W": ["R_pwr_W", "R_pwr", "right_pwr_W"],
+}
 
 # ============== Apple Color System ==============
 class AppleColors:
@@ -630,6 +646,17 @@ class MainWindow(QWidget):
         self._record_tmp_dir = None
         self._record_frame_idx = 0
         self._record_timer = None
+        self._replay_mode = False
+        self._replay_paused = False
+        self._replay_samples = []
+        self._replay_idx = 0
+        self._replay_play_t = 0.0
+        self._replay_last_wall_time = 0.0
+        self._replay_speed = 1.0
+        self._replay_csv_path = ""
+        self._replay_mapping_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "mapping.json")
+        self._replay_col_mapping = self._load_replay_mapping()
 
         # Collect updatable themed widgets
         self._cards = []
@@ -1198,6 +1225,56 @@ class MainWindow(QWidget):
         self._apply_record_idle_style()
         self.btn_record.clicked.connect(self._toggle_recording)
         row2.addWidget(self.btn_record)
+
+        vsep_replay = QFrame(); vsep_replay.setFrameShape(QFrame.VLine)
+        vsep_replay.setStyleSheet(f"background-color:{C.separator}; max-width:1px; border:none;")
+        vsep_replay.setFixedHeight(20)
+        row2.addWidget(vsep_replay)
+
+        self.btn_replay_load = QPushButton("Load CSV")
+        self.btn_replay_load.setCursor(Qt.PointingHandCursor)
+        self.btn_replay_load.setFixedHeight(26)
+        self.btn_replay_load.setStyleSheet(
+            "font-size:11px; padding:2px 8px; font-weight:600;")
+        self.btn_replay_load.clicked.connect(self._on_load_replay_csv)
+        row2.addWidget(self.btn_replay_load)
+
+        self.btn_replay_pause = QPushButton("Pause")
+        self.btn_replay_pause.setCursor(Qt.PointingHandCursor)
+        self.btn_replay_pause.setCheckable(True)
+        self.btn_replay_pause.setFixedHeight(26)
+        self.btn_replay_pause.setEnabled(False)
+        self.btn_replay_pause.setStyleSheet(
+            "font-size:11px; padding:2px 8px; font-weight:600;")
+        self.btn_replay_pause.toggled.connect(self._on_replay_pause_toggled)
+        row2.addWidget(self.btn_replay_pause)
+
+        self.cmb_replay_speed = QComboBox()
+        self.cmb_replay_speed.addItems(["1x", "2x", "4x", "8x"])
+        self.cmb_replay_speed.setCurrentIndex(0)
+        self.cmb_replay_speed.setFixedWidth(62)
+        self.cmb_replay_speed.setFixedHeight(24)
+        self._setup_combo(self.cmb_replay_speed)
+        self.cmb_replay_speed.currentIndexChanged.connect(self._on_replay_speed_changed)
+        row2.addWidget(self.cmb_replay_speed)
+
+        self.btn_replay_ff = QPushButton(">>5s")
+        self.btn_replay_ff.setCursor(Qt.PointingHandCursor)
+        self.btn_replay_ff.setFixedHeight(26)
+        self.btn_replay_ff.setEnabled(False)
+        self.btn_replay_ff.setStyleSheet(
+            "font-size:11px; padding:2px 8px; font-weight:600;")
+        self.btn_replay_ff.clicked.connect(self._on_replay_fast_forward)
+        row2.addWidget(self.btn_replay_ff)
+
+        self.btn_replay_stop = QPushButton("Stop")
+        self.btn_replay_stop.setCursor(Qt.PointingHandCursor)
+        self.btn_replay_stop.setFixedHeight(26)
+        self.btn_replay_stop.setEnabled(False)
+        self.btn_replay_stop.setStyleSheet(
+            "font-size:11px; padding:2px 8px; font-weight:600;")
+        self.btn_replay_stop.clicked.connect(self._on_replay_stop_clicked)
+        row2.addWidget(self.btn_replay_stop)
 
         row2.addStretch(1)
 
@@ -1798,6 +1875,95 @@ class MainWindow(QWidget):
             return float(prev_good), False
         return v, True
 
+    def _append_data_point(
+            self, t, L_angle, R_angle, L_tau, R_tau, L_tau_d, R_tau_d,
+            L_vel, R_vel, gait_freq, *, log_csv=True, power_override=None):
+        self._last_gait_freq = float(gait_freq)
+        vL, vR = self._visual_sign_L, self._visual_sign_R
+        self.t_buffer.append(float(t))
+        self.L_IMU_buf.append(float(L_angle) * vL)
+        self.R_IMU_buf.append(float(R_angle) * vR)
+        self.L_tau_buf.append(float(L_tau) * vL)
+        self.R_tau_buf.append(float(R_tau) * vR)
+        self.L_tau_d_buf.append(float(L_tau_d) * vL)
+        self.R_tau_d_buf.append(float(R_tau_d) * vR)
+        self.L_vel_buf.append(float(L_vel) * vL)
+        self.R_vel_buf.append(float(R_vel) * vR)
+
+        if power_override is None:
+            # Power = vel (deg/s) * torque (Nm) * pi/180 -> Watts.
+            # Use command torque for all brands for consistent sign and behavior.
+            L_vel_pwr, okL = self._sanitize_power_velocity(float(L_vel), self._pwr_vel_good_L)
+            R_vel_pwr, okR = self._sanitize_power_velocity(float(R_vel), self._pwr_vel_good_R)
+            if okL:
+                self._pwr_vel_good_L = L_vel_pwr
+            else:
+                self._pwr_glitch_count_L += 1
+            if okR:
+                self._pwr_vel_good_R = R_vel_pwr
+            else:
+                self._pwr_glitch_count_R += 1
+            L_pwr = L_vel_pwr * float(L_tau_d) * (pi / 180.0)
+            R_pwr = R_vel_pwr * float(R_tau_d) * (pi / 180.0)
+        else:
+            L_pwr = float(power_override[0])
+            R_pwr = float(power_override[1])
+            if not isfinite(L_pwr):
+                L_pwr = float(L_vel) * float(L_tau_d) * (pi / 180.0)
+            if not isfinite(R_pwr):
+                R_pwr = float(R_vel) * float(R_tau_d) * (pi / 180.0)
+
+        self.L_pwr_buf.append(L_pwr * vL)
+        self.R_pwr_buf.append(R_pwr * vR)
+
+        if log_csv and hasattr(self, '_csv_writer'):
+            self._csv_writer.writerow([
+                f'{float(t):.3f}',
+                f'{float(L_angle):.3f}', f'{float(R_angle):.3f}',
+                f'{float(L_tau_d):.4f}', f'{float(R_tau_d):.4f}',
+                f'{float(L_tau):.4f}',   f'{float(R_tau):.4f}',
+                f'{float(L_vel):.3f}',   f'{float(R_vel):.3f}',
+                f'{L_pwr:.4f}',   f'{R_pwr:.4f}',
+                f'{float(gait_freq):.3f}',
+            ])
+            now_wall = time.time()
+            if now_wall - self._csv_last_flush > 1.0:
+                self._csv_file.flush()
+                self._csv_last_flush = now_wall
+
+        self._update_counter += 1
+        eco = self.sw_eco.isChecked()
+
+        if not eco or self._update_counter % 2 == 0:
+            tl = list(self.t_buffer)
+            self.L_angle_line.setData(tl, list(self.R_IMU_buf))
+            self.L_tau_line.setData(tl, list(self.R_tau_buf))
+            self.L_tau_d_line.setData(tl, list(self.R_tau_d_buf))
+            self.L_vel_line.setData(tl, list(self.R_vel_buf))
+            self.L_pwr_line.setData(tl, list(self.R_pwr_buf))
+            self.R_angle_line.setData(tl, list(self.L_IMU_buf))
+            self.R_tau_line.setData(tl, list(self.L_tau_buf))
+            self.R_tau_d_line.setData(tl, list(self.L_tau_d_buf))
+            self.R_vel_line.setData(tl, list(self.L_vel_buf))
+            self.R_pwr_line.setData(tl, list(self.L_pwr_buf))
+            self._update_power_strip(tl, list(self.R_pwr_buf), 'right')
+            self._update_power_strip(tl, list(self.L_pwr_buf), 'left')
+
+            if self.sw_auto_scroll.isChecked() and len(tl) > 1:
+                for pw in [self.plot_left, self.plot_right]:
+                    pw.getViewBox().setXRange(tl[0], tl[-1], padding=0.02)
+
+        if not eco or self._update_counter % 3 == 0:
+            self.lbl_Lang.setText(f"L: {float(L_angle):.1f} deg")
+            self.lbl_Rang.setText(f"R: {float(R_angle):.1f} deg")
+            self.lbl_Lcmd.setText(f"L cmd: {float(L_tau_d):.1f} Nm")
+            self.lbl_Rcmd.setText(f"R cmd: {float(R_tau_d):.1f} Nm")
+            self.lbl_Ltau.setText(f"L est: {float(L_tau):.1f} Nm")
+            self.lbl_Rtau.setText(f"R est: {float(R_tau):.1f} Nm")
+            self.lbl_Lpwr.setText(f"L pwr: {L_pwr:.2f} W")
+            self.lbl_Rpwr.setText(f"R pwr: {R_pwr:.2f} W")
+        return L_pwr, R_pwr
+
     def _on_win_size_changed(self, val):
         self.win_size = val
         for attr in ['t_buffer', 'L_IMU_buf', 'R_IMU_buf', 'L_tau_buf', 'R_tau_buf',
@@ -2102,6 +2268,422 @@ class MainWindow(QWidget):
     def _reset_record_btn(self):
         self.btn_record.setText("Record")
         self._apply_record_idle_style()
+
+    # ================================================================ Replay
+    def _load_replay_mapping(self):
+        path = getattr(self, "_replay_mapping_path", "")
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            clean = {}
+            for k, v in data.items():
+                if not isinstance(k, str) or not k:
+                    continue
+                if isinstance(v, str):
+                    vv = v.strip()
+                    if not vv:
+                        continue
+                    if k in REPLAY_POWER_COLUMNS and vv == REPLAY_AUTO_COMPUTE:
+                        clean[k] = REPLAY_AUTO_COMPUTE
+                    else:
+                        clean[k] = [vv]
+                    continue
+                if isinstance(v, list):
+                    candidates = []
+                    auto_flag = False
+                    for item in v:
+                        if not isinstance(item, str):
+                            continue
+                        col = item.strip()
+                        if not col:
+                            continue
+                        if k in REPLAY_POWER_COLUMNS and col == REPLAY_AUTO_COMPUTE:
+                            auto_flag = True
+                            continue
+                        if col not in candidates:
+                            candidates.append(col)
+                    if candidates:
+                        clean[k] = candidates
+                    elif k in REPLAY_POWER_COLUMNS and auto_flag:
+                        clean[k] = REPLAY_AUTO_COMPUTE
+            return clean
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_replay_mapping(self):
+        serializable = {}
+        for key in REPLAY_PLOT_COLUMN_ALIASES.keys():
+            mapped = self._replay_col_mapping.get(key, None)
+            if key in REPLAY_POWER_COLUMNS and mapped == REPLAY_AUTO_COMPUTE:
+                serializable[key] = REPLAY_AUTO_COMPUTE
+                continue
+            cands = self._get_replay_mapping_candidates(key)
+            if isinstance(cands, list) and cands:
+                serializable[key] = cands
+        try:
+            with open(self._replay_mapping_path, "w", encoding="utf-8") as f:
+                json.dump(serializable, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            QMessageBox.warning(self, "Replay", f"映射保存失败:\n{e}")
+
+    def _get_replay_mapping_candidates(self, key):
+        mapped = self._replay_col_mapping.get(key, [])
+        if isinstance(mapped, str):
+            if key in REPLAY_POWER_COLUMNS and mapped == REPLAY_AUTO_COMPUTE:
+                return REPLAY_AUTO_COMPUTE
+            mapped = [mapped]
+        if not isinstance(mapped, list):
+            return []
+        out = []
+        for item in mapped:
+            if not isinstance(item, str):
+                continue
+            col = item.strip()
+            if not col:
+                continue
+            if key in REPLAY_POWER_COLUMNS and col == REPLAY_AUTO_COMPUTE:
+                continue
+            if col not in out:
+                out.append(col)
+        return out
+
+    def _merge_replay_mapping_choice(self, key, mapped_value):
+        if key in REPLAY_POWER_COLUMNS and mapped_value == REPLAY_AUTO_COMPUTE:
+            self._replay_col_mapping[key] = REPLAY_AUTO_COMPUTE
+            return
+        if not isinstance(mapped_value, str):
+            return
+        col = mapped_value.strip()
+        if not col:
+            return
+        existing = self._get_replay_mapping_candidates(key)
+        if existing == REPLAY_AUTO_COMPUTE:
+            existing = []
+        existing = [x for x in existing if x != col]
+        existing.insert(0, col)
+        self._replay_col_mapping[key] = existing
+
+    def _prompt_replay_column_mapping(self, headers, missing_keys):
+        if not headers:
+            return None
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("CSV 关键词映射")
+        dlg.setModal(True)
+        dlg.resize(560, 320)
+
+        lay = QVBoxLayout(dlg)
+        tip = QLabel(
+            "检测到以下绘图关键词缺失，请选择 CSV 中对应列。\n"
+            "功率列可选“自动计算（vel*cmd）”。\n\n"
+            + ", ".join(missing_keys)
+        )
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+
+        form = QFormLayout()
+        combos = {}
+        for key in missing_keys:
+            combo = QComboBox()
+            if key in REPLAY_POWER_COLUMNS:
+                combo.addItem("自动计算 (vel*cmd)", REPLAY_AUTO_COMPUTE)
+            for h in headers:
+                combo.addItem(h, h)
+            saved = self._replay_col_mapping.get(key, "")
+            if saved == REPLAY_AUTO_COMPUTE and key in REPLAY_POWER_COLUMNS:
+                combo.setCurrentIndex(0)
+            else:
+                candidates = self._get_replay_mapping_candidates(key)
+                if isinstance(candidates, list):
+                    for cand in candidates:
+                        idx = combo.findData(cand)
+                        if idx >= 0:
+                            combo.setCurrentIndex(idx)
+                            break
+            form.addRow(f"{key} ->", combo)
+            combos[key] = combo
+        lay.addLayout(form)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+
+        resolved = {}
+        for key, combo in combos.items():
+            col = combo.currentData()
+            if col == REPLAY_AUTO_COMPUTE and key in REPLAY_POWER_COLUMNS:
+                resolved[key] = REPLAY_AUTO_COMPUTE
+                continue
+            if not isinstance(col, str) or not col.strip():
+                QMessageBox.warning(self, "Replay", f"{key} 未选择映射列。")
+                return None
+            resolved[key] = col.strip()
+        return resolved
+
+    def _resolve_replay_plot_columns(self, fieldnames):
+        headers = [h for h in (fieldnames or []) if isinstance(h, str) and h]
+        if not headers:
+            raise ValueError("CSV header missing")
+
+        resolved = {}
+        missing = []
+        for key, aliases in REPLAY_PLOT_COLUMN_ALIASES.items():
+            mapped = self._replay_col_mapping.get(key, "")
+            if mapped == REPLAY_AUTO_COMPUTE and key in REPLAY_POWER_COLUMNS:
+                resolved[key] = None
+                continue
+            candidates = self._get_replay_mapping_candidates(key)
+            if isinstance(candidates, list):
+                hit = next((c for c in candidates if c in headers), None)
+                if hit is not None:
+                    resolved[key] = hit
+                    continue
+            found = None
+            for alias in aliases:
+                if alias in headers:
+                    found = alias
+                    break
+            if found is not None:
+                resolved[key] = found
+            else:
+                missing.append(key)
+
+        if missing:
+            user_map = self._prompt_replay_column_mapping(headers, missing)
+            if user_map is None:
+                raise ValueError("CSV 关键词映射已取消")
+            for key, mapped in user_map.items():
+                self._merge_replay_mapping_choice(key, mapped)
+                if mapped == REPLAY_AUTO_COMPUTE and key in REPLAY_POWER_COLUMNS:
+                    resolved[key] = None
+                else:
+                    resolved[key] = mapped
+            self._save_replay_mapping()
+
+        return resolved
+
+    def _set_replay_controls_active(self, active: bool):
+        self.btn_replay_pause.setEnabled(active)
+        self.btn_replay_ff.setEnabled(active)
+        self.btn_replay_stop.setEnabled(active)
+        if not active:
+            self.btn_replay_pause.blockSignals(True)
+            self.btn_replay_pause.setChecked(False)
+            self.btn_replay_pause.blockSignals(False)
+            self.btn_replay_pause.setText("Pause")
+
+    def _row_float(self, row, keys, default=0.0, allow_none=False):
+        for key in keys:
+            if key not in row:
+                continue
+            val = row.get(key)
+            if val is None:
+                continue
+            txt = str(val).strip()
+            if txt == "":
+                continue
+            try:
+                return float(txt)
+            except ValueError:
+                continue
+        if allow_none:
+            return None
+        return float(default)
+
+    def _load_replay_samples(self, csv_path):
+        samples = []
+        with open(csv_path, 'r', newline='') as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                raise ValueError("CSV header missing")
+            plot_cols = self._resolve_replay_plot_columns(reader.fieldnames)
+            prev_raw_t = None
+            replay_t = 0.0
+            for row in reader:
+                raw_t = self._row_float(
+                    row, ['t_s', 't', 'time_s', 'time', 'timestamp_s'],
+                    allow_none=True)
+                if raw_t is None:
+                    raw_t = (prev_raw_t + 0.02) if prev_raw_t is not None else 0.0
+                if prev_raw_t is not None:
+                    dt = raw_t - prev_raw_t
+                    if dt < -100.0:
+                        dt += 655.36
+                    if dt <= 0.0 or dt > 1.0:
+                        dt = 0.02
+                    replay_t += dt
+                prev_raw_t = raw_t
+
+                L_angle = self._row_float(row, [plot_cols['L_angle_deg']], 0.0)
+                R_angle = self._row_float(row, [plot_cols['R_angle_deg']], 0.0)
+                L_tau_d = self._row_float(row, [plot_cols['L_cmd_Nm']], 0.0)
+                R_tau_d = self._row_float(row, [plot_cols['R_cmd_Nm']], 0.0)
+                L_tau = self._row_float(row, [plot_cols['L_est_Nm']], 0.0)
+                R_tau = self._row_float(row, [plot_cols['R_est_Nm']], 0.0)
+                L_vel = self._row_float(row, [plot_cols['L_vel_dps']], 0.0)
+                R_vel = self._row_float(row, [plot_cols['R_vel_dps']], 0.0)
+                L_pwr = nan
+                R_pwr = nan
+                if plot_cols.get('L_pwr_W'):
+                    L_pwr = self._row_float(row, [plot_cols['L_pwr_W']], nan)
+                if plot_cols.get('R_pwr_W'):
+                    R_pwr = self._row_float(row, [plot_cols['R_pwr_W']], nan)
+                gait = self._row_float(row, ['gait_freq_Hz', 'gait_hz', 'gait_freq'], 0.0)
+
+                samples.append((
+                    replay_t, L_angle, R_angle, L_tau, R_tau, L_tau_d, R_tau_d,
+                    L_vel, R_vel, L_pwr, R_pwr, gait,
+                ))
+        return samples
+
+    def _start_replay(self, samples, csv_path):
+        self._replay_samples = samples
+        self._replay_csv_path = csv_path
+        self._replay_mode = True
+        self._replay_paused = False
+        self._replay_idx = 0
+        self._replay_play_t = 0.0
+        self._replay_last_wall_time = time.time()
+        self._update_counter = 0
+        self._clear_buffers()
+        self._set_replay_controls_active(True)
+        self.btn_replay_pause.blockSignals(True)
+        self.btn_replay_pause.setChecked(False)
+        self.btn_replay_pause.blockSignals(False)
+        self.btn_replay_pause.setText("Pause")
+        self.lbl_imu.setText("IMU: REPLAY")
+        self.lbl_maxt.setText("MaxT: REPLAY")
+        self.lbl_status.setText(
+            f"Replay loaded: {os.path.basename(csv_path)} ({len(samples)} rows)")
+        self._consume_replay_samples(max_steps=1)
+
+    def _stop_replay(self, finished=False):
+        had_path = bool(self._replay_csv_path)
+        csv_name = os.path.basename(self._replay_csv_path) if had_path else ""
+        self._replay_mode = False
+        self._replay_paused = False
+        self._replay_samples = []
+        self._replay_idx = 0
+        self._replay_play_t = 0.0
+        self._replay_last_wall_time = 0.0
+        self._set_replay_controls_active(False)
+        if finished and csv_name:
+            self.lbl_status.setText(f"Replay finished: {csv_name}")
+        elif had_path:
+            self.lbl_status.setText("Replay stopped")
+
+    def _on_load_replay_csv(self):
+        start_dir = os.path.dirname(self._replay_csv_path) if self._replay_csv_path else \
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Replay CSV", start_dir, "CSV Files (*.csv)")
+        if not path:
+            return
+        try:
+            samples = self._load_replay_samples(path)
+        except (OSError, ValueError) as e:
+            if isinstance(e, ValueError) and "已取消" in str(e):
+                self.lbl_status.setText("Replay load cancelled.")
+                return
+            QMessageBox.warning(self, "Replay", f"Failed to load CSV:\n{e}")
+            return
+        if len(samples) < 2:
+            QMessageBox.warning(self, "Replay", "CSV data is too short to replay.")
+            return
+        self._start_replay(samples, path)
+
+    def _on_replay_pause_toggled(self, checked):
+        if not self._replay_mode:
+            self.btn_replay_pause.blockSignals(True)
+            self.btn_replay_pause.setChecked(False)
+            self.btn_replay_pause.blockSignals(False)
+            self.btn_replay_pause.setText("Pause")
+            return
+        self._replay_paused = bool(checked)
+        self.btn_replay_pause.setText("Resume" if self._replay_paused else "Pause")
+        self._replay_last_wall_time = time.time()
+        if self._replay_paused:
+            self.lbl_status.setText(
+                f"Replay paused: {self._replay_idx}/{len(self._replay_samples)}")
+
+    def _on_replay_speed_changed(self, _index):
+        text = self.cmb_replay_speed.currentText().strip().lower().replace('x', '')
+        try:
+            speed = float(text)
+        except ValueError:
+            speed = 1.0
+        self._replay_speed = max(0.25, min(16.0, speed))
+        self._replay_last_wall_time = time.time()
+
+    def _on_replay_fast_forward(self):
+        if not self._replay_mode or not self._replay_samples:
+            return
+        self._replay_play_t = min(self._replay_samples[-1][0], self._replay_play_t + 5.0)
+        self._consume_replay_samples()
+        if self._replay_mode:
+            self.lbl_status.setText(
+                f"Replay fast-forward to t={self._replay_play_t:.2f}s "
+                f"({self._replay_speed:.1f}x)")
+
+    def _on_replay_stop_clicked(self):
+        if not self._replay_mode:
+            return
+        self._stop_replay(finished=False)
+
+    def _consume_replay_samples(self, max_steps=3000):
+        if not self._replay_mode or not self._replay_samples:
+            return
+        total = len(self._replay_samples)
+        steps = 0
+        while self._replay_idx < total and self._replay_samples[self._replay_idx][0] <= self._replay_play_t:
+            sample = self._replay_samples[self._replay_idx]
+            self._apply_replay_sample(sample, self._replay_idx, total)
+            self._replay_idx += 1
+            steps += 1
+            if steps >= max_steps:
+                break
+        if self._replay_idx >= total:
+            self._stop_replay(finished=True)
+
+    def _update_replay(self, now):
+        if not self._replay_mode:
+            return
+        if self.connected and self.ser:
+            try:
+                avail = self.ser.in_waiting
+                if avail > 0:
+                    self.ser.read(avail)
+            except (serial.SerialException, OSError):
+                pass
+        if self._replay_paused:
+            self._replay_last_wall_time = now
+            return
+        dt = now - self._replay_last_wall_time if self._replay_last_wall_time > 0 else 0.02
+        self._replay_last_wall_time = now
+        if dt < 0.0:
+            dt = 0.02
+        self._replay_play_t += dt * self._replay_speed
+        self._consume_replay_samples()
+
+    def _apply_replay_sample(self, sample, idx, total):
+        (t, L_angle, R_angle, L_tau, R_tau, L_tau_d, R_tau_d,
+         L_vel, R_vel, L_pwr_csv, R_pwr_csv, gait_freq) = sample
+        L_pwr = L_pwr_csv if isfinite(L_pwr_csv) else (L_vel * L_tau_d * (pi / 180.0))
+        R_pwr = R_pwr_csv if isfinite(R_pwr_csv) else (R_vel * R_tau_d * (pi / 180.0))
+        self._last_gait_freq = gait_freq
+        self._append_data_point(
+            t, L_angle, R_angle, L_tau, R_tau, L_tau_d, R_tau_d, L_vel, R_vel,
+            gait_freq, log_csv=False, power_override=(L_pwr, R_pwr))
+        self.lbl_status.setText(
+            f"Replay {idx + 1}/{total}  t={t:.2f}s  speed={self._replay_speed:.1f}x")
 
     # ================================================================ Plots
     def _build_plots(self):
@@ -2633,6 +3215,9 @@ class MainWindow(QWidget):
     def _update_everything(self):
         now = time.time()
         self._update_tag_panel(now)
+        if self._replay_mode:
+            self._update_replay(now)
+            return
         # Refresh port list periodically while disconnected.
         if not self.connected:
             if now - self._last_port_scan > 1.0:
@@ -2941,84 +3526,9 @@ class MainWindow(QWidget):
             + (f"  tag='{tag_char}'" if tag_valid else "")
             + f"  vel={'IMU' if has_imu_vel else 'DER'}")
 
-        # === Buffers ===
-        vL, vR = self._visual_sign_L, self._visual_sign_R
-        self.t_buffer.append(t)
-        self.L_IMU_buf.append(L_angle * vL)
-        self.R_IMU_buf.append(R_angle * vR)
-        self.L_tau_buf.append(L_tau * vL)
-        self.R_tau_buf.append(R_tau * vR)
-        self.L_tau_d_buf.append(L_tau_d * vL)
-        self.R_tau_d_buf.append(R_tau_d * vR)
-        self.L_vel_buf.append(L_vel * vL)
-        self.R_vel_buf.append(R_vel * vR)
-        # Power = vel (deg/s) * torque (Nm) * pi/180 -> Watts.
-        # Use command torque for all brands for consistent sign and behavior.
-        L_tau_for_pwr = L_tau_d
-        R_tau_for_pwr = R_tau_d
-        # Guard display power against occasional one-frame IMU velocity glitches.
-        L_vel_pwr, okL = self._sanitize_power_velocity(L_vel, self._pwr_vel_good_L)
-        R_vel_pwr, okR = self._sanitize_power_velocity(R_vel, self._pwr_vel_good_R)
-        if okL:
-            self._pwr_vel_good_L = L_vel_pwr
-        else:
-            self._pwr_glitch_count_L += 1
-        if okR:
-            self._pwr_vel_good_R = R_vel_pwr
-        else:
-            self._pwr_glitch_count_R += 1
-        L_pwr = L_vel_pwr * L_tau_for_pwr * (pi / 180.0)
-        R_pwr = R_vel_pwr * R_tau_for_pwr * (pi / 180.0)
-        self.L_pwr_buf.append(L_pwr * vL)
-        self.R_pwr_buf.append(R_pwr * vR)
-
-        # === CSV logging (always on) ===
-        if hasattr(self, '_csv_writer'):
-            self._csv_writer.writerow([
-                f'{t:.3f}',
-                f'{L_angle:.3f}', f'{R_angle:.3f}',
-                f'{L_tau_d:.4f}', f'{R_tau_d:.4f}',
-                f'{L_tau:.4f}',   f'{R_tau:.4f}',
-                f'{L_vel:.3f}',   f'{R_vel:.3f}',
-                f'{L_pwr:.4f}',   f'{R_pwr:.4f}',
-                f'{gait_freq:.3f}',
-            ])
-            now_wall = time.time()
-            if now_wall - self._csv_last_flush > 1.0:
-                self._csv_file.flush()
-                self._csv_last_flush = now_wall
-
-        self._update_counter += 1
-        eco = self.sw_eco.isChecked()
-
-        if not eco or self._update_counter % 2 == 0:
-            tl = list(self.t_buffer)
-            self.L_angle_line.setData(tl, list(self.R_IMU_buf))
-            self.L_tau_line.setData(tl, list(self.R_tau_buf))
-            self.L_tau_d_line.setData(tl, list(self.R_tau_d_buf))
-            self.L_vel_line.setData(tl, list(self.R_vel_buf))
-            self.L_pwr_line.setData(tl, list(self.R_pwr_buf))
-            self.R_angle_line.setData(tl, list(self.L_IMU_buf))
-            self.R_tau_line.setData(tl, list(self.L_tau_buf))
-            self.R_tau_d_line.setData(tl, list(self.L_tau_d_buf))
-            self.R_vel_line.setData(tl, list(self.L_vel_buf))
-            self.R_pwr_line.setData(tl, list(self.L_pwr_buf))
-            self._update_power_strip(tl, list(self.R_pwr_buf), 'right')
-            self._update_power_strip(tl, list(self.L_pwr_buf), 'left')
-
-            if self.sw_auto_scroll.isChecked() and len(tl) > 1:
-                for pw in [self.plot_left, self.plot_right]:
-                    pw.getViewBox().setXRange(tl[0], tl[-1], padding=0.02)
-
-        if not eco or self._update_counter % 3 == 0:
-            self.lbl_Lang.setText(f"L: {L_angle:.1f} deg")
-            self.lbl_Rang.setText(f"R: {R_angle:.1f} deg")
-            self.lbl_Lcmd.setText(f"L cmd: {L_tau_d:.1f} Nm")
-            self.lbl_Rcmd.setText(f"R cmd: {R_tau_d:.1f} Nm")
-            self.lbl_Ltau.setText(f"L est: {L_tau:.1f} Nm")
-            self.lbl_Rtau.setText(f"R est: {R_tau:.1f} Nm")
-            self.lbl_Lpwr.setText(f"L pwr: {L_pwr:.2f} W")
-            self.lbl_Rpwr.setText(f"R pwr: {R_pwr:.2f} W")
+        self._append_data_point(
+            t, L_angle, R_angle, L_tau, R_tau, L_tau_d, R_tau_d,
+            L_vel, R_vel, gait_freq, log_csv=True)
 
 
 if __name__ == "__main__":
