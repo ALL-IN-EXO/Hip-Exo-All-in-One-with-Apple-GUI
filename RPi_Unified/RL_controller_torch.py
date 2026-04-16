@@ -170,6 +170,24 @@ AUTO_HIST_MARGIN_S = 2.0
 AUTO_MAX_DELAY_S = MAX_RUNTIME_DELAY_MS / 1000.0
 AUTO_HIST_FRAMES = int(round((AUTO_WINDOW_MAX_S + AUTO_MAX_DELAY_S + AUTO_HIST_MARGIN_S) * CTRL_HZ))
 
+# Runtime optimizer method: 'grid' (legacy local scan) or 'bo' (Bayesian optimization)
+AUTO_OPT_METHOD_DEFAULT = 'grid'
+
+# Objective: J = pos_per_s - λ * max(0, target_ratio - ratio)^2 - μ * |neg_per_s|
+AUTO_OBJ_LAMBDA = 20.0
+AUTO_OBJ_MU = 1.0
+
+# BO (1D GP over delay_ms)
+AUTO_BO_MIN_SAMPLES = 3
+AUTO_BO_HISTORY_MAX = 80
+AUTO_BO_LENGTH_SCALE_MS = 35.0
+AUTO_BO_SIGMA_F = 1.0
+AUTO_BO_SIGMA_N = 0.25
+AUTO_BO_JITTER = 1e-6
+AUTO_BO_ACQ = 'ucb'            # 'ucb' | 'ei'
+AUTO_BO_UCB_BETA = 2.0
+AUTO_BO_EI_XI = 0.01
+
 
 # ========= 加载神经网络 =========
 def load_network():
@@ -373,6 +391,7 @@ csv_header = [
     'pd_zm_bias_L', 'pd_zm_bias_R',
     'L_P', 'L_D', 'R_P', 'R_D',
     'scale_runtime', 'torque_delay_ms_L', 'torque_delay_ms_R',
+    'auto_opt_method',
     'tag',
 ]
 
@@ -395,6 +414,16 @@ RPI_FILTER_TYPE_REV = {v: k for k, v in RPI_FILTER_TYPE_MAP.items()}  # 反向�
 RPI_FILTER_EN_VEL    = 0x01
 RPI_FILTER_EN_REF    = 0x02
 RPI_FILTER_EN_TORQUE = 0x04
+
+# auto_flags bit layout (GUI passthrough [20] and status uplink [20]):
+# bit0: auto_delay_enable
+# bit1: motion_valid_L (status only)
+# bit2: motion_valid_R (status only)
+# bit3: auto_method_bo (0=grid, 1=bo)
+RPI_AUTO_FLAG_ENABLE         = 0x01
+RPI_AUTO_FLAG_MOTION_VALID_L = 0x02
+RPI_AUTO_FLAG_MOTION_VALID_R = 0x04
+RPI_AUTO_FLAG_METHOD_BO      = 0x08
 
 # ---- NN_TYPE 编码 (用于上行状态) ----
 NN_TYPE_CODE = {'dnn': 0, 'lstm': 1, 'lstm_leg_dcp': 2, 'lstm_pd': 3}
@@ -543,6 +572,135 @@ def pick_best_delay_candidate(candidates, current_delay_ms: float, target_ratio:
     )
 
 
+def auto_objective_from_eval(ev: dict) -> float:
+    """Scalar objective used by auto-delay optimizer (scale-invariant, before runtime_scale display)."""
+    if ev is None:
+        return -1e9
+    ratio = float(ev.get('ratio', 0.0))
+    pos_per_s = float(ev.get('pos_per_s', 0.0))
+    neg_per_s = float(ev.get('neg_per_s', 0.0))
+    penalty_ratio = max(0.0, AUTO_TARGET_RATIO - ratio)
+    return pos_per_s - AUTO_OBJ_LAMBDA * (penalty_ratio ** 2) - AUTO_OBJ_MU * abs(neg_per_s)
+
+
+def _norm_pdf(z: np.ndarray) -> np.ndarray:
+    return np.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
+
+
+def _norm_cdf(z: np.ndarray) -> np.ndarray:
+    return 0.5 * (1.0 + np.vectorize(math.erf)(z / math.sqrt(2.0)))
+
+
+def _rbf_kernel_1d(x1: np.ndarray, x2: np.ndarray, length_scale: float, sigma_f: float) -> np.ndarray:
+    d = (x1[:, None] - x2[None, :]) / max(1e-6, float(length_scale))
+    return (float(sigma_f) ** 2) * np.exp(-0.5 * d * d)
+
+
+def gp_predict_1d(x_obs: np.ndarray, y_obs: np.ndarray, x_query: np.ndarray):
+    """
+    Lightweight 1D GP prediction with RBF kernel.
+    Returns (mu, std) at query points, or (None, None) on numerical failure.
+    """
+    if x_obs.size < 1 or y_obs.size < 1 or x_query.size < 1:
+        return None, None
+
+    y_mean = float(np.mean(y_obs))
+    y_std = float(np.std(y_obs))
+    y_scale = y_std if y_std > 1e-6 else 1.0
+    y_n = (y_obs - y_mean) / y_scale
+
+    k_xx = _rbf_kernel_1d(
+        x_obs, x_obs,
+        length_scale=AUTO_BO_LENGTH_SCALE_MS,
+        sigma_f=AUTO_BO_SIGMA_F
+    )
+    k_xx += (AUTO_BO_SIGMA_N ** 2 + AUTO_BO_JITTER) * np.eye(x_obs.size, dtype=np.float64)
+
+    try:
+        l = np.linalg.cholesky(k_xx)
+        alpha = np.linalg.solve(l.T, np.linalg.solve(l, y_n))
+        k_xs = _rbf_kernel_1d(
+            x_obs, x_query,
+            length_scale=AUTO_BO_LENGTH_SCALE_MS,
+            sigma_f=AUTO_BO_SIGMA_F
+        )
+        mu_n = k_xs.T @ alpha
+        v = np.linalg.solve(l, k_xs)
+        var_n = (AUTO_BO_SIGMA_F ** 2) - np.sum(v * v, axis=0)
+        var_n = np.maximum(var_n, 1e-12)
+    except np.linalg.LinAlgError:
+        return None, None
+
+    mu = y_mean + y_scale * mu_n
+    std = y_scale * np.sqrt(var_n)
+    return mu.astype(np.float64), std.astype(np.float64)
+
+
+def propose_bo_delay_candidate(history_x, history_y, current_delay_ms: float,
+                               d_lo: float, d_hi: float, step_ms: float) -> float:
+    """
+    Propose next delay (ms) by 1D BO over local bounds [d_lo, d_hi].
+    Falls back to deterministic seeding when history is short.
+    """
+    x_query = np.arange(d_lo, d_hi + 0.5 * step_ms, step_ms, dtype=np.float64)
+    if x_query.size == 0:
+        return float(current_delay_ms)
+
+    x_obs = np.asarray(history_x, dtype=np.float64)
+    y_obs = np.asarray(history_y, dtype=np.float64)
+
+    # Cold start: deterministic local seeding around current point.
+    if x_obs.size < AUTO_BO_MIN_SAMPLES:
+        span = max(step_ms, 0.5 * (d_hi - d_lo))
+        seed_offsets = np.array([0.0, +0.5 * span, -0.5 * span, +span, -span], dtype=np.float64)
+        sampled = set(np.round(x_obs / max(step_ms, 1e-6)).astype(np.int64).tolist())
+        for off in seed_offsets:
+            cand = float(np.clip(current_delay_ms + off, d_lo, d_hi))
+            cand_bin = int(round(cand / max(step_ms, 1e-6)))
+            if cand_bin not in sampled:
+                return cand
+        return float(np.clip(current_delay_ms, d_lo, d_hi))
+
+    mu, std = gp_predict_1d(x_obs, y_obs, x_query)
+    if mu is None or std is None:
+        return float(np.clip(current_delay_ms, d_lo, d_hi))
+
+    if AUTO_BO_ACQ == 'ei':
+        y_best = float(np.max(y_obs))
+        imp = mu - y_best - AUTO_BO_EI_XI
+        z = np.zeros_like(imp)
+        nz = std > 1e-12
+        z[nz] = imp[nz] / std[nz]
+        ei = np.zeros_like(imp)
+        if np.any(nz):
+            ei[nz] = imp[nz] * _norm_cdf(z[nz]) + std[nz] * _norm_pdf(z[nz])
+        acq = ei
+    else:
+        acq = mu + AUTO_BO_UCB_BETA * std
+
+    best_idx = int(np.argmax(acq))
+    return float(x_query[best_idx])
+
+
+def make_bo_state():
+    return {
+        'x': deque(maxlen=AUTO_BO_HISTORY_MAX),
+        'y': deque(maxlen=AUTO_BO_HISTORY_MAX),
+    }
+
+
+def reset_bo_state(state: dict):
+    state['x'].clear()
+    state['y'].clear()
+
+
+def bo_record_sample(state: dict, delay_ms: float, objective: float):
+    if not (math.isfinite(delay_ms) and math.isfinite(objective)):
+        return
+    state['x'].append(float(delay_ms))
+    state['y'].append(float(objective))
+
+
 def parse_runtime_cfg(payload: bytes):
     """Parse GUI passthrough payload (40B). Returns dict or None."""
     if len(payload) < 20:
@@ -578,7 +736,8 @@ def parse_runtime_cfg(payload: bytes):
         "enable_vel": enable_vr,
         "enable_ref": enable_vr,
         "enable_torque": bool(filter_en_mask & RPI_FILTER_EN_TORQUE),
-        "auto_delay_enable": bool(auto_flags & 0x01),
+        "auto_delay_enable": bool(auto_flags & RPI_AUTO_FLAG_ENABLE),
+        "auto_method": "bo" if (auto_flags & RPI_AUTO_FLAG_METHOD_BO) else "grid",
     }
 
 
@@ -737,6 +896,7 @@ def send_status(ser: serial.Serial, filter_source, filter_type_code,
                 filter_order, enable_mask, cutoff_hz, scale,
                 delay_ms_L, delay_ms_R,
                 auto_enable=False,
+                auto_method='grid',
                 motion_valid_L=False, motion_valid_R=False,
                 ratio_L=0.0, ratio_R=0.0,
                 pos_per_s_L=0.0, pos_per_s_R=0.0,
@@ -756,7 +916,8 @@ def send_status(ser: serial.Serial, filter_source, filter_type_code,
       [12..15] scale      float32
       [16..17] delay_ms_L    int16 ×10   (0.1ms)
       [18..19] delay_ms_R    int16 ×10
-      [20]     auto_flags bit0=auto_enable, bit1=motion_valid_L, bit2=motion_valid_R
+      [20]     auto_flags bit0=auto_enable, bit1=motion_valid_L,
+                               bit2=motion_valid_R, bit3=method_bo
       [21..23] reserved
       [24..25] ratio_L       int16 ×10000 (0.01%)
       [26..27] ratio_R       int16 ×10000
@@ -784,11 +945,13 @@ def send_status(ser: serial.Serial, filter_source, filter_type_code,
 
     auto_flags = 0
     if auto_enable:
-        auto_flags |= 0x01
+        auto_flags |= RPI_AUTO_FLAG_ENABLE
+    if str(auto_method).lower() == 'bo':
+        auto_flags |= RPI_AUTO_FLAG_METHOD_BO
     if motion_valid_L:
-        auto_flags |= 0x02
+        auto_flags |= RPI_AUTO_FLAG_MOTION_VALID_L
     if motion_valid_R:
-        auto_flags |= 0x04
+        auto_flags |= RPI_AUTO_FLAG_MOTION_VALID_R
     buf[20] = auto_flags & 0xFF
     # buf[21..23] = 0 (reserved)
 
@@ -830,6 +993,7 @@ def main():
     runtime_delay_ms_R = runtime_delay_ms
 
     auto_delay_enable = False
+    auto_opt_method = AUTO_OPT_METHOD_DEFAULT
     auto_last_eval_ts = 0.0
     auto_last_change_ts_L = 0.0
     auto_last_change_ts_R = 0.0
@@ -854,6 +1018,8 @@ def main():
     hist_vel_R = deque(maxlen=AUTO_HIST_FRAMES)
     hist_ang_L = deque(maxlen=AUTO_HIST_FRAMES)
     hist_ang_R = deque(maxlen=AUTO_HIST_FRAMES)
+    auto_bo_state_L = make_bo_state()
+    auto_bo_state_R = make_bo_state()
 
     last_gui_tag = ""
     frame_count = 0
@@ -884,6 +1050,7 @@ def main():
 
     print(f"\n[启动] NN_TYPE={NN_TYPE}, kp={kp}, kd={kd}")
     print(f"[启动] 串口={SER_DEV}, 波特率={BAUDRATE}")
+    print(f"[启动] AutoDelay optimizer={auto_opt_method} (grid|bo)")
     if NN_TYPE == 'lstm_pd':
         print(
             f"[启动] lstm_pd zero-mean={'ON' if pd_zm_enabled else 'OFF'} "
@@ -915,6 +1082,9 @@ def main():
 
                 prev_auto_delay_enable = auto_delay_enable
                 auto_delay_enable = bool(cfg.get('auto_delay_enable', auto_delay_enable))
+                auto_opt_method = str(cfg.get('auto_method', auto_opt_method)).lower()
+                if auto_opt_method not in ('grid', 'bo'):
+                    auto_opt_method = 'grid'
                 # When auto turns off, clear motion_valid flags but keep last known
                 # ratio/power metrics so the GUI continues to show the most-recent values.
                 if not auto_delay_enable:
@@ -922,6 +1092,8 @@ def main():
                     auto_motion_valid_R = False
                     auto_best_delay_ms_L = runtime_delay_ms
                     auto_best_delay_ms_R = runtime_delay_ms
+                    reset_bo_state(auto_bo_state_L)
+                    reset_bo_state(auto_bo_state_R)
 
                 # cfg change invalidates history (filter/scale/delay 都会让旧窗口数据不再代表当前配置):
                 # 清空 history + 重置评估节拍，避免用跨配置数据做评估。
@@ -933,6 +1105,8 @@ def main():
                 hist_vel_R.clear()
                 hist_ang_L.clear()
                 hist_ang_R.clear()
+                reset_bo_state(auto_bo_state_L)
+                reset_bo_state(auto_bo_state_R)
                 if pd_zm_enabled:
                     pd_zm_hist_L.clear()
                     pd_zm_hist_R.clear()
@@ -943,6 +1117,8 @@ def main():
                 if auto_delay_enable and not prev_auto_delay_enable:
                     auto_last_change_ts_L = _now_wall
                     auto_last_change_ts_R = _now_wall
+                    reset_bo_state(auto_bo_state_L)
+                    reset_bo_state(auto_bo_state_R)
 
                 if NN_TYPE == 'dnn':
                     apply_runtime_filter_to_dnn(
@@ -974,7 +1150,8 @@ def main():
 
                 print(
                     f"[RPi CFG] scale={runtime_scale:.3f}, delay={runtime_delay_ms:.1f}ms "
-                    f"(L/R snapped), auto_delay={'ON' if auto_delay_enable else 'OFF'}"
+                    f"(L/R snapped), auto_delay={'ON' if auto_delay_enable else 'OFF'}, "
+                    f"method={auto_opt_method}"
                 )
                 continue
 
@@ -1076,7 +1253,7 @@ def main():
                     effective_dwell_s = AUTO_DWELL_S
 
                 def _auto_step_leg(side_tau_np, side_vel_np, cur_delay_ms,
-                                   last_change_ts):
+                                   last_change_ts, bo_state):
                     """
                     Run one 1Hz evaluation + optional scan/apply for a single leg.
                     Returns a dict with new state for that leg.
@@ -1100,6 +1277,7 @@ def main():
                         cur['mean_abs_vel'] >= AUTO_VALID_MIN_MEAN_ABS_VEL_DPS and
                         cur['abs_power_per_s'] >= AUTO_VALID_MIN_ABS_POWER_W
                     )
+                    cur_obj = auto_objective_from_eval(cur)
                     pos_per_s_disp = cur['pos_per_s'] * float(runtime_scale)
                     neg_per_s_disp = cur['neg_per_s'] * float(runtime_scale)
                     best_delay_ms = float(cur_delay_ms)
@@ -1107,38 +1285,48 @@ def main():
                     new_last_change = float(last_change_ts)
                     changed = False
 
+                    if auto_delay_enable and motion_valid:
+                        bo_record_sample(bo_state, cur_delay_ms, cur_obj)
+
                     if auto_delay_enable and motion_valid and (now_wall - last_change_ts) >= effective_dwell_s:
                         d_lo = max(0.0, cur_delay_ms - AUTO_SCAN_HALF_RANGE_MS)
                         d_hi = min(MAX_RUNTIME_DELAY_MS, cur_delay_ms + AUTO_SCAN_HALF_RANGE_MS)
-                        cand_delays = np.arange(
-                            d_lo, d_hi + 0.5 * AUTO_SCAN_STEP_MS,
-                            AUTO_SCAN_STEP_MS, dtype=np.float32
-                        )
-                        if cand_delays.size == 0:
-                            cand_delays = np.array([cur_delay_ms], dtype=np.float32)
-
-                        cands = []
-                        for c_delay in cand_delays:
-                            ev = evaluate_delay_candidate_leg(
-                                float(c_delay), side_tau_np, side_vel_np, window_frames
+                        if auto_opt_method == 'bo':
+                            best_delay_ms = propose_bo_delay_candidate(
+                                bo_state['x'], bo_state['y'],
+                                cur_delay_ms, d_lo, d_hi, AUTO_SCAN_STEP_MS
                             )
-                            if ev is not None:
-                                cands.append(ev)
-
-                        best = pick_best_delay_candidate(cands, cur_delay_ms, AUTO_TARGET_RATIO)
-                        if best is not None:
-                            best_delay_ms = best['delay_ms']
-                            step_ms = max(
-                                -AUTO_MAX_STEP_MS,
-                                min(AUTO_MAX_STEP_MS, best_delay_ms - cur_delay_ms)
+                        else:
+                            cand_delays = np.arange(
+                                d_lo, d_hi + 0.5 * AUTO_SCAN_STEP_MS,
+                                AUTO_SCAN_STEP_MS, dtype=np.float32
                             )
-                            if abs(step_ms) >= 0.5:
-                                new_delay_ms = max(
-                                    0.0,
-                                    min(MAX_RUNTIME_DELAY_MS, cur_delay_ms + step_ms)
+                            if cand_delays.size == 0:
+                                cand_delays = np.array([cur_delay_ms], dtype=np.float32)
+
+                            cands = []
+                            for c_delay in cand_delays:
+                                ev = evaluate_delay_candidate_leg(
+                                    float(c_delay), side_tau_np, side_vel_np, window_frames
                                 )
-                                new_last_change = now_wall
-                                changed = True
+                                if ev is not None:
+                                    cands.append(ev)
+
+                            best = pick_best_delay_candidate(cands, cur_delay_ms, AUTO_TARGET_RATIO)
+                            if best is not None:
+                                best_delay_ms = best['delay_ms']
+
+                        step_ms = max(
+                            -AUTO_MAX_STEP_MS,
+                            min(AUTO_MAX_STEP_MS, best_delay_ms - cur_delay_ms)
+                        )
+                        if abs(step_ms) >= 0.5:
+                            new_delay_ms = max(
+                                0.0,
+                                min(MAX_RUNTIME_DELAY_MS, cur_delay_ms + step_ms)
+                            )
+                            new_last_change = now_wall
+                            changed = True
 
                     return {
                         'ratio': cur['ratio'],
@@ -1152,10 +1340,10 @@ def main():
                     }
 
                 state_L = _auto_step_leg(
-                    tau_src_L_np, vel_L_np, runtime_delay_ms_L, auto_last_change_ts_L
+                    tau_src_L_np, vel_L_np, runtime_delay_ms_L, auto_last_change_ts_L, auto_bo_state_L
                 )
                 state_R = _auto_step_leg(
-                    tau_src_R_np, vel_R_np, runtime_delay_ms_R, auto_last_change_ts_R
+                    tau_src_R_np, vel_R_np, runtime_delay_ms_R, auto_last_change_ts_R, auto_bo_state_R
                 )
 
                 auto_cur_ratio_L = state_L['ratio']
@@ -1204,6 +1392,7 @@ def main():
                             delay_ms_L=runtime_delay_ms_L,
                             delay_ms_R=runtime_delay_ms_R,
                             auto_enable=auto_delay_enable,
+                            auto_method=auto_opt_method,
                             motion_valid_L=auto_motion_valid_L,
                             motion_valid_R=auto_motion_valid_R,
                             ratio_L=auto_cur_ratio_L,
@@ -1238,6 +1427,7 @@ def main():
                 'scale_runtime': f'{runtime_scale:.4f}',
                 'torque_delay_ms_L': f'{delay_ms_L_eff:.3f}',
                 'torque_delay_ms_R': f'{delay_ms_R_eff:.3f}',
+                'auto_opt_method': auto_opt_method,
                 'tag': tag_to_log,
             }
 

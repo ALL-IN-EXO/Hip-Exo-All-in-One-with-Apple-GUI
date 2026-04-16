@@ -219,7 +219,8 @@ void Controller_EG::compute(const CtrlInput& in, CtrlOutput& out) {
 
   // === 后处理延迟缓冲 + AutoDelayOptimizer 数据推入 ===
   // tau_src (pre-post-delay) 与 IMU 角速度一起送入 ADO ring buffer
-  ado_.push_sample(S_L, S_R, in.LTAVx, in.RTAVx);
+  // 注意：out.tau_R 最终取反，故此处推入 -S_R 使 ADO 功率计算与实际输出一致
+  ado_.push_sample(S_L, -S_R, in.LTAVx, in.RTAVx);
 
   // 写入后处理延迟缓冲
   post_buf_L_[post_buf_idx_] = S_L;
@@ -241,7 +242,7 @@ void Controller_EG::compute(const CtrlInput& in, CtrlOutput& out) {
   post_buf_idx_ = (post_buf_idx_ + 1) % EG_POST_DELAY_BUF;
 
   out.tau_L = tau_L_delayed;
-  out.tau_R = tau_R_delayed;
+  out.tau_R = -tau_R_delayed;
 }
 
 void Controller_EG::tick_auto_delay(unsigned long now_us, float gait_freq_hz) {

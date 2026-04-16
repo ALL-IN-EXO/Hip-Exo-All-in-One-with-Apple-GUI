@@ -44,6 +44,10 @@ RPI_PT_MAGIC1 = 0x4C  # 'L'
 RPI_PT_VERSION = 0x01            # downlink (GUI → RPi) passthrough version
 RPI_STATUS_VERSION_LEGACY = 0x02  # uplink status v2: single-leg float32 metrics
 RPI_STATUS_VERSION_PER_LEG = 0x03  # uplink status v3: per-leg int16-packed metrics
+RPI_AUTO_FLAG_ENABLE = 0x01
+RPI_AUTO_FLAG_MOTION_VALID_L = 0x02
+RPI_AUTO_FLAG_MOTION_VALID_R = 0x04
+RPI_AUTO_FLAG_METHOD_BO = 0x08
 
 # Filter type codes (keep in sync with RL_controller_torch.py)
 RL_FILTER_TYPES = [
@@ -591,6 +595,7 @@ class MainWindow(QWidget):
         self._rpi_delay_ms_L = 0.0
         self._rpi_delay_ms_R = 0.0
         self._rpi_auto_delay_enable = False
+        self._rpi_auto_method_bo = False
         self._rpi_auto_motion_valid_L = False
         self._rpi_auto_motion_valid_R = False
         self._rpi_power_ratio_L = 0.0
@@ -866,7 +871,12 @@ class MainWindow(QWidget):
         self.chk_eg_auto_delay.setToolTip(
             "Teensy-local auto delay: optimizes post_delay_ms to maximize positive power ratio (L/R independent)")
         self.chk_eg_auto_delay.stateChanged.connect(self._on_eg_auto_delay_toggled)
-        self.lbl_eg_auto_delay_state = QLabel("L=-- ms  R=-- ms")
+        self.btn_eg_reset = QPushButton("Reset")
+        self.btn_eg_reset.setFixedWidth(52)
+        self.btn_eg_reset.setEnabled(False)
+        self.btn_eg_reset.setToolTip("Reset Auto Delay: restart optimization from base post_delay_ms")
+        self.btn_eg_reset.clicked.connect(self._on_eg_reset_clicked)
+        self.lbl_eg_auto_delay_state = QLabel("L=-- idx  R=-- idx")
         self.lbl_eg_auto_delay_state.setStyleSheet(
             f"color:{C.purple}; font-size:11px; background:transparent;")
         _lbl_pd = QLabel("Post Delay (ms)")
@@ -874,7 +884,8 @@ class MainWindow(QWidget):
         eg_grid.addWidget(_lbl_pd, _eg_next_row, 0, 1, 2)
         eg_grid.addWidget(self.sb_eg_post_delay, _eg_next_row, 2)
         eg_grid.addWidget(self.chk_eg_auto_delay, _eg_next_row + 1, 0)
-        eg_grid.addWidget(self.lbl_eg_auto_delay_state, _eg_next_row + 1, 1, 1, 2)
+        eg_grid.addWidget(self.btn_eg_reset, _eg_next_row + 1, 1)
+        eg_grid.addWidget(self.lbl_eg_auto_delay_state, _eg_next_row + 2, 0, 1, 3)
         self.algo_stack.addWidget(eg_panel)
 
         # -- Samsung panel --
@@ -889,6 +900,11 @@ class MainWindow(QWidget):
         self.chk_sam_auto_delay.setToolTip(
             "Teensy-local auto delay: optimizes delay_ms to maximize positive power ratio (L/R independent)")
         self.chk_sam_auto_delay.stateChanged.connect(self._on_sam_auto_delay_toggled)
+        self.btn_sam_reset = QPushButton("Reset")
+        self.btn_sam_reset.setFixedWidth(52)
+        self.btn_sam_reset.setEnabled(False)
+        self.btn_sam_reset.setToolTip("Reset Auto Delay: restart optimization from base delay_ms")
+        self.btn_sam_reset.clicked.connect(self._on_sam_reset_clicked)
         self.lbl_sam_auto_delay_state = QLabel("L=-- ms  R=-- ms")
         self.lbl_sam_auto_delay_state.setStyleSheet(
             f"color:{C.purple}; font-size:11px; background:transparent;")
@@ -897,7 +913,8 @@ class MainWindow(QWidget):
         sam_grid.addWidget(QLabel("Delay (ms)"), 1, 0)
         sam_grid.addWidget(self.sb_sam_delay, 1, 1)
         sam_grid.addWidget(self.chk_sam_auto_delay, 2, 0)
-        sam_grid.addWidget(self.lbl_sam_auto_delay_state, 2, 1)
+        sam_grid.addWidget(self.btn_sam_reset, 2, 1)
+        sam_grid.addWidget(self.lbl_sam_auto_delay_state, 3, 0, 1, 2)
         self.algo_stack.addWidget(sam_panel)
 
         # -- RL panel --
@@ -976,29 +993,41 @@ class MainWindow(QWidget):
         rl_lay.addWidget(self.lbl_rl_filter_en, 6, 0)
         rl_lay.addLayout(filt_row, 6, 1)
 
-        # Row 7: Apply RL button (staged send, not realtime)
+        # Row 7: Auto-delay optimizer method
+        self.cmb_rl_auto_method = QComboBox()
+        self.cmb_rl_auto_method.addItems(["Grid (Legacy)", "Bayes (BO)"])
+        self._setup_combo(self.cmb_rl_auto_method)
+        self.cmb_rl_auto_method.setCurrentIndex(0)
+        self.cmb_rl_auto_method.setToolTip(
+            "Auto Delay optimizer on RPi: Grid(local scan) or Bayes(1D GP BO)."
+        )
+        self.cmb_rl_auto_method.currentIndexChanged.connect(self._update_rl_filter_state_label)
+        rl_lay.addWidget(QLabel("Auto Method"), 7, 0)
+        rl_lay.addWidget(self.cmb_rl_auto_method, 7, 1)
+
+        # Row 8: Apply RL button (staged send, not realtime)
         self.btn_apply_rl = QPushButton("Apply RL Settings")
         self.btn_apply_rl.setStyleSheet(
             f"background-color:{C.blue}; color:white; font-weight:600; "
             f"border-radius:8px; padding:8px 16px; font-size:13px;")
         self.btn_apply_rl.clicked.connect(self._on_apply_rl_clicked)
-        rl_lay.addWidget(self.btn_apply_rl, 7, 0, 1, 2)
+        rl_lay.addWidget(self.btn_apply_rl, 8, 0, 1, 2)
 
-        # Row 8: Status label
+        # Row 9: Status label
         self.lbl_rl_filter_state = QLabel("")
         self.lbl_rl_filter_state.setWordWrap(True)
         self.lbl_rl_filter_state.setStyleSheet(
             f"color:{C.text2}; font-size:11px; background:transparent; padding-top:2px;"
         )
-        rl_lay.addWidget(self.lbl_rl_filter_state, 8, 0, 1, 2)
+        rl_lay.addWidget(self.lbl_rl_filter_state, 9, 0, 1, 2)
 
-        # Row 9: Auto-delay telemetry (from RPi status uplink)
+        # Row 10: Auto-delay telemetry (from RPi status uplink)
         self.lbl_rl_auto_state = QLabel("Auto Delay: waiting for RPi status...")
         self.lbl_rl_auto_state.setWordWrap(True)
         self.lbl_rl_auto_state.setStyleSheet(
             f"color:{C.purple}; font-size:11px; background:transparent; padding-top:1px;"
         )
-        rl_lay.addWidget(self.lbl_rl_auto_state, 9, 0, 1, 2)
+        rl_lay.addWidget(self.lbl_rl_auto_state, 10, 0, 1, 2)
         self.algo_stack.addWidget(rl_panel)
 
         # -- Test panel (sin wave) --
@@ -1365,7 +1394,9 @@ class MainWindow(QWidget):
         struct.pack_into('<f', pt, 16, float(self.sb_rl_cutoff_hz.value()))
         auto_flags = 0
         if self.chk_rl_auto_delay.isChecked():
-            auto_flags |= 0x01
+            auto_flags |= RPI_AUTO_FLAG_ENABLE
+        if hasattr(self, 'cmb_rl_auto_method') and self.cmb_rl_auto_method.currentIndex() == 1:
+            auto_flags |= RPI_AUTO_FLAG_METHOD_BO
         pt[20] = auto_flags & 0xFF
         return pt
 
@@ -1386,21 +1417,44 @@ class MainWindow(QWidget):
         auto_on = self.chk_sam_auto_delay.isChecked()
         self._sam_auto_delay_enable = auto_on
         self.sb_sam_delay.setEnabled(not auto_on)
+        self.btn_sam_reset.setEnabled(auto_on)
         if auto_on:
             self.sb_sam_delay.setToolTip("Auto Delay ON: Teensy optimizing delay_ms (L/R independent).")
         else:
             self.sb_sam_delay.setToolTip("")
         self._tx_params()
 
+    def _on_sam_reset_clicked(self):
+        """Reset Samsung Auto Delay: send falling+rising edge on auto_delay_enable to cold-start ADO."""
+        if not self._sam_auto_delay_enable:
+            return
+        self._sam_auto_delay_enable = False
+        self._tx_params()
+        self._sam_auto_delay_enable = True
+        self._tx_params()
+
     def _on_eg_auto_delay_toggled(self, _state):
         auto_on = self.chk_eg_auto_delay.isChecked()
         self._eg_auto_delay_enable = auto_on
         self.sb_eg_post_delay.setEnabled(not auto_on)
+        self.sb_Assist_delay_gain.setEnabled(not auto_on)
+        self.btn_eg_reset.setEnabled(auto_on)
         if auto_on:
             self.sb_eg_post_delay.setToolTip("Auto Delay ON: Teensy optimizing post_delay_ms (L/R independent).")
+            self.sb_Assist_delay_gain.setToolTip("Auto Delay ON: delay index locked.")
         else:
             self.sb_eg_post_delay.setToolTip(
                 "EG output post-delay (ms). Applied after internal Assist_delay_gain.")
+            self.sb_Assist_delay_gain.setToolTip("")
+        self._tx_params()
+
+    def _on_eg_reset_clicked(self):
+        """Reset EG Auto Delay: send falling+rising edge on auto_delay_enable to cold-start ADO."""
+        if not self._eg_auto_delay_enable:
+            return
+        self._eg_auto_delay_enable = False
+        self._tx_params()
+        self._eg_auto_delay_enable = True
         self._tx_params()
 
     def _set_rl_delay_spinbox_value(self, delay_ms: float):
@@ -1503,6 +1557,7 @@ class MainWindow(QWidget):
         """RPi 超时断线时更新 UI"""
         if not hasattr(self, "lbl_rpi_nn_type"):
             return
+        self._rpi_auto_method_bo = False
         self.lbl_rpi_nn_type.setText("RPi: Offline")
         self.lbl_rpi_nn_type.setStyleSheet(
             f"color:{C.red}; font-size:13px; font-weight:600; background:transparent;")
@@ -1525,6 +1580,7 @@ class MainWindow(QWidget):
             en_r = "ON" if (self._rpi_enable_mask & 0x02) else "OFF"
             en_t = "ON" if (self._rpi_enable_mask & 0x04) else "OFF"
             auto_en = "ON" if self._rpi_auto_delay_enable else "OFF"
+            method_rpi = "BO" if self._rpi_auto_method_bo else "Grid"
 
             # 非 auto 模式下 L/R 同步; auto 模式下可能分离 → 显示 "L/R" 对
             if abs(self._rpi_delay_ms_L - self._rpi_delay_ms_R) < 0.5:
@@ -1535,7 +1591,7 @@ class MainWindow(QWidget):
                 current_str = (
                     f"[{src}] {ftype} {self._rpi_cutoff_hz:.1f}Hz order={self._rpi_filter_order} | "
                     f"Vel={en_v} Ref={en_r} Torque={en_t} | "
-                    f"Scale={self._rpi_scale:.2f} {delay_str} | Auto={auto_en}"
+                    f"Scale={self._rpi_scale:.2f} {delay_str} | Auto={auto_en}/{method_rpi}"
                 )
             else:  # LSTM
                 current_str = (
@@ -1543,7 +1599,7 @@ class MainWindow(QWidget):
                 )
                 if en_t == "ON" and self._rpi_filter_type_code > 0:
                     current_str += f" {ftype} {self._rpi_cutoff_hz:.1f}Hz order={self._rpi_filter_order}"
-                current_str += f" | Scale={self._rpi_scale:.2f} {delay_str} | Auto={auto_en}"
+                current_str += f" | Scale={self._rpi_scale:.2f} {delay_str} | Auto={auto_en}/{method_rpi}"
             self.lbl_rpi_current_filter.setText(f"RPi Active: {current_str}")
         else:
             self.lbl_rpi_current_filter.setText("RPi Active: waiting for status...")
@@ -1554,6 +1610,7 @@ class MainWindow(QWidget):
         vr = "ON" if self.chk_rl_vr_filter.isChecked() else "OFF"
         tq = "ON" if self.chk_rl_torque_filter.isChecked() else "OFF"
         ad = "ON" if self.chk_rl_auto_delay.isChecked() else "OFF"
+        method_gui = "BO" if (hasattr(self, 'cmb_rl_auto_method') and self.cmb_rl_auto_method.currentIndex() == 1) else "Grid"
         cutoff = float(self.sb_rl_cutoff_hz.value())
         delay = float(self.sb_rl_torque_delay.value())
         scale = float(self.sb_rl_scale.value())
@@ -1562,13 +1619,13 @@ class MainWindow(QWidget):
                 state = (
                     f"GUI Sent(seq={self._rl_cfg_tx_seq}): "
                     f"{filt_name} {cutoff:.1f}Hz, Vel+Ref={vr}, Torque={tq}, "
-                    f"Scale={scale:.2f}, Delay={delay:.0f}ms, Auto={ad}"
+                    f"Scale={scale:.2f}, Delay={delay:.0f}ms, Auto={ad}/{method_gui}"
                 )
             else:
                 state = (
                     f"GUI Pending: "
                     f"{filt_name} {cutoff:.1f}Hz, Vel+Ref={vr}, Torque={tq}, "
-                    f"Scale={scale:.2f}, Delay={delay:.0f}ms, Auto={ad}"
+                    f"Scale={scale:.2f}, Delay={delay:.0f}ms, Auto={ad}/{method_gui}"
                 )
         else:
             state = f"Algo={ALGO_NAMES.get(self._algo_select, '?')}. Override sent only when RL active."
@@ -1577,10 +1634,11 @@ class MainWindow(QWidget):
         if hasattr(self, "lbl_rl_auto_state"):
             if self._rpi_status_valid:
                 auto_state = "ON" if self._rpi_auto_delay_enable else "OFF"
+                method_state = "BO" if self._rpi_auto_method_bo else "Grid"
                 mL = "VALID" if self._rpi_auto_motion_valid_L else "HOLD"
                 mR = "VALID" if self._rpi_auto_motion_valid_R else "HOLD"
                 self.lbl_rl_auto_state.setText(
-                    f"Auto Delay(RPi): {auto_state}\n"
+                    f"Auto Delay(RPi): {auto_state}/{method_state}\n"
                     f"  L: motion={mL} | ratio={self._rpi_power_ratio_L:.3f} | "
                     f"+P={self._rpi_pos_per_s_L:+.2f}W | -P={self._rpi_neg_per_s_L:+.2f}W | "
                     f"delay={self._rpi_delay_ms_L:.0f}ms | best={self._rpi_best_delay_ms_L:.0f}ms\n"
@@ -1592,24 +1650,37 @@ class MainWindow(QWidget):
                 self.lbl_rl_auto_state.setText("Auto Delay: waiting for RPi status...")
 
         # Samsung / EG auto delay state labels (Teensy-native source, v3 format same fields)
-        def _nonrl_auto_txt(auto_on):
-            if not self._rpi_status_valid:
-                return "L=-- ms  R=-- ms"
-            mL = "V" if self._rpi_auto_motion_valid_L else "-"
-            mR = "V" if self._rpi_auto_motion_valid_R else "-"
-            if auto_on:
-                return (f"L={self._rpi_delay_ms_L:.0f}ms({mL}) "
-                        f"R={self._rpi_delay_ms_R:.0f}ms({mR})")
-            else:
-                return (f"L={self._rpi_delay_ms_L:.0f}ms "
-                        f"R={self._rpi_delay_ms_R:.0f}ms")
-
         if hasattr(self, "lbl_sam_auto_delay_state"):
-            self.lbl_sam_auto_delay_state.setText(
-                _nonrl_auto_txt(self._sam_auto_delay_enable))
+            if not self._rpi_status_valid:
+                self.lbl_sam_auto_delay_state.setText("L=-- ms  R=-- ms")
+            else:
+                mL = "V" if self._rpi_auto_motion_valid_L else "-"
+                mR = "V" if self._rpi_auto_motion_valid_R else "-"
+                base_ms = float(self.sb_sam_delay.value())
+                oL = self._rpi_delay_ms_L - base_ms
+                oR = self._rpi_delay_ms_R - base_ms
+                if self._sam_auto_delay_enable:
+                    self.lbl_sam_auto_delay_state.setText(
+                        f"L:{oL:+.0f}ms({mL})  R:{oR:+.0f}ms({mR})")
+                else:
+                    self.lbl_sam_auto_delay_state.setText(
+                        f"L:{self._rpi_delay_ms_L:.0f}ms  R:{self._rpi_delay_ms_R:.0f}ms")
+
         if hasattr(self, "lbl_eg_auto_delay_state"):
-            self.lbl_eg_auto_delay_state.setText(
-                _nonrl_auto_txt(self._eg_auto_delay_enable))
+            if not self._rpi_status_valid:
+                self.lbl_eg_auto_delay_state.setText("L=-- idx  R=-- idx")
+            else:
+                mL = "V" if self._rpi_auto_motion_valid_L else "-"
+                mR = "V" if self._rpi_auto_motion_valid_R else "-"
+                base_ms = float(self.sb_eg_post_delay.value())
+                oL_idx = (self._rpi_delay_ms_L - base_ms) / 10.0
+                oR_idx = (self._rpi_delay_ms_R - base_ms) / 10.0
+                if self._eg_auto_delay_enable:
+                    self.lbl_eg_auto_delay_state.setText(
+                        f"L:{oL_idx:+.1f}idx({mL})  R:{oR_idx:+.1f}idx({mR})")
+                else:
+                    self.lbl_eg_auto_delay_state.setText(
+                        f"L:{self._rpi_delay_ms_L/10:.1f}idx  R:{self._rpi_delay_ms_R/10:.1f}idx")
 
         self._update_power_strip_titles()
 
@@ -2509,6 +2580,7 @@ class MainWindow(QWidget):
             self._rpi_nn_type = -1
             self._rpi_status_version = 0
             self._rpi_auto_delay_enable = False
+            self._rpi_auto_method_bo = False
             self._rpi_auto_motion_valid = False
             self._rpi_auto_motion_valid_L = False
             self._rpi_auto_motion_valid_R = False
@@ -2808,9 +2880,10 @@ class MainWindow(QWidget):
                 if valid_sample:
                     self._rpi_delay_ms_L = dL
                     self._rpi_delay_ms_R = dR
-                    self._rpi_auto_delay_enable = bool(auto_flags & 0x01)
-                    self._rpi_auto_motion_valid_L = bool(auto_flags & 0x02)
-                    self._rpi_auto_motion_valid_R = bool(auto_flags & 0x04)
+                    self._rpi_auto_delay_enable = bool(auto_flags & RPI_AUTO_FLAG_ENABLE)
+                    self._rpi_auto_method_bo = bool(auto_flags & RPI_AUTO_FLAG_METHOD_BO)
+                    self._rpi_auto_motion_valid_L = bool(auto_flags & RPI_AUTO_FLAG_MOTION_VALID_L)
+                    self._rpi_auto_motion_valid_R = bool(auto_flags & RPI_AUTO_FLAG_MOTION_VALID_R)
                     self._rpi_power_ratio_L = rL
                     self._rpi_power_ratio_R = rR
                     self._rpi_pos_per_s_L = pL
@@ -2823,7 +2896,7 @@ class MainWindow(QWidget):
                 # v2 legacy: single-leg float32 — mirror to both L/R for display.
                 delay_ms = struct.unpack_from('<f', rpi_blob, 16)[0]
                 auto_flags = rpi_blob[20] if len(rpi_blob) > 20 else 0
-                motion_valid = bool(auto_flags & 0x02)
+                motion_valid = bool(auto_flags & RPI_AUTO_FLAG_MOTION_VALID_L)
                 if len(rpi_blob) >= 40:
                     ratio = struct.unpack_from('<f', rpi_blob, 24)[0]
                     pos_w = struct.unpack_from('<f', rpi_blob, 28)[0]
@@ -2848,7 +2921,8 @@ class MainWindow(QWidget):
                         abs(delay_ms - self._rpi_delay_ms_L) <= self._rpi_delay_jump_guard_ms
                     )
                 if valid_sample:
-                    self._rpi_auto_delay_enable = bool(auto_flags & 0x01)
+                    self._rpi_auto_delay_enable = bool(auto_flags & RPI_AUTO_FLAG_ENABLE)
+                    self._rpi_auto_method_bo = bool(auto_flags & RPI_AUTO_FLAG_METHOD_BO)
                     self._rpi_auto_motion_valid_L = motion_valid
                     self._rpi_auto_motion_valid_R = motion_valid
                     self._rpi_delay_ms_L = delay_ms
