@@ -54,11 +54,13 @@ Hip-Exo-All-in-One-with-Apple-GUI/
 │   ├── HARDWARE_RISK_AUDIT.md        # Hardware safety audit
 │   └── REPO_STANDARD.md              # Repo creation standard (cross-project)
 │
-├── scripts/                           # Git workflow shell scripts
+├── scripts/                           # Git workflow + PyInstaller build scripts
 │   ├── new_feature.sh                 # Pull main → create branch → commit → push
 │   ├── push_current.sh                # Commit current branch → push
 │   ├── cleanup_branch.sh             # After PR merge: switch to main, delete branch
-│   └── status.sh                      # Show full git status at a glance
+│   ├── status.sh                      # Show full git status at a glance
+│   ├── build_win.ps1                  # Package GUI.py into distributable .exe (Windows)
+│   └── build_mac.sh                   # Package GUI.py into distributable .app (macOS)
 │
 ├── tools/                             # RPi sync tools (code deploy + data pull)
 │   ├── deploy_code.sh                 # Push RPi_Unified/ to Raspberry Pi
@@ -112,6 +114,27 @@ cp tools/rpi_profiles.conf.example tools/rpi_profiles.conf
 # Override profile at runtime:
 python tools/rpi_sync.py --profile aboutberlin --direction push
 ```
+
+### Packaging the GUI (distributable .exe / .app)
+
+Package `GUI_RL_update/GUI.py` into a standalone executable so non-developers can run the GUI without installing Python.
+
+**Windows:**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_win.ps1
+# Output: GUI_RL_update/release/windows/<timestamp_gitsha>/HipExoRLGUI_win_*.zip
+```
+
+**macOS:**
+
+```bash
+chmod +x ./scripts/build_mac.sh
+./scripts/build_mac.sh
+# Output: GUI_RL_update/release/macos/<timestamp_gitsha>/HipExoRLGUI_mac_*.zip
+```
+
+Distribute the `.zip` file. Common options (`-FullBuild` / `--full`, `-SkipDepInstall` / `--skip-deps`), full parameter list, troubleshooting, and first-launch notes for recipients (SmartScreen / Gatekeeper quarantine) are documented in [scripts/README.md](scripts/README.md).
 
 ### Auto Delay (Samsung / EG / RL)
 
