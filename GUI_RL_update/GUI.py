@@ -693,7 +693,7 @@ class MainWindow(QWidget):
         self._apply_plot_visibility()
         self._build_value_displays()
 
-        self._maxT_before_off = 12.0
+        self._maxT_before_off = 15.0
         self.sb_max_torque_cfg.setValue(0.0)
         self._set_power_ui(False)
 
@@ -859,7 +859,7 @@ class MainWindow(QWidget):
             sb.valueChanged.connect(self._tx_params)
             return sb
 
-        self.sb_max_torque_cfg = make_dspin(12.0, 0.0, 30.0, 0.1, 1)
+        self.sb_max_torque_cfg = make_dspin(15.0, 0.0, 30.0, 0.1, 1)
         self.sb_max_torque_cfg.setFixedWidth(90)
         mt_row.addWidget(self.sb_max_torque_cfg)
         param_lay.addLayout(mt_row)
@@ -1951,7 +1951,7 @@ class MainWindow(QWidget):
 
     def _on_power_toggled(self, checked):
         if checked:
-            val = self._maxT_before_off if self._maxT_before_off > 0.0 else 12.0
+            val = self._maxT_before_off if self._maxT_before_off > 0.0 else 15.0
             self.sb_max_torque_cfg.setValue(val)
             self._set_power_ui(True)
         else:
