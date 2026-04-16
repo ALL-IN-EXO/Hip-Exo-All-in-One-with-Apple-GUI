@@ -17,6 +17,8 @@ import os
 import subprocess
 import tempfile
 import shutil
+import threading
+import queue
 from datetime import datetime
 """
 Hip-Exo GUI v4.1 — Apple HIG Design
@@ -566,7 +568,6 @@ class MainWindow(QWidget):
         self._render_dirty = False
         self._last_render_ts = 0.0
         self._render_fps_normal = 24.0
-        self._render_fps_eco = 16.0
         self._last_render_values = None
         self._prev_L_angle = 0.0
         self._prev_R_angle = 0.0
@@ -668,6 +669,17 @@ class MainWindow(QWidget):
         self._record_tmp_dir = None
         self._record_frame_idx = 0
         self._record_timer = None
+        self._record_start_time = 0.0
+        self._record_status_last_ts = 0.0
+        self._record_fps = 15
+        self._record_ext = "jpg"
+        self._record_jpg_quality = 90
+        self._record_queue_max = 10
+        self._record_queue = None
+        self._record_writer_thread = None
+        self._record_drop_count = 0
+        self._record_saved_count = 0
+        self._ffmpeg_path = self._resolve_ffmpeg_path()
         self._replay_mode = False
         self._replay_paused = False
         self._replay_samples = []
@@ -786,10 +798,13 @@ class MainWindow(QWidget):
 
         conn_lay.addStretch(1)
 
-        # Eco toggle
-        conn_lay.addWidget(QLabel("Eco"))
-        self.sw_eco = ToggleSwitch(checked=False, on_color=C.green)
-        conn_lay.addWidget(self.sw_eco)
+        # Manual serial port refresh (replaces Eco render toggle).
+        self.btn_refresh_ports = QPushButton("Refresh")
+        self.btn_refresh_ports.setFixedHeight(28)
+        self.btn_refresh_ports.setCursor(Qt.PointingHandCursor)
+        self.btn_refresh_ports.setToolTip("Refresh serial port list")
+        self.btn_refresh_ports.clicked.connect(self._on_refresh_ports_clicked)
+        conn_lay.addWidget(self.btn_refresh_ports)
 
         # Theme toggle
         self.lbl_theme_icon = QLabel("Dark")
@@ -1526,6 +1541,11 @@ class MainWindow(QWidget):
             self.cmb_port.setCurrentIndex(idx if idx >= 0 else 0)
         self.cmb_port.blockSignals(False)
         self._last_port_scan = time.time()
+        return len(ports)
+
+    def _on_refresh_ports_clicked(self):
+        n_ports = self._refresh_ports()
+        self.lbl_status.setText(f"Ports refreshed ({n_ports})")
 
     def _build_rl_passthrough(self):
         """Pack RL runtime tuning payload for BLE payload[58:98]."""
@@ -2105,8 +2125,6 @@ class MainWindow(QWidget):
         return L_pwr, R_pwr
 
     def _render_interval_s(self):
-        if hasattr(self, 'sw_eco') and self.sw_eco.isChecked():
-            return 1.0 / max(1.0, float(self._render_fps_eco))
         return 1.0 / max(1.0, float(self._render_fps_normal))
 
     def _maybe_render_plot(self, now=None, force=False):
@@ -2255,9 +2273,6 @@ class MainWindow(QWidget):
         self.pwr_strip_left_fill_neg.setBrush(pg.mkBrush(red_fill))
 
         # Toggle colors
-        self.sw_eco._on_color = C.green
-        self.sw_eco._off_color = C.fill
-        self.sw_eco.update()
         self.sw_auto_scroll._on_color = C.blue
         self.sw_auto_scroll._off_color = C.fill
         self.sw_auto_scroll.update()
@@ -2317,6 +2332,20 @@ class MainWindow(QWidget):
                 background-color: {C.blue};
                 color: white; border: none; border-radius: 8px;
                 font-weight: 600; font-size: 12px; padding: 4px 10px;
+            }}
+        """)
+        self.btn_refresh_ports.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {C.fill};
+                color: {C.text};
+                border: none;
+                border-radius: 8px;
+                font-weight: 600;
+                font-size: 12px;
+                padding: 4px 10px;
+            }}
+            QPushButton:hover {{
+                background-color: {C.separator};
             }}
         """)
         if hasattr(self, "lbl_rl_filter_state"):
@@ -2391,12 +2420,117 @@ class MainWindow(QWidget):
         else:
             self._start_recording()
 
+    def _resolve_ffmpeg_path(self):
+        exe_name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+        candidates = []
+
+        # 1) Explicit override.
+        env_path = os.environ.get("EXO_FFMPEG", "").strip()
+        if env_path:
+            candidates.append(env_path)
+
+        # 2) Packaged app locations (PyInstaller one-folder / macOS .app).
+        if getattr(sys, "frozen", False):
+            exe_dir = os.path.dirname(sys.executable)
+            candidates.append(os.path.join(exe_dir, "bin", exe_name))
+            candidates.append(os.path.join(exe_dir, exe_name))
+            meipass = getattr(sys, "_MEIPASS", "")
+            if meipass:
+                candidates.append(os.path.join(meipass, "bin", exe_name))
+                candidates.append(os.path.join(meipass, exe_name))
+
+        # 3) Development tree / common system locations.
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(base_dir, "bin", exe_name))
+        found = shutil.which("ffmpeg")
+        if found:
+            candidates.append(found)
+        if os.name != "nt":
+            candidates.extend(["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"])
+        try:
+            import imageio_ffmpeg  # type: ignore
+            candidates.append(imageio_ffmpeg.get_ffmpeg_exe())
+        except Exception:
+            pass
+
+        seen = set()
+        for p in candidates:
+            if not p:
+                continue
+            norm = os.path.abspath(p)
+            if norm in seen:
+                continue
+            seen.add(norm)
+            if os.path.isfile(norm) and os.access(norm, os.X_OK):
+                return norm
+        return None
+
+    def _record_writer_loop(self, target_dir, ext, jpg_quality):
+        """Background writer: consume QImage frames and persist to disk."""
+        idx = 0
+        q = self._record_queue
+        if q is None:
+            return
+        while True:
+            item = q.get()
+            if item is None:
+                q.task_done()
+                break
+            out_path = os.path.join(target_dir, f"frame_{idx:06d}.{ext}")
+            ok = False
+            try:
+                if ext.lower() in ("jpg", "jpeg"):
+                    ok = bool(item.save(out_path, "JPG", int(jpg_quality)))
+                else:
+                    ok = bool(item.save(out_path))
+            except Exception:
+                ok = False
+            if ok:
+                idx += 1
+                self._record_saved_count = idx
+            else:
+                self._record_drop_count += 1
+            q.task_done()
+
+    def _enqueue_record_frame(self, image):
+        q = self._record_queue
+        if q is None:
+            return False
+        try:
+            q.put_nowait(image)
+            return True
+        except queue.Full:
+            # Keep UI responsive: drop one queued old frame, keep newest frame.
+            try:
+                _old = q.get_nowait()
+                q.task_done()
+                self._record_drop_count += 1
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(image)
+                return True
+            except queue.Full:
+                self._record_drop_count += 1
+                return False
+
     def _start_recording(self):
         os.makedirs(self._capture_dir, exist_ok=True)
         self._record_tmp_dir = tempfile.mkdtemp(prefix="gui_rec_")
         self._record_frame_idx = 0
+        self._record_drop_count = 0
+        self._record_saved_count = 0
         self._recording = True
         self._record_start_time = time.time()
+        self._record_status_last_ts = 0.0
+        self._record_queue = queue.Queue(maxsize=int(self._record_queue_max))
+        self._record_writer_thread = threading.Thread(
+            target=self._record_writer_loop,
+            args=(self._record_tmp_dir, self._record_ext, int(self._record_jpg_quality)),
+            name="hip-gui-record-writer",
+            daemon=True,
+        )
+        self._record_writer_thread.start()
         self.btn_record.setText("Stop")
         self.btn_record.setStyleSheet(f"""
             QPushButton {{
@@ -2407,7 +2541,7 @@ class MainWindow(QWidget):
             QPushButton:hover {{ background-color:#e02a20; }}
         """)
         self._record_timer = QTimer(self)
-        self._record_timer.setInterval(66)  # ~15 fps
+        self._record_timer.setInterval(max(1, int(round(1000.0 / float(self._record_fps)))))
         self._record_timer.timeout.connect(self._capture_frame)
         self._record_timer.start()
         self.lbl_status.setText("Recording...")
@@ -2415,14 +2549,18 @@ class MainWindow(QWidget):
     def _capture_frame(self):
         if not self._recording or not self._record_tmp_dir:
             return
-        pixmap = self.grab()
-        path = os.path.join(self._record_tmp_dir, f"frame_{self._record_frame_idx:06d}.png")
-        pixmap.save(path, "PNG")
+        image = self.grab().toImage().copy()
+        self._enqueue_record_frame(image)
         self._record_frame_idx += 1
-        elapsed = time.time() - self._record_start_time
-        mm = int(elapsed // 60)
-        ss = elapsed - mm * 60
-        self.lbl_status.setText(f"Recording... {mm:02d}:{ss:04.1f}  ({self._record_frame_idx} frames)")
+        now = time.time()
+        if now - self._record_status_last_ts >= 0.2:
+            elapsed = now - self._record_start_time
+            mm = int(elapsed // 60)
+            ss = elapsed - mm * 60
+            self.lbl_status.setText(
+                f"Recording... {mm:02d}:{ss:04.1f}  "
+                f"(cap:{self._record_frame_idx} save:{self._record_saved_count} drop:{self._record_drop_count})")
+            self._record_status_last_ts = now
 
     def _stop_recording(self):
         self._recording = False
@@ -2432,28 +2570,55 @@ class MainWindow(QWidget):
         self.btn_record.setText("Record")
         self._apply_record_idle_style()
 
-        if self._record_frame_idx == 0:
+        # Drain writer queue before encode so frame sequence is complete.
+        if self._record_queue is not None:
+            pushed_stop = False
+            while not pushed_stop:
+                try:
+                    self._record_queue.put(None, timeout=0.05)
+                    pushed_stop = True
+                except queue.Full:
+                    QtWidgets.QApplication.processEvents(QEventLoop.AllEvents, 10)
+                    time.sleep(0.01)
+            deadline = time.time() + 8.0
+            while getattr(self._record_queue, "unfinished_tasks", 0) > 0 and time.time() < deadline:
+                QtWidgets.QApplication.processEvents(QEventLoop.AllEvents, 10)
+                time.sleep(0.01)
+        if self._record_writer_thread and self._record_writer_thread.is_alive():
+            self._record_writer_thread.join(timeout=1.5)
+        self._record_writer_thread = None
+        self._record_queue = None
+
+        if self._record_saved_count == 0:
             if self._record_tmp_dir:
                 shutil.rmtree(self._record_tmp_dir, ignore_errors=True)
             self.lbl_status.setText("Recording cancelled (no frames)")
+            self._record_tmp_dir = None
             return
 
         ts = datetime.now().strftime("recording_%Y%m%d_%H%M%S")
         mp4_path = os.path.join(self._capture_dir, ts + ".mp4")
-        frame_pattern = os.path.join(self._record_tmp_dir, "frame_%06d.png")
+        frame_pattern = os.path.join(self._record_tmp_dir, f"frame_%06d.{self._record_ext}")
         elapsed = time.time() - self._record_start_time
         dur_str = f"{int(elapsed // 60):02d}:{elapsed % 60:04.1f}"
+        self._ffmpeg_path = self._resolve_ffmpeg_path()
+        saved = int(self._record_saved_count)
+        captured = int(self._record_frame_idx)
+        dropped = int(self._record_drop_count)
 
         try:
             subprocess.run(
-                ["ffmpeg", "-y", "-framerate", "15",
+                [self._ffmpeg_path, "-y", "-hide_banner", "-loglevel", "error",
+                 "-framerate", str(self._record_fps),
                  "-i", frame_pattern,
-                 "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                 "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
                  "-crf", "18", mp4_path],
-                check=True, capture_output=True, timeout=120)
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
             shutil.rmtree(self._record_tmp_dir, ignore_errors=True)
-            msg = f"Recording saved!\n\nFile: {ts}.mp4\nDuration: {dur_str}\nFrames: {self._record_frame_idx}"
-            self.lbl_status.setText(f"Recording saved: {ts}.mp4 ({dur_str})")
+            msg = (f"Recording saved!\n\nFile: {ts}.mp4\nDuration: {dur_str}\n"
+                   f"Captured: {captured}\nSaved: {saved}\nDropped: {dropped}")
+            self.lbl_status.setText(f"Recording saved: {ts}.mp4 ({dur_str}, save:{saved}, drop:{dropped})")
             # Brief green flash on button
             self.btn_record.setText("Saved!")
             self.btn_record.setStyleSheet(f"""
@@ -2465,12 +2630,12 @@ class MainWindow(QWidget):
             """)
             QTimer.singleShot(2000, self._reset_record_btn)
             QMessageBox.information(self, "Recording Saved", msg)
-        except (FileNotFoundError, subprocess.SubprocessError):
+        except (FileNotFoundError, TypeError, subprocess.SubprocessError):
             fallback = os.path.join(self._capture_dir, ts)
             shutil.move(self._record_tmp_dir, fallback)
             msg = (f"ffmpeg not found, frames saved as images.\n\n"
-                   f"Folder: {ts}/\nFrames: {self._record_frame_idx}\nDuration: {dur_str}")
-            self.lbl_status.setText(f"Frames saved: {ts}/ ({self._record_frame_idx} frames)")
+                   f"Folder: {ts}/\nCaptured: {captured}\nSaved: {saved}\nDropped: {dropped}\nDuration: {dur_str}")
+            self.lbl_status.setText(f"Frames saved: {ts}/ (save:{saved}, drop:{dropped})")
             QMessageBox.warning(self, "Recording Saved (frames)", msg)
 
         self._record_tmp_dir = None

@@ -14,6 +14,7 @@ set -euo pipefail
 #   ICON_SOURCE=/path/to/icon.jpeg
 #   ICON_ENABLED=1      # default ON; set 0 to disable
 #   VERSION_ENABLED=1   # default ON; set 0 to disable plist version stamping
+#   FFMPEG_BIN=/path/to/ffmpeg   # optional; default: `command -v ffmpeg`
 #   SKIP_DEP_INSTALL=1
 #   FULL_BUILD=1
 #   VENV_DIR=/custom/path/.venv-build
@@ -156,7 +157,7 @@ if [[ "${SKIP_DEP_INSTALL:-0}" != "1" ]]; then
   cleanup_appledouble
   python -m pip install --upgrade pip setuptools wheel
   cleanup_appledouble
-  python -m pip install --upgrade pyinstaller pyqt5 pyqtgraph pyserial numpy pillow
+  python -m pip install --upgrade pyinstaller pyqt5 pyqtgraph pyserial numpy pillow imageio-ffmpeg
   cleanup_appledouble
 fi
 
@@ -197,10 +198,11 @@ fi
 
 if [[ "${FULL_BUILD}" == "1" ]]; then
   echo "==> Build mode: FULL (collect-all)"
-  PYI_ARGS+=(--collect-all PyQt5 --collect-all pyqtgraph)
+  PYI_ARGS+=(--collect-all PyQt5 --collect-all pyqtgraph --collect-all imageio_ffmpeg)
 else
   echo "==> Build mode: SLIM (default)"
   PYI_ARGS+=(
+    --collect-all imageio_ffmpeg
     --hidden-import serial.tools.list_ports
     --hidden-import pyqtgraph
     --exclude-module tkinter
@@ -243,6 +245,14 @@ else
     --exclude-module PyQt5.QtWebEngineCore
     --exclude-module PyQt5.QtWebEngineWidgets
   )
+fi
+
+FFMPEG_BIN="${FFMPEG_BIN:-$(command -v ffmpeg || true)}"
+if [[ -n "${FFMPEG_BIN}" && -x "${FFMPEG_BIN}" ]]; then
+  echo "==> Bundling ffmpeg binary: ${FFMPEG_BIN}"
+  PYI_ARGS+=(--add-binary "${FFMPEG_BIN}:bin")
+else
+  echo "[warn] ffmpeg not found on build host; packaged app may fallback to image frames."
 fi
 
 echo "==> Running PyInstaller"
