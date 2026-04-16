@@ -113,17 +113,38 @@ Dwell 策略由 `AUTO_DWELL_ADAPTIVE` 开关控制（默认 `False`）：
 
 ---
 
+## 6.1 BO 版本（可选，保持同一安全壳）
+
+在 `grid` 之外，新增 `bo`（Bayesian Optimization）模式，仍只优化单变量 `delay_ms`（每腿独立）：
+
+- 观测目标：
+  - `J = pos_per_s - λ·max(0, 0.95-ratio)^2 - μ·|neg_per_s|`
+- BO 模型：
+  - 1D Gaussian Process（RBF kernel）
+  - 采集函数：`UCB`（默认）或 `EI`
+- 执行节奏：
+  - 仍是 1Hz 侧环，每次窗口得到一次噪声观测 `J(x)`
+  - BO 仅决定“下一次建议 delay”，实际写入仍走 `max step` 与 `dwell`
+- **重要**：
+  - `motion_valid`、`dwell`、`delay bounds`、`AUTO_MAX_STEP_MS` 完全复用原安全壳
+  - 100Hz 主控制链路不变，BO 只在慢速监督层运行
+
+建议论文表述：BO 的收敛/低 regret 论述限定在“准稳态窗口近似平稳”条件下，不宣称全局无条件保证。
+
+---
+
 ## 7. 通信与 GUI 交互
 
 ### 7.1 GUI -> RPi（40B passthrough）
 
 - `payload[20]` bit0: `auto_delay_enable`
+- `payload[20]` bit3: `auto_method_bo`（0=grid，1=bo）
 
 ### 7.2 RPi -> GUI（AA56 状态 40B）
 
 新增字段：
 
-- `[20]` bit0: auto enable, bit1: motion valid
+- `[20]` bit0: auto enable, bit1/2: motion valid L/R, bit3: method bo
 - `[24..27]` `power_ratio` (float32)
 - `[28..31]` `pos_per_s` (float32)
 - `[32..35]` `neg_per_s` (float32)
@@ -132,6 +153,7 @@ Dwell 策略由 `AUTO_DWELL_ADAPTIVE` 开关控制（默认 `False`）：
 GUI RL 面板增加：
 
 - `Auto Delay` 开关
+- `Auto Method` 下拉（`Grid (Legacy)` / `Bayes (BO)`）
 - 实时状态行：`ratio / +P/s / -P/s / best delay / motion valid`
 
 ---
@@ -204,4 +226,3 @@ GUI RL 面板增加：
 - 自动调参与指标核心：`RPi_Unified/RL_controller_torch.py`
 - GUI 开关与显示：`GUI_RL_update/GUI.py`
 - 协议透传：`All_in_one_hip_controller_RL_update/Controller_RL.h/.cpp`
-

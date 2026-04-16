@@ -20,6 +20,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - 为重播与截图/录制相关按钮新增鼠标悬停提示（tooltip）
 - Replay 控件新增 `<<5s` 按钮，支持回退 5 秒
 
+### Fixed
+
+- **EG right torque sign** (`Controller_EG.cpp`): `out.tau_R` 补乘 `-1`，修正右腿助力方向；同步将 `ado_.push_sample` 的 tau_R 参数改为 `-S_R`，使 ADO 功率计算与实际输出方向一致
+
+### Changed
+
+- **Samsung Auto Delay 显示**：auto ON 时 `delay_ms` spinbox 灰掉；下方状态行改为显示相对 base 的有符号 offset（`L:+30ms(V)  R:-20ms(-)`）；加 Reset 按钮（发 falling+rising edge 触发 ADO 冷启动）
+- **EG Auto Delay 显示**：auto ON 时同时锁住 `Assist_delay_gain`（delay index）spinbox；状态行由 ms 换算为 idx offset（`÷10`，`L:+2.0idx(V)  R:-1.0idx(-)`）；加 Reset 按钮；auto OFF 时显示当前绝对 idx 值
+- **RL Auto Delay 新增双优化器开关（Grid / BO）**：
+  - RPi 侧在保留原有局部网格扫描（legacy）基础上，新增 1D Bayesian Optimization（GP + UCB/EI）分支
+  - 优化变量保持 `delay_ms`（每腿独立），目标函数为 `J = pos_per_s - λ*max(0, 0.95-ratio)^2 - μ*|neg_per_s|`
+  - 现有安全壳不变：`motion_valid`、`dwell`、`AUTO_MAX_STEP_MS`、delay bounds 全部保留
+  - GUI RL 面板新增 `Auto Method` 下拉（`Grid (Legacy)` / `Bayes (BO)`），通过 `rpi_passthru[20]` bit3 下发
+  - RPi 上行状态 `auto_flags` bit3 回传当前方法，GUI 状态行显示 `Auto=ON/OFF + Method`
+
 ---
 
 ## [v3.2] - 2026-04-14
