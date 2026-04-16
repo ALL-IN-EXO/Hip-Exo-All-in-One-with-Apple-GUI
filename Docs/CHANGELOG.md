@@ -44,6 +44,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - 默认 `Win` 维持为 `200`（可在 GUI 中按需调小），在流畅性与历史可视范围之间保持平衡
   - 默认渲染帧率微调为 `Normal 24 FPS / Eco 16 FPS`
   - 曲线启用 `clip-to-view + auto downsampling`，并关闭默认 antialias，减少 pyqtgraph 渲染成本
+- **Max Torque GUI 默认值更新**（`GUI_RL_update/GUI.py`）：
+  - `Max Torque` 上限保持 `30 Nm`
+  - 默认值由 `12 Nm` 调整为 `15 Nm`
+  - POWER OFF 后再次开启时的回退默认值同步改为 `15 Nm`
 
 ---
 
