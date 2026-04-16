@@ -153,22 +153,27 @@ delay_buf_R = deque([0.0] * BUF_SIZE, maxlen=BUF_SIZE)
 # ---- Auto Delay Optimization (RL only) ----
 AUTO_TARGET_RATIO = 0.95
 AUTO_UPDATE_INTERVAL_S = 1.0
-AUTO_DWELL_S = 3.0
+AUTO_DWELL_S = 0.5
 # True : effective_dwell = max(AUTO_DWELL_S, auto_window_s + 1.0) —— 等窗口 100% 新数据
 # False: effective_dwell = AUTO_DWELL_S                           —— 固定常数, 追踪更快
 AUTO_DWELL_ADAPTIVE = False
 AUTO_SCAN_HALF_RANGE_MS = 100.0
 AUTO_SCAN_STEP_MS = 10.0
-AUTO_MAX_STEP_MS = 20.0
+AUTO_MAX_STEP_MS = 40.0
 AUTO_WINDOW_CYCLES = 6.0
-AUTO_WINDOW_MIN_S = 4.0
-AUTO_WINDOW_MAX_S = 12.0
+AUTO_WINDOW_MIN_S = 8.0
+AUTO_WINDOW_MAX_S = 8.0
 AUTO_WINDOW_FALLBACK_S = 8.0
 AUTO_VALID_MIN_MEAN_ABS_VEL_DPS = 8.0
 AUTO_VALID_MIN_ABS_POWER_W = 2.0
 AUTO_HIST_MARGIN_S = 2.0
 AUTO_MAX_DELAY_S = MAX_RUNTIME_DELAY_MS / 1000.0
 AUTO_HIST_FRAMES = int(round((AUTO_WINDOW_MAX_S + AUTO_MAX_DELAY_S + AUTO_HIST_MARGIN_S) * CTRL_HZ))
+# Auto-delay power/motion evaluation velocity source:
+# True  -> use finite-difference d(angle)/dt (with wrap protection), hardcoded (no GUI)
+# False -> use IMU raw angular velocity LTAVx/RTAVx
+AUTO_PWR_USE_ANGLE_DIFF_VEL = True
+AUTO_PWR_ANGLE_WRAP_DEG = 180.0
 
 # Runtime optimizer method: 'grid' (legacy local scan) or 'bo' (Bayesian optimization)
 AUTO_OPT_METHOD_DEFAULT = 'grid'
@@ -385,6 +390,7 @@ logf = root + ts.strftime('%Y%m%d-%H%M%S') + '.csv'
 
 csv_header = [
     'Time_ms', 'imu_LTx', 'imu_RTx', 'imu_Lvel', 'imu_Rvel',
+    'auto_eval_Lvel', 'auto_eval_Rvel', 'auto_vel_source',
     'L_command_actuator', 'R_command_actuator',
     'raw_LExoTorque', 'raw_RExoTorque',
     'filtered_LExoTorque', 'filtered_RExoTorque',
@@ -480,6 +486,22 @@ def auto_window_seconds(gait_freq_hz: float) -> float:
     else:
         t_win = AUTO_WINDOW_FALLBACK_S
     return float(max(AUTO_WINDOW_MIN_S, min(AUTO_WINDOW_MAX_S, t_win)))
+
+
+def _finite_diff_vel_deg_s(cur_ang_deg: float, prev_ang_deg: float, fs_hz: float,
+                           wrap_deg: float = 180.0) -> float:
+    """
+    Angular finite difference with wrap protection.
+    Example (wrap_deg=180): if angle jumps from +179 to -179 deg, delta is +2 deg.
+    """
+    d = float(cur_ang_deg) - float(prev_ang_deg)
+    period = 2.0 * float(wrap_deg)
+    if period > 0.0:
+        while d > float(wrap_deg):
+            d -= period
+        while d < -float(wrap_deg):
+            d += period
+    return d * float(fs_hz)
 
 
 def compute_leg_power_metrics(tau_src: np.ndarray, vel_dps: np.ndarray, delay_frames: int,
@@ -1018,6 +1040,8 @@ def main():
     hist_vel_R = deque(maxlen=AUTO_HIST_FRAMES)
     hist_ang_L = deque(maxlen=AUTO_HIST_FRAMES)
     hist_ang_R = deque(maxlen=AUTO_HIST_FRAMES)
+    auto_prev_ang_L = None
+    auto_prev_ang_R = None
     auto_bo_state_L = make_bo_state()
     auto_bo_state_R = make_bo_state()
 
@@ -1051,6 +1075,10 @@ def main():
     print(f"\n[启动] NN_TYPE={NN_TYPE}, kp={kp}, kd={kd}")
     print(f"[启动] 串口={SER_DEV}, 波特率={BAUDRATE}")
     print(f"[启动] AutoDelay optimizer={auto_opt_method} (grid|bo)")
+    print(
+        f"[启动] AutoDelay power velocity source="
+        f"{'d(angle)/dt' if AUTO_PWR_USE_ANGLE_DIFF_VEL else 'imu_raw(LTAVx/RTAVx)'}"
+    )
     if NN_TYPE == 'lstm_pd':
         print(
             f"[启动] lstm_pd zero-mean={'ON' if pd_zm_enabled else 'OFF'} "
@@ -1105,6 +1133,8 @@ def main():
                 hist_vel_R.clear()
                 hist_ang_L.clear()
                 hist_ang_R.clear()
+                auto_prev_ang_L = None
+                auto_prev_ang_R = None
                 reset_bo_state(auto_bo_state_L)
                 reset_bo_state(auto_bo_state_R)
                 if pd_zm_enabled:
@@ -1211,11 +1241,32 @@ def main():
             delay_input_L = filter_L_cmd if USE_FILTERED_FOR_DELAY else L_cmd
             delay_input_R = filter_R_cmd if USE_FILTERED_FOR_DELAY else R_cmd
 
+            # ---- velocity source for auto-delay power/motion evaluation ----
+            # This affects ONLY auto-delay metrics/gating path (hist_vel_*), not NN inputs.
+            if AUTO_PWR_USE_ANGLE_DIFF_VEL:
+                if auto_prev_ang_L is None or auto_prev_ang_R is None:
+                    vel_eval_L = float(Lvel)
+                    vel_eval_R = float(Rvel)
+                else:
+                    vel_eval_L = _finite_diff_vel_deg_s(
+                        Lpos, auto_prev_ang_L, float(CTRL_HZ), AUTO_PWR_ANGLE_WRAP_DEG
+                    )
+                    vel_eval_R = _finite_diff_vel_deg_s(
+                        Rpos, auto_prev_ang_R, float(CTRL_HZ), AUTO_PWR_ANGLE_WRAP_DEG
+                    )
+                auto_prev_ang_L = float(Lpos)
+                auto_prev_ang_R = float(Rpos)
+                auto_vel_source = 'angle_diff'
+            else:
+                vel_eval_L = float(Lvel)
+                vel_eval_R = float(Rvel)
+                auto_vel_source = 'imu_raw'
+
             # ---- auto-delay history (for ratio/energy evaluation) ----
             hist_tau_src_L.append(float(delay_input_L))
             hist_tau_src_R.append(float(delay_input_R))
-            hist_vel_L.append(float(Lvel))
-            hist_vel_R.append(float(Rvel))
+            hist_vel_L.append(float(vel_eval_L))
+            hist_vel_R.append(float(vel_eval_R))
             hist_ang_L.append(float(Lpos))
             hist_ang_R.append(float(Rpos))
 
@@ -1412,6 +1463,9 @@ def main():
                 'imu_RTx': f'{Rpos:.4f}',
                 'imu_Lvel': f'{Lvel:.4f}',
                 'imu_Rvel': f'{Rvel:.4f}',
+                'auto_eval_Lvel': f'{vel_eval_L:.4f}',
+                'auto_eval_Rvel': f'{vel_eval_R:.4f}',
+                'auto_vel_source': auto_vel_source,
                 'L_command_actuator': f'{L_cmd_final:.6f}',
                 'R_command_actuator': f'{R_cmd_final:.6f}',
                 'raw_LExoTorque': f'{L_cmd:.6f}',

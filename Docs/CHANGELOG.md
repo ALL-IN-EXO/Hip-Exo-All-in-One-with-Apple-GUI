@@ -31,6 +31,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - 打包时自动探测并内嵌 ffmpeg 到 `bin/`，减少用户机器缺少 ffmpeg 导致仅保存图片序列的问题
   - 同时加入 `imageio-ffmpeg` 兜底（依赖安装 + PyInstaller collect），即使构建机未安装系统 ffmpeg 也可打包出可录制 mp4 的版本
   - 支持显式覆盖路径：mac 用 `FFMPEG_BIN`，Windows 用 `FFMPEG_EXE`
+- **mac 打包脚本增加签名/公证流程**（`scripts/build_mac_JZ.sh`）：
+  - 默认支持 Developer ID 签名（`SIGN_ENABLED=1`，默认身份 `Developer ID Application: Formideep`）
+  - 新增可选 notarization 流程（`NOTARIZE_ENABLED=1` + `NOTARY_PROFILE`）与 stapler（`STAPLE_ENABLED`）
+  - 打包顺序升级为：`build -> sign -> (optional notarize+staple) -> zip`
+  - 脚本支持 `sh build_mac_JZ.sh` 直接调用（自动 re-exec 到 bash）
+  - 默认公证关闭（`NOTARIZE_ENABLED=0`）；需要时手动开启并提供 profile（默认值 `exo-notary`）
+- **RL Auto Delay 功率评估速度源切换（硬开关，默认角度差分）**（`RPi_Unified/RL_controller_torch.py`）：
+  - 新增 `AUTO_PWR_USE_ANGLE_DIFF_VEL=True`（不走 GUI）
+  - Auto Delay 的功率/门控评估链路改为可选 `d(angle)/dt` 速度源（仅影响 auto-delay 评估，不影响 NN 主输入）
+  - 角度差分实现采用左右腿独立前值状态，加入回绕保护（`AUTO_PWR_ANGLE_WRAP_DEG`）
+  - cfg 切换时同步清空评估历史并重置差分前值，避免跨配置速度尖峰污染窗口
 
 ---
 
@@ -65,6 +76,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - 现有安全壳不变：`motion_valid`、`dwell`、`AUTO_MAX_STEP_MS`、delay bounds 全部保留
   - GUI RL 面板新增 `Auto Method` 下拉（`Grid (Legacy)` / `Bayes (BO)`），通过 `rpi_passthru[20]` bit3 下发
   - RPi 上行状态 `auto_flags` bit3 回传当前方法，GUI 状态行显示 `Auto=ON/OFF + Method`
+- **RL Auto Delay 默认参数按 grid_optimization 最优组更新**（`RPi_Unified/RL_controller_torch.py`）：
+  - `AUTO_DWELL_S`：`3.0s -> 0.5s`
+  - `AUTO_MAX_STEP_MS`：`20ms -> 40ms`
+  - 窗口默认改为固定 `8s`（`AUTO_WINDOW_MIN_S = AUTO_WINDOW_MAX_S = 8.0`）
 - **GUI 性能优化（实时与 Replay）**（`GUI_RL_update/GUI.py`）：
   - 绘图刷新与数据接收解耦：接收路径仅入缓冲，绘图按固定帧率刷新（Normal 24 FPS / Eco 16 FPS）
   - 高频 RX 路径中 `_update_rl_filter_state_label` 限频至约 4Hz，降低文本更新抖动
