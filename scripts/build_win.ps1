@@ -17,6 +17,9 @@ $ErrorActionPreference = "Stop"
 #   powershell -ExecutionPolicy Bypass -File .\scripts\build_win.ps1 -PythonExe "C:\Python311\python.exe"
 #   powershell -ExecutionPolicy Bypass -File .\scripts\build_win.ps1 -FullBuild
 #   powershell -ExecutionPolicy Bypass -File .\scripts\build_win.ps1 -SkipDepInstall
+#
+# Optional env:
+#   $env:FFMPEG_EXE = "C:\path\to\ffmpeg.exe"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot  = Resolve-Path (Join-Path $ScriptDir "..")
@@ -61,7 +64,7 @@ if (!(Test-Path $VenvPy)) {
 if (!$SkipDepInstall) {
   Write-Host "==> Installing build/runtime dependencies into venv"
   & $VenvPy -m pip install --upgrade pip setuptools wheel
-  & $VenvPy -m pip install --upgrade pyinstaller pyqt5 pyqtgraph pyserial numpy
+  & $VenvPy -m pip install --upgrade pyinstaller pyqt5 pyqtgraph pyserial numpy imageio-ffmpeg
 }
 
 Write-Host "==> Cleaning previous build folders"
@@ -86,12 +89,14 @@ if ($FullBuild) {
   Write-Host "==> Build mode: FULL (collect-all)"
   $PyArgs += @(
     "--collect-all", "PyQt5",
-    "--collect-all", "pyqtgraph"
+    "--collect-all", "pyqtgraph",
+    "--collect-all", "imageio_ffmpeg"
   )
 }
 else {
   Write-Host "==> Build mode: SLIM (default)"
   $PyArgs += @(
+    "--collect-all", "imageio_ffmpeg",
     "--hidden-import", "pyqtgraph",
     "--hidden-import", "serial",
     "--hidden-import", "serial.tools.list_ports",
@@ -132,6 +137,22 @@ else {
     "--exclude-module", "PyQt5.QtWebEngineCore",
     "--exclude-module", "PyQt5.QtWebEngineWidgets"
   )
+}
+
+$FfmpegExe = $env:FFMPEG_EXE
+if ([string]::IsNullOrWhiteSpace($FfmpegExe)) {
+  try {
+    $cmd = Get-Command ffmpeg -ErrorAction Stop
+    $FfmpegExe = $cmd.Source
+  } catch {
+    $FfmpegExe = ""
+  }
+}
+if (![string]::IsNullOrWhiteSpace($FfmpegExe) -and (Test-Path $FfmpegExe)) {
+  Write-Host "==> Bundling ffmpeg binary: $FfmpegExe"
+  $PyArgs += @("--add-binary", "$FfmpegExe;bin")
+} else {
+  Write-Host "[warn] ffmpeg not found on build host; packaged app may fallback to image frames."
 }
 
 Write-Host "==> Running PyInstaller"

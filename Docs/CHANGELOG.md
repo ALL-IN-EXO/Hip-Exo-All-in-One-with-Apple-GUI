@@ -15,6 +15,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - 提供 `FullBuild`/`--full` 模式（`--collect-all PyQt5 pyqtgraph`）和默认 SLIM 模式（针对 pyqtgraph 保留 QtSvg/QtPrintSupport/QtOpenGL 等常用依赖，仅排除 Qt3D/QtWebEngine/QtQml 等明显无关模块）
 - `.gitignore` 新增 PyInstaller 产物忽略规则：`.venv-build-*/`、`release/`、`*.spec`
 
+### Changed
+
+- **Hip GUI 连接栏交互调整**（`GUI_RL_update/GUI.py`）：
+  - 左上角 `Eco` 开关替换为手动 `Refresh` 按钮，用于即时刷新串口列表
+  - 渲染刷新率改为固定使用 Normal 帧率（不再由 Eco 开关切换）
+- **Hip GUI 录屏稳定性改进**（`GUI_RL_update/GUI.py`）：
+  - 录屏帧从 PNG 改为 JPG（默认质量 90），显著降低实时落盘开销
+  - 录屏状态文本限频更新（约 5 Hz），减少高频 UI 文本重绘
+  - 录屏写盘迁移为后台线程 + 有界队列（主线程仅抓帧入队），降低录制过程主线程阻塞导致的卡顿
+  - 队列拥塞时启用丢最旧帧策略，优先保证实时交互与当前画面
+  - ffmpeg 查找逻辑新增“打包内 bin + 环境变量 + 系统路径”多级解析
+  - ffmpeg 编码参数改为 `libx264 + ultrafast + even-dimension padding`，降低编码耗时并避免奇数分辨率失败
+- **打包脚本补充 ffmpeg 内置**（`scripts/build_mac_JZ.sh`, `scripts/build_win.ps1`）：
+  - 打包时自动探测并内嵌 ffmpeg 到 `bin/`，减少用户机器缺少 ffmpeg 导致仅保存图片序列的问题
+  - 同时加入 `imageio-ffmpeg` 兜底（依赖安装 + PyInstaller collect），即使构建机未安装系统 ffmpeg 也可打包出可录制 mp4 的版本
+  - 支持显式覆盖路径：mac 用 `FFMPEG_BIN`，Windows 用 `FFMPEG_EXE`
+
 ---
 
 ## [v3.3] - 2026-04-15
