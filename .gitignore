@@ -38,6 +38,13 @@ RPi_Unified/output/
 GUI_RL_update/data/
 GUI_RL_update/captures/
 *.mp4
+GUI_RL_update/release/
+GUI_RL_update/dist/
+GUI_RL_update/build/
+GUI_RL_update/*.spec
+GUI_RL_update/.venv-build-win/
+*.app
+*.zip
 
 # Model weights (large binary, track separately)
 *.pt

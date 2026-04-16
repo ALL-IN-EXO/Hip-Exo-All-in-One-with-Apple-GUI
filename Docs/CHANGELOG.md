@@ -62,6 +62,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `Max Torque` 上限保持 `30 Nm`
   - 默认值由 `12 Nm` 调整为 `15 Nm`
   - POWER OFF 后再次开启时的回退默认值同步改为 `15 Nm`
+- **Hip 参数区 tooltip 补齐**（`GUI_RL_update/GUI.py`）：
+  - 为新增/常用参数补充说明：`Max Torque`、EG 参数、Samsung `Kappa/Delay`、RL `Scale/Delay/Filter/Auto Method`
+  - 同步给对应标签与控件添加 tooltip，便于现场调参与新用户理解
+- **新增跨平台打包脚本**（`scripts/build_mac.sh`, `scripts/build_win.ps1`）：
+  - 支持一键打包 Hip GUI 为 macOS `.app` 与 Windows `.exe`
+  - 输出目录统一落在 `GUI_RL_update/release/{mac|windows}/<timestamp_gitsha>/`
+  - 默认启用图标与版本号标注（图标源：`scripts/assets/app_icon.jpeg`）
+  - 支持 `APP_VERSION`、`ICON_SOURCE`、`ICON_ENABLED`、`VERSION_ENABLED`、`SKIP_DEP_INSTALL`、`FULL_BUILD` 等可选参数
+- **打包大文件忽略规则补充**（`.gitignore`）：
+  - 新增忽略 `GUI_RL_update/release/`, `GUI_RL_update/dist/`, `GUI_RL_update/build/`, `GUI_RL_update/*.spec`, `GUI_RL_update/.venv-build-win/`
+  - 新增通用忽略 `*.app`, `*.zip`，避免误提交打包产物到 GitHub
 
 ---
 

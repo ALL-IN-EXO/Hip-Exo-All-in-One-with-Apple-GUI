@@ -846,9 +846,16 @@ class MainWindow(QWidget):
 
         param_lay.addWidget(_make_section_label("PARAMETERS"))
 
+        max_torque_tip = (
+            "Maximum output torque clamp (Nm).\n"
+            "This is the top-level safety limit sent to controller."
+        )
+
         # Max Torque row
         mt_row = QHBoxLayout()
-        mt_row.addWidget(QLabel("Max Torque (Nm)"))
+        lbl_max_torque = QLabel("Max Torque (Nm)")
+        lbl_max_torque.setToolTip(max_torque_tip)
+        mt_row.addWidget(lbl_max_torque)
         mt_row.addStretch(1)
 
         def make_dspin(val=0.0, mn=-20, mx=20, step=0.01, dec=2, tip=""):
@@ -859,7 +866,7 @@ class MainWindow(QWidget):
             sb.valueChanged.connect(self._tx_params)
             return sb
 
-        self.sb_max_torque_cfg = make_dspin(15.0, 0.0, 30.0, 0.1, 1)
+        self.sb_max_torque_cfg = make_dspin(15.0, 0.0, 30.0, 0.1, 1, max_torque_tip)
         self.sb_max_torque_cfg.setFixedWidth(90)
         mt_row.addWidget(self.sb_max_torque_cfg)
         param_lay.addLayout(mt_row)
@@ -878,19 +885,29 @@ class MainWindow(QWidget):
         eg_panel.setStyleSheet("background:transparent;")
         eg_grid = QGridLayout(eg_panel)
         eg_grid.setSpacing(4)
-        self.sb_Flex_Assist_gain  = make_dspin(1.0, -2, 2, 0.01, 2)
-        self.sb_Ext_Assist_gain   = make_dspin(1.0, -2, 2, 0.01, 2)
-        self.sb_gate_k            = make_dspin(1.0, 0, 10, 0.1, 2)
-        self.sb_gate_p_on         = make_dspin(8, 0, 50, 1, 2)
-        self.sb_scale_all         = make_dspin(0.20, -1.0, 1.0, 0.01, 2)
-        self.sb_ext_phase_frac_L  = make_dspin(0.300, 0.0, 0.500, 0.001, 3)
-        self.sb_ext_phase_frac_R  = make_dspin(0.300, 0.0, 0.500, 0.001, 3)
-        self.sb_ext_gain          = make_dspin(0.50, -3.0, 3.0, 0.01, 2)
+        eg_tip_r_gain = "Right-leg assist gain multiplier."
+        eg_tip_l_gain = "Left-leg assist gain multiplier."
+        eg_tip_gate_k = "Gate sharpness. Higher value means steeper on/off transition."
+        eg_tip_gate_on = "Gate-on threshold for positive-power region."
+        eg_tip_scale_all = "Global EG torque scale applied to both sides."
+        eg_tip_ext_frac_l = "Left extension phase fraction (0.0~0.5 of gait cycle)."
+        eg_tip_ext_frac_r = "Right extension phase fraction (0.0~0.5 of gait cycle)."
+        eg_tip_ext_gain = "Extension channel gain."
+        eg_tip_delay_idx = (
+            "Assist_delay_gain phase index (0..99), auto-scaled by gait frequency "
+            "(not fixed ms)."
+        )
+        self.sb_Flex_Assist_gain  = make_dspin(1.0, -2, 2, 0.01, 2, eg_tip_r_gain)
+        self.sb_Ext_Assist_gain   = make_dspin(1.0, -2, 2, 0.01, 2, eg_tip_l_gain)
+        self.sb_gate_k            = make_dspin(1.0, 0, 10, 0.1, 2, eg_tip_gate_k)
+        self.sb_gate_p_on         = make_dspin(8, 0, 50, 1, 2, eg_tip_gate_on)
+        self.sb_scale_all         = make_dspin(0.20, -1.0, 1.0, 0.01, 2, eg_tip_scale_all)
+        self.sb_ext_phase_frac_L  = make_dspin(0.300, 0.0, 0.500, 0.001, 3, eg_tip_ext_frac_l)
+        self.sb_ext_phase_frac_R  = make_dspin(0.300, 0.0, 0.500, 0.001, 3, eg_tip_ext_frac_r)
+        self.sb_ext_gain          = make_dspin(0.50, -3.0, 3.0, 0.01, 2, eg_tip_ext_gain)
         self.sb_Assist_delay_gain = QSpinBox()
         self.sb_Assist_delay_gain.setRange(0, 99); self.sb_Assist_delay_gain.setValue(40)
-        self.sb_Assist_delay_gain.setToolTip(
-            "Assist_delay_gain phase index (0..99), auto-scaled by gait frequency (not fixed ms)"
-        )
+        self.sb_Assist_delay_gain.setToolTip(eg_tip_delay_idx)
         self.sb_Assist_delay_gain.valueChanged.connect(self._tx_params)
 
         eg_labels = ["R Gain", "L Gain", "gate_k", "gate_p_on",
@@ -899,10 +916,14 @@ class MainWindow(QWidget):
                      self.sb_gate_k, self.sb_gate_p_on, self.sb_scale_all,
                      self.sb_ext_phase_frac_L, self.sb_ext_phase_frac_R,
                      self.sb_ext_gain, self.sb_Assist_delay_gain]
-        for i, (lb, sb) in enumerate(zip(eg_labels, eg_spins)):
+        eg_tips = [eg_tip_r_gain, eg_tip_l_gain, eg_tip_gate_k, eg_tip_gate_on,
+                   eg_tip_scale_all, eg_tip_ext_frac_l, eg_tip_ext_frac_r,
+                   eg_tip_ext_gain, eg_tip_delay_idx]
+        for i, (lb, sb, tip) in enumerate(zip(eg_labels, eg_spins, eg_tips)):
             r, c = divmod(i, 3)
             lbl = QLabel(lb)
             lbl.setStyleSheet(f"color:{C.text2}; font-size:11px; background:transparent;")
+            lbl.setToolTip(tip)
             eg_grid.addWidget(lbl, r*2, c)
             eg_grid.addWidget(sb, r*2+1, c)
         # Post-delay row (below the 3-column grid; 9 items → rows 0-5, so start at row 6)
@@ -926,6 +947,7 @@ class MainWindow(QWidget):
             f"color:{C.purple}; font-size:11px; background:transparent;")
         _lbl_pd = QLabel("Post Delay (ms)")
         _lbl_pd.setStyleSheet(f"color:{C.text2}; font-size:11px; background:transparent;")
+        _lbl_pd.setToolTip(self.sb_eg_post_delay.toolTip())
         eg_grid.addWidget(_lbl_pd, _eg_next_row, 0, 1, 2)
         eg_grid.addWidget(self.sb_eg_post_delay, _eg_next_row, 2)
         eg_grid.addWidget(self.chk_eg_auto_delay, _eg_next_row + 1, 0)
@@ -938,8 +960,16 @@ class MainWindow(QWidget):
         sam_panel.setStyleSheet("background:transparent;")
         sam_grid = QGridLayout(sam_panel)
         sam_grid.setSpacing(4)
-        self.sb_sam_kappa = make_dspin(3.0, 0, 20, 0.1, 1)
-        self.sb_sam_delay = make_dspin(250, 0, 1500, 10, 0)
+        sam_kappa_tip = (
+            "Samsung controller gain kappa.\n"
+            "Higher value generally increases assist magnitude."
+        )
+        sam_delay_tip = (
+            "Samsung torque delay (ms).\n"
+            "Auto Delay ON: optimized by Teensy-local AutoDelayOptimizer (L/R independent)."
+        )
+        self.sb_sam_kappa = make_dspin(3.0, 0, 20, 0.1, 1, sam_kappa_tip)
+        self.sb_sam_delay = make_dspin(250, 0, 1500, 10, 0, sam_delay_tip)
         self.chk_sam_auto_delay = QCheckBox("Auto Delay")
         self.chk_sam_auto_delay.setChecked(False)
         self.chk_sam_auto_delay.setToolTip(
@@ -953,9 +983,13 @@ class MainWindow(QWidget):
         self.lbl_sam_auto_delay_state = QLabel("L=-- ms  R=-- ms")
         self.lbl_sam_auto_delay_state.setStyleSheet(
             f"color:{C.purple}; font-size:11px; background:transparent;")
-        sam_grid.addWidget(QLabel("Kappa"), 0, 0)
+        lbl_sam_kappa = QLabel("Kappa")
+        lbl_sam_kappa.setToolTip(sam_kappa_tip)
+        sam_grid.addWidget(lbl_sam_kappa, 0, 0)
         sam_grid.addWidget(self.sb_sam_kappa, 0, 1)
-        sam_grid.addWidget(QLabel("Delay (ms)"), 1, 0)
+        lbl_sam_delay = QLabel("Delay (ms)")
+        lbl_sam_delay.setToolTip(sam_delay_tip)
+        sam_grid.addWidget(lbl_sam_delay, 1, 0)
         sam_grid.addWidget(self.sb_sam_delay, 1, 1)
         sam_grid.addWidget(self.chk_sam_auto_delay, 2, 0)
         sam_grid.addWidget(self.btn_sam_reset, 2, 1)
@@ -985,7 +1019,9 @@ class MainWindow(QWidget):
         self.sb_rl_scale = make_dspin(1.00, 0.00, 3.00, 0.01, 2,
                                       "RL torque scale (L/R same)")
         self.sb_rl_scale.valueChanged.disconnect(self._tx_params)
-        rl_lay.addWidget(QLabel("RL Scale (L/R)"), 2, 0)
+        lbl_rl_scale = QLabel("RL Scale (L/R)")
+        lbl_rl_scale.setToolTip(self.sb_rl_scale.toolTip())
+        rl_lay.addWidget(lbl_rl_scale, 2, 0)
         rl_lay.addWidget(self.sb_rl_scale, 2, 1)
 
         # Row 3: Delay (step=10ms, staged)
@@ -1000,14 +1036,18 @@ class MainWindow(QWidget):
         self.rl_delay_stack = QStackedWidget()
         self.rl_delay_stack.addWidget(self.sb_rl_torque_delay)      # index 0: manual input
         self.rl_delay_stack.addWidget(self.lbl_rl_torque_delay_auto)  # index 1: auto display
-        rl_lay.addWidget(QLabel("Torque Delay (ms)"), 3, 0)
+        lbl_rl_delay = QLabel("Torque Delay (ms)")
+        lbl_rl_delay.setToolTip(self.sb_rl_torque_delay.toolTip())
+        rl_lay.addWidget(lbl_rl_delay, 3, 0)
         rl_lay.addWidget(self.rl_delay_stack, 3, 1)
 
         # Row 4: Filter Type
         self.cmb_rl_filter_type = QComboBox()
         self.cmb_rl_filter_type.addItems([x[0] for x in RL_FILTER_TYPES])
         self._setup_combo(self.cmb_rl_filter_type)
+        self.cmb_rl_filter_type.setToolTip("RL runtime filter type on RPi.")
         self.lbl_rl_filter_type = QLabel("Filter Type")
+        self.lbl_rl_filter_type.setToolTip(self.cmb_rl_filter_type.toolTip())
         rl_lay.addWidget(self.lbl_rl_filter_type, 4, 0)
         rl_lay.addWidget(self.cmb_rl_filter_type, 4, 1)
 
@@ -1016,6 +1056,7 @@ class MainWindow(QWidget):
                                           "RL runtime filter cutoff (Hz)")
         self.sb_rl_cutoff_hz.valueChanged.disconnect(self._tx_params)
         self.lbl_rl_cutoff = QLabel("Filter Cutoff (Hz)")
+        self.lbl_rl_cutoff.setToolTip(self.sb_rl_cutoff_hz.toolTip())
         rl_lay.addWidget(self.lbl_rl_cutoff, 5, 0)
         rl_lay.addWidget(self.sb_rl_cutoff_hz, 5, 1)
 
@@ -1024,6 +1065,9 @@ class MainWindow(QWidget):
         self.chk_rl_vr_filter = QCheckBox("Vel+Ref")
         self.chk_rl_torque_filter = QCheckBox("Torque")
         self.chk_rl_auto_delay = QCheckBox("Auto Delay")
+        self.chk_rl_vr_filter.setToolTip("Enable RPi filter for velocity/reference channels.")
+        self.chk_rl_torque_filter.setToolTip("Enable RPi filter on torque output channel.")
+        self.chk_rl_auto_delay.setToolTip("Enable RPi auto delay optimization.")
         self.chk_rl_vr_filter.setChecked(True)
         self.chk_rl_torque_filter.setChecked(True)
         self.chk_rl_auto_delay.setChecked(False)
@@ -1035,6 +1079,7 @@ class MainWindow(QWidget):
         filt_row.addWidget(self.chk_rl_auto_delay)
         filt_row.addStretch(1)
         self.lbl_rl_filter_en = QLabel("Filter Enable")
+        self.lbl_rl_filter_en.setToolTip("Runtime filter and auto-delay toggles sent to RPi.")
         rl_lay.addWidget(self.lbl_rl_filter_en, 6, 0)
         rl_lay.addLayout(filt_row, 6, 1)
 
@@ -1047,7 +1092,9 @@ class MainWindow(QWidget):
             "Auto Delay optimizer on RPi: Grid(local scan) or Bayes(1D GP BO)."
         )
         self.cmb_rl_auto_method.currentIndexChanged.connect(self._update_rl_filter_state_label)
-        rl_lay.addWidget(QLabel("Auto Method"), 7, 0)
+        lbl_rl_auto_method = QLabel("Auto Method")
+        lbl_rl_auto_method.setToolTip(self.cmb_rl_auto_method.toolTip())
+        rl_lay.addWidget(lbl_rl_auto_method, 7, 0)
         rl_lay.addWidget(self.cmb_rl_auto_method, 7, 1)
 
         # Row 8: Apply RL button (staged send, not realtime)
