@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec /usr/bin/env bash "$0" "$@"
+fi
 set -euo pipefail
 
 # Build macOS .app for:
@@ -15,6 +18,12 @@ set -euo pipefail
 #   ICON_ENABLED=1      # default ON; set 0 to disable
 #   VERSION_ENABLED=1   # default ON; set 0 to disable plist version stamping
 #   FFMPEG_BIN=/path/to/ffmpeg   # optional; default: `command -v ffmpeg`
+#   SIGN_ENABLED=1      # default ON; set 0 to skip Developer ID signing
+#   DEVELOPER_ID="Developer ID Application: Formideep"
+#   CODESIGN_OPTIONS=runtime
+#   NOTARIZE_ENABLED=0  # default OFF; set 1 to submit notarization
+#   NOTARY_PROFILE=exo-notary  # required when NOTARIZE_ENABLED=1
+#   STAPLE_ENABLED=1    # default ON when notarization is enabled
 #   SKIP_DEP_INSTALL=1
 #   FULL_BUILD=1
 #   VENV_DIR=/custom/path/.venv-build
@@ -33,6 +42,12 @@ fi
 APP_NAME="${APP_NAME:-HipExoControllerGUI}"
 ICON_ENABLED="${ICON_ENABLED:-1}"
 VERSION_ENABLED="${VERSION_ENABLED:-1}"
+SIGN_ENABLED="${SIGN_ENABLED:-1}"
+DEVELOPER_ID="${DEVELOPER_ID:-Developer ID Application: Formideep}"
+CODESIGN_OPTIONS="${CODESIGN_OPTIONS:-runtime}"
+NOTARIZE_ENABLED="${NOTARIZE_ENABLED:-0}"
+NOTARY_PROFILE="${NOTARY_PROFILE:-exo-notary}"
+STAPLE_ENABLED="${STAPLE_ENABLED:-1}"
 ICON_SOURCE="${ICON_SOURCE:-${REPO_ROOT}/scripts/assets/app_icon.jpeg}"
 if [[ ! -f "${ICON_SOURCE}" && -f "/Users/junchengzhou/Downloads/images.jpeg" ]]; then
   ICON_SOURCE="/Users/junchengzhou/Downloads/images.jpeg"
@@ -85,6 +100,8 @@ echo "==> Build venv: ${VENV_DIR}"
 echo "==> Work root: ${WORK_ROOT}"
 echo "==> Build tag: ${BUILD_TAG}"
 echo "==> Icon enabled: ${ICON_ENABLED}"
+echo "==> Sign enabled: ${SIGN_ENABLED}"
+echo "==> Notarize enabled: ${NOTARIZE_ENABLED}"
 
 if [[ ! -d "${VENV_DIR}" ]]; then
   echo "==> Creating build venv: ${VENV_DIR}"
@@ -276,13 +293,43 @@ fi
 echo "==> Cleaning AppleDouble metadata in app bundle"
 cleanup_appledouble_tree "${APP_BUNDLE}"
 
-echo "==> Ad-hoc signing app bundle (best-effort)"
-codesign --force --deep --sign - "${APP_BUNDLE}" >/dev/null 2>&1 || true
+if [[ "${SIGN_ENABLED}" != "0" ]]; then
+  echo "==> Signing app bundle with Developer ID: ${DEVELOPER_ID}"
+  codesign --force --deep --options "${CODESIGN_OPTIONS}" --timestamp \
+    --sign "${DEVELOPER_ID}" "${APP_BUNDLE}"
+  echo "==> Verifying codesign"
+  codesign --verify --deep --strict --verbose=2 "${APP_BUNDLE}"
+else
+  echo "==> Ad-hoc signing app bundle (SIGN_ENABLED=0)"
+  codesign --force --deep --sign - "${APP_BUNDLE}" >/dev/null 2>&1 || true
+fi
 
 mkdir -p "${RELEASE_DIR}"
 echo "==> Copying app bundle to release folder"
 rsync -a "${APP_BUNDLE}" "${RELEASE_DIR}/"
 cleanup_appledouble_tree "${RELEASE_DIR}/${APP_NAME}.app"
+RELEASE_APP="${RELEASE_DIR}/${APP_NAME}.app"
+
+if [[ "${NOTARIZE_ENABLED}" != "0" ]]; then
+  if [[ -z "${NOTARY_PROFILE}" ]]; then
+    echo "NOTARIZE_ENABLED=1 but NOTARY_PROFILE is empty."
+    echo "Create profile first: xcrun notarytool store-credentials <profile> ..."
+    exit 1
+  fi
+  NOTARY_ZIP="${RELEASE_DIR}/${APP_NAME}_notary_${BUILD_TAG}.zip"
+  echo "==> Preparing notarization zip: ${NOTARY_ZIP}"
+  (
+    cd "${RELEASE_DIR}"
+    ditto -c -k --keepParent "${APP_NAME}.app" "$(basename "${NOTARY_ZIP}")"
+  )
+  echo "==> Submitting notarization (profile=${NOTARY_PROFILE})"
+  xcrun notarytool submit "${NOTARY_ZIP}" --keychain-profile "${NOTARY_PROFILE}" --wait
+  if [[ "${STAPLE_ENABLED}" != "0" ]]; then
+    echo "==> Stapling notarization ticket"
+    xcrun stapler staple "${RELEASE_APP}"
+    xcrun stapler validate "${RELEASE_APP}" || true
+  fi
+fi
 
 ZIP_NAME="${APP_NAME}_v${APP_VERSION}_mac_${BUILD_TAG}.zip"
 echo "==> Creating zip: ${ZIP_NAME}"

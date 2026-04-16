@@ -56,7 +56,7 @@
 
 1. 从左右髋角历史估计步频（自相关法）：`estimate_gait_freq_hz(...)`
 2. 按 `AUTO_WINDOW_CYCLES / gait_freq_hz` 得到目标窗口
-3. 限制在 `[AUTO_WINDOW_MIN_S, AUTO_WINDOW_MAX_S]`（默认 4~12s）
+3. 限制在 `[AUTO_WINDOW_MIN_S, AUTO_WINDOW_MAX_S]`（当前默认锁定 8~8s）
 4. 若步频不可用，回退到 `AUTO_WINDOW_FALLBACK_S`（默认 8s）
 
 优点：
@@ -76,6 +76,14 @@
 只有该侧 `motion_valid == True` 才允许改该侧 `delay`。  
 评估统一使用 `scale = 1.0`（ratio / 候选排序对 `runtime_scale` 不变），回传给 GUI 的 `pos_per_s / neg_per_s` 再乘 `runtime_scale` 保留真实功率语义。  
 这可避免静止、摆腿幅度过小、信号噪声主导、以及 GUI 调小 scale 导致 `abs_power_per_s` 永远不过阈值的错误门控。
+
+速度源（用于功率/门控评估）支持硬开关（不走 GUI）：
+
+- `AUTO_PWR_USE_ANGLE_DIFF_VEL = True`（默认）：用 `d(hip_angle)/dt`（deg/s）
+- `False`：回退用 IMU 原始角速度 `LTAVx/RTAVx`
+
+`d(angle)/dt` 实现为左右腿独立前值状态，并带回绕保护（`AUTO_PWR_ANGLE_WRAP_DEG`，默认 ±180°），用于避免角度跨界导致的差分尖峰。  
+该速度源仅用于 auto-delay 的 `hist_vel`（功率评估与 motion-valid gate）；NN 推理输入速度链路不变。
 
 ---
 
@@ -98,11 +106,11 @@
    - 在该集合内最大化 `pos_per_s`
    - 若无人满足 0.95，则回退到全局最大 `ratio`
 5. 为防抖与突变：
-   - 每次实际改变量限制为 `<= 20ms`
+   - 每次实际改变量限制为 `<= 40ms`
    - 变化后重置本侧 dwell 计时（`auto_last_change_ts_L/R` 各自维护）
 
 Dwell 策略由 `AUTO_DWELL_ADAPTIVE` 开关控制（默认 `False`）：
-- `False`：固定 `AUTO_DWELL_S`（默认 3.0s）
+- `False`：固定 `AUTO_DWELL_S`（当前默认 0.5s）
 - `True`：`max(AUTO_DWELL_S, auto_window_s + 1.0)`，等窗口 100% 由新 cfg 下的数据填满
 
 冷启动：在 cfg 把 `auto_delay_enable` 由 False→True 上升沿时，`auto_last_change_ts_L/R` 被重置为当前时间，首轮扫描需等满 dwell；同时 `hist_tau_src/vel/ang` 三条历史缓冲被清空，避免评估窗口混入切换前的旧 scale / delay / filter 数据。
@@ -171,21 +179,21 @@ GUI RL 面板增加：
 
 - `AUTO_TARGET_RATIO = 0.95`
 - `AUTO_UPDATE_INTERVAL_S = 1.0`
-- `AUTO_DWELL_S = 2.0`
+- `AUTO_DWELL_S = 0.5`
 - `AUTO_SCAN_HALF_RANGE_MS = 100.0`
 - `AUTO_SCAN_STEP_MS = 10.0`
-- `AUTO_MAX_STEP_MS = 20.0`
-- 窗口：`4~12s`（fallback 8s）
+- `AUTO_MAX_STEP_MS = 40.0`
+- 窗口：`8~8s`（fixed 8s）
 
-如需更稳：
+如需更稳（精度优先）：
 
-- 增大 `AUTO_DWELL_S`（例如 3~4s）
-- 增大窗口下限（例如 5~6s）
+- 适当增大 `AUTO_DWELL_S`（例如 0.8~1.5s）
+- 保持窗口较长（例如 fixed 8s）
 
-如需更快：
+如需更快（响应优先）：
 
-- 缩小 dwell 或缩小窗口上限
-- 但会增加误调概率
+- 缩小 dwell（例如 0.1~0.3s）
+- 但会增加误调概率（尤其短窗口 + 短 dwell 组合）
 
 ---
 
