@@ -10,6 +10,11 @@ build/
 .env
 *.log
 
+# PyInstaller build artifacts (scripts/build_win.ps1, scripts/build_mac.sh)
+.venv-build-*/
+release/
+*.spec
+
 # macOS
 .DS_Store
 ._*

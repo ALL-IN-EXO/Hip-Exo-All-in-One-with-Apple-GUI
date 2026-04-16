@@ -3,6 +3,20 @@
 All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **PyInstaller 打包脚本**（`scripts/build_win.ps1`, `scripts/build_mac.sh`）:
+  - Windows PowerShell 脚本产出 `.exe` 目录 + `.zip`，保存到 `GUI_RL_update/release/windows/<时间戳_gitsha>/`
+  - macOS Bash 脚本产出 `.app` bundle + `.zip`（用 `ditto` 保留 bundle symlink），保存到 `GUI_RL_update/release/macos/<时间戳_gitsha>/`
+  - 两份脚本默认入口 `GUI_RL_update/GUI.py`，可通过 `-Entry/-AppName/-SourceDir`（Win）或 `--entry/--name/--source`（Mac）覆盖
+  - 依赖自动装入独立 venv（`.venv-build-win/`, `.venv-build-mac/`）：`pyqt5 pyqtgraph pyserial numpy pyinstaller`
+  - 提供 `FullBuild`/`--full` 模式（`--collect-all PyQt5 pyqtgraph`）和默认 SLIM 模式（针对 pyqtgraph 保留 QtSvg/QtPrintSupport/QtOpenGL 等常用依赖，仅排除 Qt3D/QtWebEngine/QtQml 等明显无关模块）
+- `.gitignore` 新增 PyInstaller 产物忽略规则：`.venv-build-*/`、`release/`、`*.spec`
+
+---
+
 ## [v3.3] - 2026-04-15
 
 ### Added
