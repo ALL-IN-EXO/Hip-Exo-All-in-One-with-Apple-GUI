@@ -562,7 +562,12 @@ class MainWindow(QWidget):
         # Data buffers
         self.win_size = 200
         self._init_buffers()
-        self._update_counter = 0
+        # Render scheduling: keep data ingest independent from plot repaint.
+        self._render_dirty = False
+        self._last_render_ts = 0.0
+        self._render_fps_normal = 24.0
+        self._render_fps_eco = 16.0
+        self._last_render_values = None
         self._prev_L_angle = 0.0
         self._prev_R_angle = 0.0
         self._prev_wall_time = 0.0
@@ -595,6 +600,16 @@ class MainWindow(QWidget):
         self._pwr_glitch_count_R = 0
         self._rl_cfg_tx_seq = 0
         self._rl_last_tx_ts = 0.0
+        self._rl_status_ui_last_ts = 0.0
+        self._rl_status_ui_min_interval_s = 0.25  # ~4 Hz
+        self._replay_status_last_ts = 0.0
+        self._replay_status_min_interval_s = 0.12  # ~8 Hz
+        self._replay_budget_ms = 5.0
+        self._power_overlay_min_interval_s = 0.25  # ~4 Hz
+        self._power_overlay_left_sig = None
+        self._power_overlay_right_sig = None
+        self._power_overlay_left_last_ts = 0.0
+        self._power_overlay_right_last_ts = 0.0
 
         # RPi status (received via BLE uplink passthrough)
         self._rpi_nn_type = -1          # -1=unknown, 0=dnn, 1=lstm, 2=lstm_leg_dcp, 3=lstm_pd
@@ -643,6 +658,7 @@ class MainWindow(QWidget):
         self._last_rx_time = 0.0
         self._conn_healthy = False
         self._imu34_counter = 0
+        self._imu_ok_state_cache = [None] * 6
         self._rx_buf = bytearray()
         self._last_port_scan = 0.0
 
@@ -1660,7 +1676,7 @@ class MainWindow(QWidget):
         self.lbl_rpi_current_filter.setText("RPi Active: no connection")
         if hasattr(self, "lbl_rl_auto_state"):
             self.lbl_rl_auto_state.setText("Auto Delay: no connection")
-        self._update_power_strip_titles()
+        self._update_power_strip_titles(force=True)
 
     def _update_rl_filter_state_label(self):
         if not hasattr(self, "lbl_rl_filter_state"):
@@ -1779,6 +1795,14 @@ class MainWindow(QWidget):
                         f"L:{self._rpi_delay_ms_L/10:.1f}idx  R:{self._rpi_delay_ms_R/10:.1f}idx")
 
         self._update_power_strip_titles()
+
+    def _maybe_update_rl_filter_state_label(self, now=None, force=False):
+        if now is None:
+            now = time.time()
+        if (not force) and (now - self._rl_status_ui_last_ts) < self._rl_status_ui_min_interval_s:
+            return
+        self._update_rl_filter_state_label()
+        self._rl_status_ui_last_ts = now
 
     # ================================================================ Test waveform
     def _on_test_waveform_changed(self, index):
@@ -1953,6 +1977,9 @@ class MainWindow(QWidget):
         self._pwr_vel_good_R = 0.0
         self._pwr_glitch_count_L = 0
         self._pwr_glitch_count_R = 0
+        self._render_dirty = True
+        self._last_render_values = None
+        self._last_render_ts = 0.0
 
     def _sanitize_power_velocity(self, vel_raw: float, prev_good: float):
         """Display-only velocity guard for power calculation."""
@@ -2021,38 +2048,81 @@ class MainWindow(QWidget):
                 self._csv_file.flush()
                 self._csv_last_flush = now_wall
 
-        self._update_counter += 1
-        eco = self.sw_eco.isChecked()
-
-        if not eco or self._update_counter % 2 == 0:
-            tl = list(self.t_buffer)
-            self.L_angle_line.setData(tl, list(self.R_IMU_buf))
-            self.L_tau_line.setData(tl, list(self.R_tau_buf))
-            self.L_tau_d_line.setData(tl, list(self.R_tau_d_buf))
-            self.L_vel_line.setData(tl, list(self.R_vel_buf))
-            self.L_pwr_line.setData(tl, list(self.R_pwr_buf))
-            self.R_angle_line.setData(tl, list(self.L_IMU_buf))
-            self.R_tau_line.setData(tl, list(self.L_tau_buf))
-            self.R_tau_d_line.setData(tl, list(self.L_tau_d_buf))
-            self.R_vel_line.setData(tl, list(self.L_vel_buf))
-            self.R_pwr_line.setData(tl, list(self.L_pwr_buf))
-            self._update_power_strip(tl, list(self.R_pwr_buf), 'right')
-            self._update_power_strip(tl, list(self.L_pwr_buf), 'left')
-
-            if self.sw_auto_scroll.isChecked() and len(tl) > 1:
-                for pw in [self.plot_left, self.plot_right]:
-                    pw.getViewBox().setXRange(tl[0], tl[-1], padding=0.02)
-
-        if not eco or self._update_counter % 3 == 0:
-            self.lbl_Lang.setText(f"L: {float(L_angle):.1f} deg")
-            self.lbl_Rang.setText(f"R: {float(R_angle):.1f} deg")
-            self.lbl_Lcmd.setText(f"L cmd: {float(L_tau_d):.1f} Nm")
-            self.lbl_Rcmd.setText(f"R cmd: {float(R_tau_d):.1f} Nm")
-            self.lbl_Ltau.setText(f"L est: {float(L_tau):.1f} Nm")
-            self.lbl_Rtau.setText(f"R est: {float(R_tau):.1f} Nm")
-            self.lbl_Lpwr.setText(f"L pwr: {L_pwr:.2f} W")
-            self.lbl_Rpwr.setText(f"R pwr: {R_pwr:.2f} W")
+        self._last_render_values = (
+            float(L_angle), float(R_angle),
+            float(L_tau_d), float(R_tau_d),
+            float(L_tau), float(R_tau),
+            float(L_pwr), float(R_pwr),
+        )
+        self._render_dirty = True
         return L_pwr, R_pwr
+
+    def _render_interval_s(self):
+        if hasattr(self, 'sw_eco') and self.sw_eco.isChecked():
+            return 1.0 / max(1.0, float(self._render_fps_eco))
+        return 1.0 / max(1.0, float(self._render_fps_normal))
+
+    def _maybe_render_plot(self, now=None, force=False):
+        if now is None:
+            now = time.time()
+        if not force and not self._render_dirty:
+            return
+        if (not force) and (now - self._last_render_ts) < self._render_interval_s():
+            return
+        self._render_plot_frame(now)
+
+    def _render_plot_frame(self, now=None):
+        if now is None:
+            now = time.time()
+        tl = list(self.t_buffer)
+        if not tl:
+            return
+
+        # Materialize once per frame to avoid repeated deque->list conversions.
+        R_IMU = list(self.R_IMU_buf)
+        R_tau = list(self.R_tau_buf)
+        R_tau_d = list(self.R_tau_d_buf)
+        R_vel = list(self.R_vel_buf)
+        R_pwr = list(self.R_pwr_buf)
+        L_IMU = list(self.L_IMU_buf)
+        L_tau = list(self.L_tau_buf)
+        L_tau_d = list(self.L_tau_d_buf)
+        L_vel = list(self.L_vel_buf)
+        L_pwr = list(self.L_pwr_buf)
+
+        self.L_angle_line.setData(tl, R_IMU)
+        self.L_tau_line.setData(tl, R_tau)
+        self.L_tau_d_line.setData(tl, R_tau_d)
+        self.L_vel_line.setData(tl, R_vel)
+        self.L_pwr_line.setData(tl, R_pwr)
+        self.R_angle_line.setData(tl, L_IMU)
+        self.R_tau_line.setData(tl, L_tau)
+        self.R_tau_d_line.setData(tl, L_tau_d)
+        self.R_vel_line.setData(tl, L_vel)
+        self.R_pwr_line.setData(tl, L_pwr)
+        self._update_power_strip(tl, R_pwr, 'right')
+        self._update_power_strip(tl, L_pwr, 'left')
+
+        if self.sw_auto_scroll.isChecked() and len(tl) > 1:
+            x0 = tl[0]
+            x1 = tl[-1]
+            self.plot_left.getViewBox().setXRange(x0, x1, padding=0.02)
+            self.plot_right.getViewBox().setXRange(x0, x1, padding=0.02)
+
+        if self._last_render_values is not None:
+            (L_angle, R_angle, L_tau_d, R_tau_d,
+             L_tau, R_tau, L_pwr_now, R_pwr_now) = self._last_render_values
+            self.lbl_Lang.setText(f"L: {L_angle:.1f} deg")
+            self.lbl_Rang.setText(f"R: {R_angle:.1f} deg")
+            self.lbl_Lcmd.setText(f"L cmd: {L_tau_d:.1f} Nm")
+            self.lbl_Rcmd.setText(f"R cmd: {R_tau_d:.1f} Nm")
+            self.lbl_Ltau.setText(f"L est: {L_tau:.1f} Nm")
+            self.lbl_Rtau.setText(f"R est: {R_tau:.1f} Nm")
+            self.lbl_Lpwr.setText(f"L pwr: {L_pwr_now:.2f} W")
+            self.lbl_Rpwr.setText(f"R pwr: {R_pwr_now:.2f} W")
+
+        self._render_dirty = False
+        self._last_render_ts = now
 
     def _on_win_size_changed(self, val):
         self.win_size = val
@@ -2061,6 +2131,7 @@ class MainWindow(QWidget):
                      'L_pwr_buf', 'R_pwr_buf']:
             old = getattr(self, attr)
             setattr(self, attr, deque(old, maxlen=val))
+        self._render_dirty = True
 
     # ================================================================ Theme
     def _on_theme_toggled(self, checked):
@@ -2074,6 +2145,8 @@ class MainWindow(QWidget):
 
         qss = _build_qss(C)
         self.setStyleSheet(qss)
+        # Force one-pass style refresh for IMU badges after theme swap.
+        self._imu_ok_state_cache = [None] * 6
 
         # Update cards
         for card in self._cards:
@@ -2120,7 +2193,7 @@ class MainWindow(QWidget):
             strip.getAxis('left').setTextPen(C.text2)
             strip.getAxis('bottom').setPen(C.plot_fg)
             strip.getAxis('bottom').setTextPen(C.plot_fg)
-        self._update_power_strip_titles()
+        self._update_power_strip_titles(force=True)
         self.pwr_strip_right_zero.setPen(pg.mkPen(C.separator, width=1.2))
         self.pwr_strip_left_zero.setPen(pg.mkPen(C.separator, width=1.2))
         self.pwr_strip_right_pos.setPen(pg.mkPen(C.green, width=1.2))
@@ -2571,6 +2644,12 @@ class MainWindow(QWidget):
             self.btn_replay_pause.blockSignals(False)
             self.btn_replay_pause.setText("Pause")
 
+    def _set_replay_status(self, text, force=False):
+        now = time.time()
+        if force or (now - self._replay_status_last_ts) >= self._replay_status_min_interval_s:
+            self.lbl_status.setText(str(text))
+            self._replay_status_last_ts = now
+
     def _row_float(self, row, keys, default=0.0, allow_none=False):
         for key in keys:
             if key not in row:
@@ -2644,7 +2723,7 @@ class MainWindow(QWidget):
         self._replay_idx = 0
         self._replay_play_t = 0.0
         self._replay_last_wall_time = time.time()
-        self._update_counter = 0
+        self._replay_status_last_ts = 0.0
         self._clear_buffers()
         self._set_replay_controls_active(True)
         self.btn_replay_pause.blockSignals(True)
@@ -2653,9 +2732,12 @@ class MainWindow(QWidget):
         self.btn_replay_pause.setText("Pause")
         self.lbl_imu.setText("IMU: REPLAY")
         self.lbl_maxt.setText("MaxT: REPLAY")
-        self.lbl_status.setText(
-            f"Replay loaded: {os.path.basename(csv_path)} ({len(samples)} rows)")
-        self._consume_replay_samples(max_steps=1)
+        self._set_replay_status(
+            f"Replay loaded: {os.path.basename(csv_path)} ({len(samples)} rows)",
+            force=True,
+        )
+        self._consume_replay_samples(max_steps=1, budget_ms=1.0)
+        self._maybe_render_plot(force=True)
 
     def _stop_replay(self, finished=False):
         had_path = bool(self._replay_csv_path)
@@ -2704,8 +2786,10 @@ class MainWindow(QWidget):
         self.btn_replay_pause.setText("Resume" if self._replay_paused else "Pause")
         self._replay_last_wall_time = time.time()
         if self._replay_paused:
-            self.lbl_status.setText(
-                f"Replay paused: {self._replay_idx}/{len(self._replay_samples)}")
+            self._set_replay_status(
+                f"Replay paused: {self._replay_idx}/{len(self._replay_samples)}",
+                force=True,
+            )
 
     def _on_replay_speed_changed(self, _index):
         text = self.cmb_replay_speed.currentText().strip().lower().replace('x', '')
@@ -2727,12 +2811,14 @@ class MainWindow(QWidget):
         target_idx = bisect.bisect_right(self._replay_time_axis, self._replay_play_t) - 1
 
         self._clear_buffers()
-        self._update_counter = 0
         if target_idx < 0:
             self._replay_idx = 0
             self._replay_last_wall_time = time.time()
-            self.lbl_status.setText(
-                f"Replay seek to t={self._replay_play_t:.2f}s ({self._replay_speed:.1f}x)")
+            self._set_replay_status(
+                f"Replay seek to t={self._replay_play_t:.2f}s ({self._replay_speed:.1f}x)",
+                force=True,
+            )
+            self._maybe_render_plot(force=True)
             return
 
         start_idx = max(0, target_idx - self.win_size + 1)
@@ -2740,6 +2826,11 @@ class MainWindow(QWidget):
             self._apply_replay_sample(self._replay_samples[i], i, total)
         self._replay_idx = target_idx + 1
         self._replay_last_wall_time = time.time()
+        self._set_replay_status(
+            f"Replay seek to t={self._replay_play_t:.2f}s ({self._replay_speed:.1f}x)",
+            force=True,
+        )
+        self._maybe_render_plot(force=True)
 
     def _on_replay_rewind(self):
         if not self._replay_mode or not self._replay_samples:
@@ -2747,39 +2838,61 @@ class MainWindow(QWidget):
         target = max(0.0, self._replay_play_t - 5.0)
         self._seek_replay_time(target)
         if self._replay_mode:
-            self.lbl_status.setText(
+            self._set_replay_status(
                 f"Replay rewind to t={self._replay_play_t:.2f}s "
-                f"({self._replay_speed:.1f}x)")
+                f"({self._replay_speed:.1f}x)",
+                force=True,
+            )
 
     def _on_replay_fast_forward(self):
         if not self._replay_mode or not self._replay_samples:
             return
         self._replay_play_t = min(self._replay_samples[-1][0], self._replay_play_t + 5.0)
-        self._consume_replay_samples()
+        self._consume_replay_samples(budget_ms=8.0)
+        self._maybe_render_plot(force=True)
         if self._replay_mode:
-            self.lbl_status.setText(
+            self._set_replay_status(
                 f"Replay fast-forward to t={self._replay_play_t:.2f}s "
-                f"({self._replay_speed:.1f}x)")
+                f"({self._replay_speed:.1f}x)",
+                force=True,
+            )
 
     def _on_replay_stop_clicked(self):
         if not self._replay_mode:
             return
         self._stop_replay(finished=False)
 
-    def _consume_replay_samples(self, max_steps=3000):
+    def _consume_replay_samples(self, max_steps=None, budget_ms=None):
         if not self._replay_mode or not self._replay_samples:
-            return
+            return 0, -1, 0.0, 0
+        if budget_ms is None:
+            budget_ms = self._replay_budget_ms
+        budget_s = max(0.0005, float(budget_ms) * 1e-3)
         total = len(self._replay_samples)
         steps = 0
+        last_idx = -1
+        last_t = 0.0
+        t_start = time.perf_counter()
         while self._replay_idx < total and self._replay_samples[self._replay_idx][0] <= self._replay_play_t:
             sample = self._replay_samples[self._replay_idx]
             self._apply_replay_sample(sample, self._replay_idx, total)
+            last_idx = self._replay_idx
+            last_t = float(sample[0])
             self._replay_idx += 1
             steps += 1
-            if steps >= max_steps:
+            if max_steps is not None and steps >= int(max_steps):
                 break
+            if (time.perf_counter() - t_start) >= budget_s:
+                break
+
+        if steps > 0 and last_idx >= 0:
+            self._set_replay_status(
+                f"Replay {last_idx + 1}/{total}  t={last_t:.2f}s  speed={self._replay_speed:.1f}x",
+                force=False,
+            )
         if self._replay_idx >= total:
             self._stop_replay(finished=True)
+        return steps, last_idx, last_t, total
 
     def _update_replay(self, now):
         if not self._replay_mode:
@@ -2800,8 +2913,9 @@ class MainWindow(QWidget):
             dt = 0.02
         self._replay_play_t += dt * self._replay_speed
         self._consume_replay_samples()
+        self._maybe_render_plot(now)
 
-    def _apply_replay_sample(self, sample, idx, total):
+    def _apply_replay_sample(self, sample, _idx, _total):
         (t, L_angle, R_angle, L_tau, R_tau, L_tau_d, R_tau_d,
          L_vel, R_vel, L_pwr_csv, R_pwr_csv, gait_freq) = sample
         L_pwr = L_pwr_csv if isfinite(L_pwr_csv) else (L_vel * L_tau_d * (pi / 180.0))
@@ -2810,8 +2924,6 @@ class MainWindow(QWidget):
         self._append_data_point(
             t, L_angle, R_angle, L_tau, R_tau, L_tau_d, R_tau_d, L_vel, R_vel,
             gait_freq, log_csv=False, power_override=(L_pwr, R_pwr))
-        self.lbl_status.setText(
-            f"Replay {idx + 1}/{total}  t={t:.2f}s  speed={self._replay_speed:.1f}x")
 
     # ================================================================ Plots
     def _build_plots(self):
@@ -3011,7 +3123,28 @@ class MainWindow(QWidget):
         self.pwr_strip_left.addItem(self.pwr_strip_left_overlay)
         self.pwr_strip_left.setYRange(-5.0, 5.0, padding=0.02)
         self.plot_layout.addWidget(self.pwr_strip_left, 0)
-        self._update_power_strip_titles()
+        self._update_power_strip_titles(force=True)
+        self._configure_plot_items_performance()
+
+    def _configure_plot_items_performance(self):
+        """Low-risk pyqtgraph perf tuning for long-running sessions."""
+        plot_items = [
+            self.L_angle_line, self.L_tau_d_line, self.L_tau_line, self.L_vel_line, self.L_pwr_line,
+            self.R_angle_line, self.R_tau_d_line, self.R_tau_line, self.R_vel_line, self.R_pwr_line,
+            self.pwr_strip_right_zero, self.pwr_strip_right_pos, self.pwr_strip_right_neg,
+            self.pwr_strip_left_zero, self.pwr_strip_left_pos, self.pwr_strip_left_neg,
+        ]
+        for item in plot_items:
+            if item is None:
+                continue
+            try:
+                item.setClipToView(True)
+            except Exception:
+                pass
+            try:
+                item.setDownsampling(auto=True, method='peak')
+            except Exception:
+                pass
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Wheel and isinstance(obj, (QDoubleSpinBox, QSpinBox)):
@@ -3077,7 +3210,7 @@ class MainWindow(QWidget):
         strip.setYRange(-smoothed, smoothed, padding=0.02)
         self._position_power_ratio_overlay(strip, overlay)
 
-    def _update_power_strip_titles(self):
+    def _update_power_strip_titles(self, force=False):
         """Keep strip titles static, and show per-leg ratio/power via in-plot overlay."""
         if not hasattr(self, 'pwr_strip_right') or not hasattr(self, 'pwr_strip_left'):
             return
@@ -3110,20 +3243,52 @@ class MainWindow(QWidget):
             self._rpi_auto_motion_valid_R, valid,
         )
 
-        overlay_tmpl = (
-            f"<div style='color:{{col}}; font-size:13pt; font-weight:600; "
-            f"background:rgba(0,0,0,0); text-align:right;'>"
-            f"{{l1}}<br/>{{l2}}</div>"
+        self._set_power_overlay_html(
+            side='left',
+            strip=getattr(self, 'pwr_strip_left', None),
+            overlay=getattr(self, 'pwr_strip_left_overlay', None),
+            line1=l1_L,
+            line2=l2_L,
+            force=force,
         )
-        html_L = overlay_tmpl.format(col=C.purple, l1=l1_L, l2=l2_L)
-        html_R = overlay_tmpl.format(col=C.purple, l1=l1_R, l2=l2_R)
+        self._set_power_overlay_html(
+            side='right',
+            strip=getattr(self, 'pwr_strip_right', None),
+            overlay=getattr(self, 'pwr_strip_right_overlay', None),
+            line1=l1_R,
+            line2=l2_R,
+            force=force,
+        )
 
-        if hasattr(self, 'pwr_strip_left_overlay'):
-            self.pwr_strip_left_overlay.setHtml(html_L)
-            self._position_power_ratio_overlay(self.pwr_strip_left, self.pwr_strip_left_overlay)
-        if hasattr(self, 'pwr_strip_right_overlay'):
-            self.pwr_strip_right_overlay.setHtml(html_R)
-            self._position_power_ratio_overlay(self.pwr_strip_right, self.pwr_strip_right_overlay)
+    def _set_power_overlay_html(self, side, strip, overlay, line1, line2, force=False):
+        if overlay is None or strip is None:
+            return
+        now = time.time()
+        sig = (str(line1), str(line2), C.purple)
+        if side == 'left':
+            prev_sig = self._power_overlay_left_sig
+            prev_ts = self._power_overlay_left_last_ts
+        else:
+            prev_sig = self._power_overlay_right_sig
+            prev_ts = self._power_overlay_right_last_ts
+        changed = (sig != prev_sig)
+        if (not force) and (not changed):
+            return
+        if (not force) and (now - prev_ts) < self._power_overlay_min_interval_s:
+            return
+
+        overlay_html = (
+            f"<div style='color:{C.purple}; font-size:13pt; font-weight:600; "
+            f"background:rgba(0,0,0,0); text-align:right;'>{line1}<br/>{line2}</div>"
+        )
+        overlay.setHtml(overlay_html)
+        self._position_power_ratio_overlay(strip, overlay)
+        if side == 'left':
+            self._power_overlay_left_sig = sig
+            self._power_overlay_left_last_ts = now
+        else:
+            self._power_overlay_right_sig = sig
+            self._power_overlay_right_last_ts = now
 
     def _position_power_ratio_overlay(self, strip, overlay_item):
         if overlay_item is None or strip is None:
@@ -3366,6 +3531,7 @@ class MainWindow(QWidget):
             self._rpi_status_valid = False
             self._update_rpi_offline_ui()
         self._read_serial()
+        self._maybe_render_plot(now)
 
     # ================================================================ RX
     def _read_serial(self):
@@ -3591,11 +3757,13 @@ class MainWindow(QWidget):
             self._rpi_last_rx_time = time.time()
             self._rpi_online = True
             prev_nn = getattr(self, '_prev_rpi_nn_type', -1)
+            force_rl_status_refresh = False
             if not self._rpi_status_valid or rpi_blob[3] != prev_nn:
                 self._rpi_status_valid = True
                 self._prev_rpi_nn_type = rpi_blob[3]
                 self._update_rl_panel_for_nn_type()
-            self._update_rl_filter_state_label()
+                force_rl_status_refresh = True
+            self._maybe_update_rl_filter_state_label(now=now, force=force_rl_status_refresh)
 
         # === Update UI ===
         self.lbl_imu.setText(f"IMU: {'OK' if imu_ok_flag else 'FAIL'}")
@@ -3617,15 +3785,24 @@ class MainWindow(QWidget):
 
         for i in range(6):
             ok = (imu_bits >> i) & 0x01
+            ok_bool = bool(ok)
+            if self._imu_ok_state_cache[i] != ok_bool:
+                if ok_bool:
+                    self.lbl_imus[i].setStyleSheet(
+                        f"color:{C.green}; font-weight:600; font-size:11px; background:transparent;")
+                else:
+                    self.lbl_imus[i].setStyleSheet(
+                        f"color:{C.red}; font-weight:500; font-size:11px; background:transparent;")
+                self._imu_ok_state_cache[i] = ok_bool
             if ok:
-                self.lbl_imus[i].setStyleSheet(
-                    f"color:{C.green}; font-weight:600; font-size:11px; background:transparent;")
                 if i < 2 or update_34:
-                    self.lbl_imus[i].setText(f"{labels[i]}:{imu_angles[i]:.1f}")
+                    txt = f"{labels[i]}:{imu_angles[i]:.1f}"
+                    if self.lbl_imus[i].text() != txt:
+                        self.lbl_imus[i].setText(txt)
             else:
-                self.lbl_imus[i].setStyleSheet(
-                    f"color:{C.red}; font-weight:500; font-size:11px; background:transparent;")
-                self.lbl_imus[i].setText(f"{labels[i]}:-")
+                txt = f"{labels[i]}:-"
+                if self.lbl_imus[i].text() != txt:
+                    self.lbl_imus[i].setText(txt)
 
         # Brand badge
         brand_names = {0: "-", 1: "SIG", 2: "TMOTOR"}
@@ -3665,7 +3842,8 @@ class MainWindow(QWidget):
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle('Fusion')  # Cross-platform clean base
-    pg.setConfigOptions(antialias=True)
+    # Antialiasing is expensive for continuously updated curves.
+    pg.setConfigOptions(antialias=False)
     w = MainWindow()
     w.show()
     sys.exit(app.exec_())

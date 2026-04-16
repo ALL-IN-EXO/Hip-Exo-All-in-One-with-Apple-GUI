@@ -34,6 +34,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - 现有安全壳不变：`motion_valid`、`dwell`、`AUTO_MAX_STEP_MS`、delay bounds 全部保留
   - GUI RL 面板新增 `Auto Method` 下拉（`Grid (Legacy)` / `Bayes (BO)`），通过 `rpi_passthru[20]` bit3 下发
   - RPi 上行状态 `auto_flags` bit3 回传当前方法，GUI 状态行显示 `Auto=ON/OFF + Method`
+- **GUI 性能优化（实时与 Replay）**（`GUI_RL_update/GUI.py`）：
+  - 绘图刷新与数据接收解耦：接收路径仅入缓冲，绘图按固定帧率刷新（Normal 24 FPS / Eco 16 FPS）
+  - 高频 RX 路径中 `_update_rl_filter_state_label` 限频至约 4Hz，降低文本更新抖动
+  - Power overlay `setHtml(...)` 改为“内容变化 + 限频”更新，减少富文本重绘成本
+  - IMU `setStyleSheet(...)` 改为仅在 OK/FAIL 状态变化时更新
+  - Replay 改为时间预算批处理（默认 5ms/tick）+ 单次重绘；`lbl_status` 限频约 8Hz，缓解回放卡顿
+  - 新增诊断与执行清单文档：`Docs/GUI_PERFORMANCE_TODO.md`
+  - 默认 `Win` 维持为 `200`（可在 GUI 中按需调小），在流畅性与历史可视范围之间保持平衡
+  - 默认渲染帧率微调为 `Normal 24 FPS / Eco 16 FPS`
+  - 曲线启用 `clip-to-view + auto downsampling`，并关闭默认 antialias，减少 pyqtgraph 渲染成本
 
 ---
 
