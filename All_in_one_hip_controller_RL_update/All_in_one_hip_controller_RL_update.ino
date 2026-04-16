@@ -30,6 +30,7 @@
 #include "Controller_Samsung.h"
 #include "Controller_RL.h"
 #include "Controller_Test.h"
+#include "Controller_SOGI.h"
 
 #define GUI_WRITE_ENABLE 1
 
@@ -88,6 +89,7 @@ static Controller_EG      ctrl_eg;
 static Controller_Samsung  ctrl_samsung;
 static Controller_RL       ctrl_rl;
 static Controller_Test     ctrl_test;
+static Controller_SOGI     ctrl_sogi;
 
 Controller* active_ctrl = &ctrl_eg;   // 默认 EG
 uint8_t active_algo_id = ALGO_EG;
@@ -217,6 +219,7 @@ void switch_algorithm(uint8_t new_algo) {
     case ALGO_SAMSUNG: new_ctrl = &ctrl_samsung;  break;
     case ALGO_RL:      new_ctrl = &ctrl_rl;       break;
     case ALGO_TEST:    new_ctrl = &ctrl_test;     break;
+    case ALGO_SOGI:    new_ctrl = &ctrl_sogi;     break;
     default:
       Serial.printf("[ALGO] Unknown algo ID: %d\n", new_algo);
       return;
@@ -442,6 +445,8 @@ void loop() {
       ctrl_samsung.tick_auto_delay(current_time, gait_freq);
     } else if (active_algo_id == ALGO_EG) {
       ctrl_eg.tick_auto_delay(current_time, gait_freq);
+    } else if (active_algo_id == ALGO_SOGI) {
+      ctrl_sogi.tick_auto_delay(current_time, gait_freq);
     }
   }
 

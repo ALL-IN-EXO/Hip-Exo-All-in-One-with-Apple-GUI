@@ -50,7 +50,7 @@
  * 下行 GUI → Teensy (data_rs232_rx[0..124], 去掉3字节帧头)
  * =========================================================
  * payload 索引 (帧头后的偏移):
- * [0]        algo_select   uint8   算法选择: 0=EG, 1=Samsung, 2=RL, 3=Test
+ * [0]        algo_select   uint8   算法选择: 0=EG, 1=Samsung, 2=RL, 3=Test, 4=SOGI
  * [1]        brand_request uint8   电机品牌: 0=不变, 1=SIG, 2=TMOTOR
  * [2]        ctrl_flags    uint8   控制标志
  *              bit0: imu_reinit
@@ -85,6 +85,10 @@
  *     [5..6]   test_torque_Nm ×100    int16  (amplitude)
  *     [7]      test_waveform          uint8  (0=const, 1=sin)
  *     [8..9]   test_freq_hz ×100      int16  (sin 频率)
+ *   SOGI 参数 (algo=4):
+ *     [5..6]   sogi_A_gain ×100       int16  (Nm, 力矩幅值)
+ *     [7..8]   sogi_phi_lead_deg ×100 int16  (相位超前°)
+ *     [9..10]  sogi_amp_min ×10       int16  (deg/s, 幅值看门狗)
  * --- RPi 透传区 [58..97] (40 bytes) ---
  * [58..97]   rpi_passthru  GUI→Teensy→RPi (Serial8 转发)
  * --- 预留 [98..124] ---
@@ -105,6 +109,7 @@ enum AlgoID : uint8_t {
   ALGO_SAMSUNG = 1,
   ALGO_RL      = 2,
   ALGO_TEST    = 3,
+  ALGO_SOGI    = 4,
 };
 
 // ========== 辅助函数 ==========
@@ -239,6 +244,11 @@ struct BleDownlinkData {
   uint8_t test_waveform;    // [7] 0=const, 1=sin
   float test_freq_hz;       // [8..9]
 
+  // SOGI 参数
+  float sogi_A_gain;         // [5..6]   Nm
+  float sogi_phi_lead_deg;   // [7..8]   deg
+  float sogi_amp_min;        // [9..10]  deg/s
+
   // 通用自动延迟控制 (EG/Samsung 适用; RL 用 rpi_passthru 内的位)
   bool    auto_delay_enable;  // payload[28] bit0
   int16_t eg_post_delay_ms;   // payload[29..30], EG 后处理延迟基础值 (ms)
@@ -293,6 +303,12 @@ static inline BleDownlinkData ble_parse_downlink(const uint8_t* payload) {
       d.test_torque_Nm = ble_rd_i16(payload, 5) / 100.0f;
       d.test_waveform  = payload[7];
       d.test_freq_hz   = ble_rd_i16(payload, 8) / 100.0f;
+      break;
+
+    case ALGO_SOGI:
+      d.sogi_A_gain        = ble_rd_i16(payload, 5) / 100.0f;
+      d.sogi_phi_lead_deg  = ble_rd_i16(payload, 7) / 100.0f;
+      d.sogi_amp_min       = ble_rd_i16(payload, 9) / 10.0f;
       break;
   }
 
