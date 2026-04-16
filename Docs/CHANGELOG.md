@@ -7,6 +7,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **SOGI-FLL 相位同步控制器**（`All_in_one_hip_controller_RL_update/`, `GUI_RL_update/GUI.py`）：
+  - Teensy 侧新增 `Controller_SOGI.h/.cpp`，基于 SOGI-FLL 提取左右髋角速度瞬时相位 φ，输出 `τ = A·ramp·gate·sin(φ+lead)` 与 ω 同相助力（算法原理见 `Docs/SOGI-FLL-CONTROLLER.md`）
+  - `BleProtocol.h` 新增 `ALGO_SOGI = 4` 及 3 个可调参数：`sogi_A_gain` (×100, Nm)、`sogi_phi_lead_deg` (×100, °)、`sogi_amp_min` (×10, deg/s)，占用下行 payload `[5..10]`
+  - 其他 SOGI 参数硬编码（f0=1.0 Hz, k=1.41, γ=40, f_min/f_max=0.3/3.5 Hz, ramp=1.5 s），减少调参负担
+  - `.ino` 主循环接入：静态实例 `ctrl_sogi`、`switch_algorithm` 新增 `ALGO_SOGI` 分支；复用现有 IMU 安全门与 dir_bits 镜像逻辑
+  - GUI 侧 `SegmentedControl` 新增 "SOGI" 选项（位于 Test 之前）；参数面板含 A_gain / Phi lead / amp_min 三个 QDoubleSpinBox，`_tx_params` 按协议写入 payload `[5..10]`
+  - SOGI 复用 `AutoDelayOptimizer`（`enabled` 恒 false，不改 delay）以计算 ratio / pos_per_s / neg_per_s，填入 BLE 上行 40B 透传槽，使 GUI 的 `+Ratio` 正功占比指标对 SOGI 生效
 - **PyInstaller 打包脚本**（`scripts/build_win.ps1`, `scripts/build_mac.sh`）:
   - Windows PowerShell 脚本产出 `.exe` 目录 + `.zip`，保存到 `GUI_RL_update/release/windows/<时间戳_gitsha>/`
   - macOS Bash 脚本产出 `.app` bundle + `.zip`（用 `ditto` 保留 bundle symlink），保存到 `GUI_RL_update/release/macos/<时间戳_gitsha>/`

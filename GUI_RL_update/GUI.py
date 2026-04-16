@@ -40,7 +40,12 @@ ALGO_EG      = 0
 ALGO_SAMSUNG = 1
 ALGO_RL      = 2
 ALGO_TEST    = 3
-ALGO_NAMES = {ALGO_EG: "EG", ALGO_SAMSUNG: "Samsung", ALGO_RL: "RL", ALGO_TEST: "Test"}
+ALGO_SOGI    = 4
+ALGO_NAMES = {ALGO_EG: "EG", ALGO_SAMSUNG: "Samsung", ALGO_RL: "RL",
+              ALGO_TEST: "Test", ALGO_SOGI: "SOGI"}
+# UI segment order (SOGI before Test); decoupled from algo ID because SOGI_id=4 > TEST_id=3.
+_SEG_TO_ALGO = [ALGO_EG, ALGO_SAMSUNG, ALGO_RL, ALGO_SOGI, ALGO_TEST]
+_ALGO_TO_SEG = {a: i for i, a in enumerate(_SEG_TO_ALGO)}
 
 # RPi passthrough payload format (40 bytes, packed into BLE payload[58:98])
 RPI_PT_MAGIC0 = 0x52  # 'R'
@@ -839,7 +844,7 @@ class MainWindow(QWidget):
         algo_header.addStretch(1)
         algo_lay.addLayout(algo_header)
 
-        self.seg_algo = SegmentedControl(["EG", "Samsung", "RL", "Test"])
+        self.seg_algo = SegmentedControl(["EG", "Samsung", "RL", "SOGI", "Test"])
         self.seg_algo.currentIndexChanged.connect(self._on_algo_selected)
         self._segmented_ctrls.append(self.seg_algo)
         algo_lay.addWidget(self.seg_algo)
@@ -1136,6 +1141,37 @@ class MainWindow(QWidget):
         )
         rl_lay.addWidget(self.lbl_rl_auto_state, 10, 0, 1, 2)
         self.algo_stack.addWidget(rl_panel)
+
+        # -- SOGI panel (phase-locked sinusoidal assist) --
+        sogi_panel = QWidget()
+        sogi_panel.setStyleSheet("background:transparent;")
+        sogi_grid = QGridLayout(sogi_panel)
+        sogi_grid.setSpacing(4)
+        sogi_a_tip = (
+            "SOGI torque amplitude A_gain (Nm).\n"
+            "Peak of tau = A * sin(phi + lead). Tune per subject."
+        )
+        sogi_lead_tip = (
+            "Phase lead (deg) applied to the SOGI output.\n"
+            "Compensates control-chain delay. Typical range 0~40°."
+        )
+        sogi_ampmin_tip = (
+            "Amplitude watchdog threshold (deg/s).\n"
+            "When instantaneous amp falls below this, torque is gated off (standing/stop)."
+        )
+        self.sb_sogi_A       = make_dspin(5.0, 0.0, 15.0, 0.1, 1, sogi_a_tip)
+        self.sb_sogi_lead    = make_dspin(20.0, -90.0, 90.0, 1.0, 1, sogi_lead_tip)
+        self.sb_sogi_amp_min = make_dspin(20.0, 0.0, 500.0, 1.0, 1, sogi_ampmin_tip)
+        lbl_sogi_A = QLabel("A_gain (Nm)");       lbl_sogi_A.setToolTip(sogi_a_tip)
+        lbl_sogi_lead = QLabel("Phi lead (°)");   lbl_sogi_lead.setToolTip(sogi_lead_tip)
+        lbl_sogi_amp = QLabel("amp_min (deg/s)"); lbl_sogi_amp.setToolTip(sogi_ampmin_tip)
+        sogi_grid.addWidget(lbl_sogi_A,          0, 0)
+        sogi_grid.addWidget(self.sb_sogi_A,      0, 1)
+        sogi_grid.addWidget(lbl_sogi_lead,       1, 0)
+        sogi_grid.addWidget(self.sb_sogi_lead,   1, 1)
+        sogi_grid.addWidget(lbl_sogi_amp,        2, 0)
+        sogi_grid.addWidget(self.sb_sogi_amp_min,2, 1)
+        self.algo_stack.addWidget(sogi_panel)
 
         # -- Test panel (sin wave) --
         test_panel = QWidget()
@@ -1880,7 +1916,10 @@ class MainWindow(QWidget):
 
     # ================================================================ Algorithm
     def _on_algo_selected(self, index):
-        self._algo_pending = index
+        if 0 <= index < len(_SEG_TO_ALGO):
+            self._algo_pending = _SEG_TO_ALGO[index]
+        else:
+            self._algo_pending = ALGO_EG
         self.algo_stack.setCurrentIndex(index)
         self._update_rl_filter_state_label()
 
@@ -3691,6 +3730,10 @@ class MainWindow(QWidget):
             put_s16(5, float(self.sb_test_amplitude.value()))
             payload[7] = self.cmb_test_waveform.currentIndex() & 0xFF
             put_s16(8, float(self.sb_test_freq.value()))
+        elif algo == ALGO_SOGI:
+            put_s16(5, float(self.sb_sogi_A.value()))
+            put_s16(7, float(self.sb_sogi_lead.value()))
+            put_s16(9, float(self.sb_sogi_amp_min.value()), 10)
 
         header = struct.pack('<BBB', 0xA5, 0x5A, BLE_FRAME_LEN)
         self.ser.write(header + payload)
