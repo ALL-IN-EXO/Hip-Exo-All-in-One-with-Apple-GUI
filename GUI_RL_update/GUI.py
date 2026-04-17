@@ -260,6 +260,14 @@ QScrollBar::handle:vertical {{
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
     height: 0;
 }}
+QToolTip {{
+    color: #f5f5f7;
+    background-color: rgba(28, 28, 30, 245);
+    border: 1px solid #8e8e93;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 12px;
+}}
 """
 
 
@@ -1280,6 +1288,24 @@ class MainWindow(QWidget):
             chk_refs.append(chk)
         self.chk_plot_angle, self.chk_plot_cmd, self.chk_plot_est, self.chk_plot_vel, self.chk_plot_pwr = chk_refs
 
+        raw_data_note_tip = (
+            "显示数据来源说明（当前 GUI 曲线）:\n"
+            "1) Angle 曲线: 来自 Teensy BLE 上行 payload[5..8]，即 imu.LTx / imu.RTx。\n"
+            "   imu.LTx/RTx = IMU Euler-X(AngleXLeft/Right) - 零偏(offL/offR)。\n"
+            "2) Vel 曲线: 优先来自 payload[40..43]，即 imu.LTAVx / imu.RTAVx（deg/s）。\n"
+            "3) 若 payload[40..51] 全 0，GUI 才回退到 d(angle)/dt 差分速度。\n"
+            "4) GUI 不对 Angle/Vel 做 LPF/IIR/Butterworth 滤波。\n"
+            "5) Power 的速度去毛刺只影响 Pwr 显示，不影响 Angle/Vel 曲线。\n"
+            "6) 这里“原始数据”指 IMU 模块输出值（可包含模块自身配置滤波），\n"
+            "   不是 Teensy 的 LTx_filtered/RTx_filtered 控制链路。"
+        )
+        self.note_raw_data = QFrame()
+        self.note_raw_data.setFixedSize(16, 16)
+        self.note_raw_data.setToolTip(raw_data_note_tip)
+        self.note_raw_data.setStyleSheet(
+            f"background:{C.fill}; border:1px solid {C.teal}; border-radius:4px;")
+        row1.addWidget(self.note_raw_data)
+
         vsep1 = QFrame(); vsep1.setFrameShape(QFrame.VLine)
         vsep1.setStyleSheet(f"background-color:{C.separator}; max-width:1px; border:none;")
         vsep1.setFixedHeight(20)
@@ -2248,6 +2274,15 @@ class MainWindow(QWidget):
         C = AppleColors.Dark if self._dark_mode else AppleColors.Light
 
         qss = _build_qss(C)
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(qss)
+            # Keep tooltip rendering consistent across platforms/theme toggles.
+            tip_pal = QPalette(QToolTip.palette())
+            tip_pal.setColor(QPalette.ToolTipBase, QColor(28, 28, 30, 245))
+            tip_pal.setColor(QPalette.ToolTipText, QColor("#f5f5f7"))
+            QToolTip.setPalette(tip_pal)
+            QToolTip.setFont(QFont("-apple-system", 12))
         self.setStyleSheet(qss)
         # Force one-pass style refresh for IMU badges after theme swap.
         self._imu_ok_state_cache = [None] * 6
@@ -2387,6 +2422,9 @@ class MainWindow(QWidget):
                 background-color: {C.separator};
             }}
         """)
+        if hasattr(self, "note_raw_data"):
+            self.note_raw_data.setStyleSheet(
+                f"background:{C.fill}; border:1px solid {C.teal}; border-radius:4px;")
         if hasattr(self, "lbl_rl_filter_state"):
             self.lbl_rl_filter_state.setStyleSheet(
                 f"color:{C.text2}; font-size:11px; background:transparent; padding-top:2px;"
