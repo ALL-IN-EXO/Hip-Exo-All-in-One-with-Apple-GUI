@@ -24,6 +24,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **GUI tooltip 风格统一（全局单一样式）**（`GUI_RL_update/GUI.py`）：
+  - 全局 `QToolTip` 统一为深色底 + 浅色字（与 `Disp/Filtered` note 风格一致）
+  - 主题切换时同步将样式应用到 `QApplication`，并强制 `QToolTip` palette/font，避免出现黑底黑字或白底黑字混用
+
 - **Hip GUI 连接栏交互调整**（`GUI_RL_update/GUI.py`）：
   - 左上角 `Eco` 开关替换为手动 `Refresh` 按钮，用于即时刷新串口列表
   - 渲染刷新率改为固定使用 Normal 帧率（不再由 Eco 开关切换）
