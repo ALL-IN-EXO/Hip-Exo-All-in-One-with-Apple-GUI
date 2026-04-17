@@ -1769,15 +1769,15 @@ class MainWindow(QWidget):
             self.chk_rl_torque_filter.blockSignals(False)
 
         # ---- 按网络类型设置推荐预设 ----
-        # nn=0: DNN     → scale=0.50, delay=200ms, cutoff=2.5Hz, Butterworth, Vel+Ref+Torque ON
+        # nn=0: DNN     → scale=0.50, delay=200ms, cutoff=5.0Hz, Butterworth, Vel+Ref+Torque ON
         # nn=1: LSTM    → scale=1.00, delay=0ms,   cutoff=5.0Hz, Butterworth, Torque ON
         # nn=2: LegDcp  → scale=1.00, delay=100ms, cutoff=5.0Hz, Butterworth, Torque ON
-        # nn=3: LSTM-PD → scale=0.40, delay=200ms, cutoff=2.5Hz, Butterworth, Torque ON
+        # nn=3: LSTM-PD → scale=0.40, delay=200ms, cutoff=5.0Hz, Butterworth, Torque ON
         _presets = {
-            0: dict(scale=0.50, delay=200.0, cutoff=2.5,  vr=True,  torque=True),
+            0: dict(scale=0.50, delay=200.0, cutoff=5.0,  vr=True,  torque=True),
             1: dict(scale=1.00, delay=0.0,   cutoff=5.0,  vr=False, torque=True),
             2: dict(scale=1.00, delay=100.0, cutoff=5.0,  vr=False, torque=True),
-            3: dict(scale=0.40, delay=200.0, cutoff=2.5,  vr=False, torque=True),
+            3: dict(scale=0.40, delay=200.0, cutoff=5.0,  vr=False, torque=True),
         }
         preset = _presets.get(nn, _presets[1])
         self.sb_rl_scale.setValue(preset['scale'])
