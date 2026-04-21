@@ -77,7 +77,8 @@ TIMEOUT       = 0.01
 PI_USE_BINARY = 1                     # 1=二进制帧, 0=文本CSV
 
 # ---- Delay Buffer ----
-USE_FILTERED_FOR_DELAY = True         # True=用滤波后torque做delay, False=用raw NN输出
+# 统一通路: raw torque -> (主循环统一torque滤波) -> delay -> scale -> send
+USE_FILTERED_FOR_DELAY = True         # 保留兼容标志，当前统一管线始终使用滤波后torque做delay
 MAX_RUNTIME_DELAY_MS = 1000.0
 # +1: 同时覆盖 0ms 档位和 MAX_RUNTIME_DELAY_MS 档位 (100Hz 下即 0..100 帧)
 BUF_SIZE = int(round(MAX_RUNTIME_DELAY_MS / dt_ms)) + 1
@@ -132,9 +133,18 @@ TORQUE_FILTER_ENABLE_CUSTOM = False
 # ║      LSTM专用滤波器配置 (仅LSTM模式时生效)                        ║
 # ╚══════════════════════════════════════════════════════════════════╝
 # torque前滤波器系数 (Butterworth低通)
-# --nn lstm: 20Hz (legacy default)
+# --nn lstm: legacy default (内部滤波已旁路，系数仅保留兼容注释)
 LSTM_FILTER_B = np.array([0.0913, 0.1826, 0.0913])   # 20Hz
 LSTM_FILTER_A = np.array([1.0, -0.9824, 0.3477])
+# internal filter bypass (all NN): identity
+NN_INTERNAL_FILTER_BYPASS_B = np.array([1.0], dtype=np.float64)
+NN_INTERNAL_FILTER_BYPASS_A = np.array([1.0], dtype=np.float64)
+
+# Unified torque filter defaults (main-loop pre-delay path)
+UNIFIED_TORQUE_FILTER_ENABLE_DEFAULT = True
+UNIFIED_TORQUE_FILTER_CODE_DEFAULT = 1      # 1=Butterworth
+UNIFIED_TORQUE_FILTER_ORDER_DEFAULT = 2
+UNIFIED_TORQUE_FILTER_CUTOFF_DEFAULT = 5.0
 # --nn lstm_leg_dcp: 5Hz 2nd-order Butterworth (computed at import time)
 from filter_library import compute_iir_coeffs as _cic
 LSTM_LEGDCP_FILTER_B, LSTM_LEGDCP_FILTER_A = _cic(5.0, 'butterworth', float(CTRL_HZ), 2)
@@ -144,7 +154,7 @@ del _cic
 # ║                 以下为运行逻辑，一般不需要改                       ║
 # ╚══════════════════════════════════════════════════════════════════╝
 
-from filter_library import create_filter, compute_iir_coeffs, RECOMMENDED_FILTERS
+from filter_library import create_filter, compute_iir_coeffs, RECOMMENDED_FILTERS, IIRFilter
 
 # 延迟环形队列
 delay_buf_L = deque([0.0] * BUF_SIZE, maxlen=BUF_SIZE)
@@ -228,10 +238,11 @@ def load_network():
             ref_filter_type=filter_params.get('ref_filter_type'),
             ref_filter_b=filter_params.get('ref_filter_b'),
             ref_filter_a=filter_params.get('ref_filter_a'),
-            torque_filter_type=filter_params.get('torque_filter_type'),
-            torque_filter_b=filter_params.get('torque_filter_b'),
-            torque_filter_a=filter_params.get('torque_filter_a'),
-            torque_filter_enable=filter_params.get('torque_filter_enable', False),
+            # Torque filter is unified in main loop for all NN types.
+            torque_filter_type=None,
+            torque_filter_b=None,
+            torque_filter_a=None,
+            torque_filter_enable=False,
             enable_zero_mean=ENABLE_ZERO_MEAN,
             zero_mean_buffer_size=ZERO_MEAN_BUFFER_SIZE,
             zero_mean_warmup=ZERO_MEAN_WARMUP,
@@ -242,15 +253,16 @@ def load_network():
         print(f"\n{'='*80}")
         print(f"加载 LSTMNetwork: {LSTM_MODEL_PATH}")
         print(f"kp={kp}, kd={kd}")
-        print(f"滤波器: b={LSTM_FILTER_B}, a={LSTM_FILTER_A}")
+        print(f"内部exo_filter: bypass(identity), 统一torque滤波在主循环配置")
         print(f"{'='*80}")
 
         nn_obj = LSTMNetwork(
             kp=kp, kd=kd,
-            b=LSTM_FILTER_B, a=LSTM_FILTER_A,
+            b=NN_INTERNAL_FILTER_BYPASS_B, a=NN_INTERNAL_FILTER_BYPASS_A,
         )
         nn_obj.load_saved_policy(torch.load(LSTM_MODEL_PATH, map_location=torch.device('cpu')))
         nn_obj.eval()
+        print('[统一扭矩滤波] LSTM internal exo_filter bypassed (handled in main loop).')
         print('load parameters successfully!!')
         return nn_obj
 
@@ -259,15 +271,16 @@ def load_network():
         print(f"\n{'='*80}")
         print(f"加载 LSTMNetworkLegDcp: {LSTM_MODEL_PATH}")
         print(f"kp={kp}, kd={kd}")
-        print(f"滤波器: b={LSTM_LEGDCP_FILTER_B}, a={LSTM_LEGDCP_FILTER_A}")
+        print(f"内部exo_filter: bypass(identity), 统一torque滤波在主循环配置")
         print(f"{'='*80}")
 
         nn_obj = LSTMNetworkLegDcp(
             kp=kp, kd=kd,
-            b=LSTM_LEGDCP_FILTER_B, a=LSTM_LEGDCP_FILTER_A,
+            b=NN_INTERNAL_FILTER_BYPASS_B, a=NN_INTERNAL_FILTER_BYPASS_A,
         )
         nn_obj.load_saved_policy(torch.load(LSTM_MODEL_PATH, map_location=torch.device('cpu')))
         nn_obj.eval()
+        print('[统一扭矩滤波] LSTM-LegDcp internal exo_filter bypassed (handled in main loop).')
         print('load parameters successfully!!')
         return nn_obj
 
@@ -276,15 +289,16 @@ def load_network():
         print(f"\n{'='*80}")
         print(f"加载 LSTMNetworkPD: {LSTM_PD_MODEL_PATH}")
         print(f"kp={kp}, kd={kd}")
-        print(f"滤波器: b={LSTM_FILTER_B}, a={LSTM_FILTER_A}")
+        print(f"内部exo_filter: bypass(identity), 统一torque滤波在主循环配置")
         print(f"{'='*80}")
 
         nn_obj = LSTMNetworkPD(
             kp=kp, kd=kd,
-            b=LSTM_FILTER_B, a=LSTM_FILTER_A,
+            b=NN_INTERNAL_FILTER_BYPASS_B, a=NN_INTERNAL_FILTER_BYPASS_A,
         )
         nn_obj.load_saved_policy(torch.load(LSTM_PD_MODEL_PATH, map_location=torch.device('cpu')))
         nn_obj.eval()
+        print('[统一扭矩滤波] LSTM-PD internal exo_filter bypassed (handled in main loop).')
         print('load parameters successfully!!')
         return nn_obj
 
@@ -441,6 +455,36 @@ STATUS_SEND_INTERVAL = 50  # 每50帧发送一次 (0.5s @100Hz)
 class IdentityFilter:
     def filter(self, x):
         return x
+
+
+def build_unified_torque_filters(filter_code, cutoff_hz, filter_order, enable_torque):
+    """
+    Build the unified torque filters used by all NN types in main loop.
+    Returns: (left_filter, right_filter, used_filter_code, used_cutoff_hz, used_order, used_enable)
+    """
+    if not enable_torque:
+        return IdentityFilter(), IdentityFilter(), int(filter_code), float(cutoff_hz), int(filter_order), False
+
+    code = int(filter_code)
+    order = max(1, min(6, int(filter_order)))
+    cutoff = float(cutoff_hz)
+    filter_type = RPI_FILTER_TYPE_MAP.get(code)
+    if filter_type is None:
+        code = UNIFIED_TORQUE_FILTER_CODE_DEFAULT
+        filter_type = RPI_FILTER_TYPE_MAP[code]
+
+    # Keep cutoff in valid IIR range for the current CTRL_HZ
+    cutoff = max(0.5, min(float(CTRL_HZ) * 0.45, cutoff))
+    try:
+        b, a = compute_iir_coeffs(cutoff, filter_type, float(CTRL_HZ), order)
+        return IIRFilter(b=b, a=a), IIRFilter(b=b, a=a), code, cutoff, order, True
+    except Exception as exc:
+        print(f"[统一扭矩滤波] rebuild failed ({exc}), fallback to default 5Hz Butterworth 2nd")
+        code = UNIFIED_TORQUE_FILTER_CODE_DEFAULT
+        order = UNIFIED_TORQUE_FILTER_ORDER_DEFAULT
+        cutoff = UNIFIED_TORQUE_FILTER_CUTOFF_DEFAULT
+        b, a = compute_iir_coeffs(cutoff, RPI_FILTER_TYPE_MAP[code], float(CTRL_HZ), order)
+        return IIRFilter(b=b, a=a), IIRFilter(b=b, a=a), code, cutoff, order, True
 
 
 def estimate_gait_freq_hz(angle_hist: np.ndarray, fs: float) -> float:
@@ -780,50 +824,31 @@ def apply_runtime_filter_to_dnn(dnn_obj, filter_code, cutoff_hz, filter_order, e
         dnn_obj.right_vel_filter = create_filter(**kwargs) if enable_vel else IdentityFilter()
         dnn_obj.left_ref_filter = create_filter(**kwargs) if enable_ref else IdentityFilter()
         dnn_obj.right_ref_filter = create_filter(**kwargs) if enable_ref else IdentityFilter()
-        dnn_obj.torque_filter_enable = bool(enable_torque)
-        if enable_torque:
-            dnn_obj.left_torque_filter = create_filter(**kwargs)
-            dnn_obj.right_torque_filter = create_filter(**kwargs)
-        else:
-            dnn_obj.left_torque_filter = None
-            dnn_obj.right_torque_filter = None
+        # Torque filter is unified in main loop; force-disable DNN internal torque filter.
+        dnn_obj.torque_filter_enable = False
+        dnn_obj.left_torque_filter = None
+        dnn_obj.right_torque_filter = None
     except Exception as exc:
         print(f"[RPi CFG] Failed: {exc}")
         return False
 
-    print(f"[RPi CFG] Filter applied: {filter_type} {cutoff_hz:.2f}Hz order={filter_order}")
+    print(
+        f"[RPi CFG] DNN filter applied: {filter_type} {cutoff_hz:.2f}Hz order={filter_order} "
+        f"(torque handled by unified main-loop filter)"
+    )
     return True
 
 
 def apply_runtime_filter_to_lstm(nn_obj, filter_code, cutoff_hz, filter_order, enable_torque):
-    """Rebuild runtime torque pre-filter for LSTM/LSTMLegDcp networks."""
+    """LSTM internal torque pre-filter is bypassed; unified filter is in main loop."""
     if NN_TYPE == 'dnn':
         return False
 
-    if not enable_torque:
-        nn_obj.left_exo_filter = IdentityFilter()
-        nn_obj.right_exo_filter = IdentityFilter()
-        print(f"[RPi CFG] LSTM torque filter DISABLED")
-        return True
-
-    filter_type = RPI_FILTER_TYPE_MAP.get(filter_code)
-    if filter_type is None:
-        print(f"[RPi CFG] Unknown filter code: {filter_code}")
-        return False
-
-    try:
-        b, a = compute_iir_coeffs(float(cutoff_hz), filter_type,
-                                   float(CTRL_HZ), int(filter_order))
-        from filter_library import IIRFilter
-        nn_obj.left_exo_filter = IIRFilter(b=b, a=a)
-        nn_obj.right_exo_filter = IIRFilter(b=b, a=a)
-        nn_obj.b = b
-        nn_obj.a = a
-    except Exception as exc:
-        print(f"[RPi CFG] LSTM filter rebuild failed: {exc}")
-        return False
-
-    print(f"[RPi CFG] LSTM torque filter: {filter_type} {cutoff_hz:.2f}Hz order={filter_order}")
+    nn_obj.left_exo_filter = IdentityFilter()
+    nn_obj.right_exo_filter = IdentityFilter()
+    nn_obj.b = NN_INTERNAL_FILTER_BYPASS_B
+    nn_obj.a = NN_INTERNAL_FILTER_BYPASS_A
+    print("[RPi CFG] LSTM internal exo_filter bypassed (torque handled by unified main-loop filter)")
     return True
 
 
@@ -1050,27 +1075,25 @@ def main():
     status_dirty = True  # 启动时立即发送一次状态
 
     # 当前滤波器状态跟踪 (用于上行状态)
-    cur_filter_source = 0      # 0=base, 1=runtime_override
-    cur_filter_type_code = 0   # 0=preset/N/A
-    cur_filter_order = 2
-    cur_enable_mask = 0x00
-    cur_cutoff_hz = 0.0
+    # 统一策略: torque filter 默认 5Hz 2nd Butterworth, 由主循环统一应用
+    cur_filter_source = 0  # 0=base, 1=runtime_override
+    cur_filter_type_code = UNIFIED_TORQUE_FILTER_CODE_DEFAULT
+    cur_filter_order = UNIFIED_TORQUE_FILTER_ORDER_DEFAULT
+    cur_cutoff_hz = UNIFIED_TORQUE_FILTER_CUTOFF_DEFAULT
+    cur_enable_mask = (RPI_FILTER_EN_TORQUE if UNIFIED_TORQUE_FILTER_ENABLE_DEFAULT else 0x00)
+    # DNN 仍保留 vel/ref 运行时滤波开关；LSTM 家族仅 torque 有意义
+    if NN_TYPE == 'dnn':
+        cur_enable_mask |= (RPI_FILTER_EN_VEL | RPI_FILTER_EN_REF)
 
-    # 初始化基础滤波器状态 (LSTM模式: torque filter always on)
-    if NN_TYPE != 'dnn':
-        cur_enable_mask = RPI_FILTER_EN_TORQUE
-        cur_filter_type_code = 1  # Butterworth
-        cur_filter_order = 2
-        if NN_TYPE == 'lstm_leg_dcp':
-            cur_cutoff_hz = 5.0   # LegDcp default: 5Hz
-        else:
-            cur_cutoff_hz = 20.0  # lstm / lstm_pd default: 20Hz
+    torque_filter_L, torque_filter_R, cur_filter_type_code, cur_cutoff_hz, cur_filter_order, torque_on = \
+        build_unified_torque_filters(
+            cur_filter_type_code, cur_cutoff_hz, cur_filter_order,
+            bool(cur_enable_mask & RPI_FILTER_EN_TORQUE)
+        )
+    if torque_on:
+        cur_enable_mask |= RPI_FILTER_EN_TORQUE
     else:
-        # DNN: 根据preset配置
-        if FILTER_CONFIG_MODE == 'preset':
-            cur_enable_mask = (RPI_FILTER_EN_VEL | RPI_FILTER_EN_REF)
-            if TORQUE_FILTER_NAME:
-                cur_enable_mask |= RPI_FILTER_EN_TORQUE
+        cur_enable_mask &= ~RPI_FILTER_EN_TORQUE
 
     print(f"\n[启动] NN_TYPE={NN_TYPE}, kp={kp}, kd={kd}")
     print(f"[启动] 串口={SER_DEV}, 波特率={BAUDRATE}")
@@ -1078,6 +1101,12 @@ def main():
     print(
         f"[启动] AutoDelay power velocity source="
         f"{'d(angle)/dt' if AUTO_PWR_USE_ANGLE_DIFF_VEL else 'imu_raw(LTAVx/RTAVx)'}"
+    )
+    _startup_filter_name = RPI_FILTER_TYPE_MAP.get(cur_filter_type_code, '?')
+    print(
+        f"[启动] Unified torque filter="
+        f"{'ON' if (cur_enable_mask & RPI_FILTER_EN_TORQUE) else 'OFF'} "
+        f"{_startup_filter_name} {cur_cutoff_hz:.1f}Hz order={cur_filter_order}"
     )
     if NN_TYPE == 'lstm_pd':
         print(
@@ -1161,15 +1190,21 @@ def main():
                         cfg['enable_torque'],
                     )
 
+                # Unified torque filter (all NN): filter -> delay -> scale -> send
+                torque_filter_L, torque_filter_R, used_code, used_cutoff, used_order, used_enable = \
+                    build_unified_torque_filters(
+                        cfg['filter_code'], cfg['cutoff_hz'], cfg['filter_order'], cfg['enable_torque']
+                    )
+
                 # 更新滤波器状态跟踪
                 cur_filter_source = 1  # runtime_override
-                cur_filter_type_code = cfg['filter_code']
-                cur_filter_order = cfg['filter_order']
-                cur_cutoff_hz = cfg['cutoff_hz']
+                cur_filter_type_code = used_code
+                cur_filter_order = used_order
+                cur_cutoff_hz = used_cutoff
                 en = 0
                 if cfg['enable_vel']:  en |= RPI_FILTER_EN_VEL
                 if cfg['enable_ref']:  en |= RPI_FILTER_EN_REF
-                if cfg['enable_torque']: en |= RPI_FILTER_EN_TORQUE
+                if used_enable: en |= RPI_FILTER_EN_TORQUE
                 cur_enable_mask = en
                 status_dirty = True  # 立即回传状态
 
@@ -1214,13 +1249,9 @@ def main():
             # 例如 lstm_pd 中 D 项已带符号(L_d = -dqTd*kd)，总扭矩是 L_p + L_d。
             L_p, L_d, R_p, R_d = dnn.L_p, dnn.L_d, dnn.R_p, dnn.R_d
 
-            # ---- 获取滤波后的torque ----
-            if hasattr(dnn, 'filtered_hip_torque_L'):
-                filter_L_cmd = dnn.filtered_hip_torque_L
-                filter_R_cmd = dnn.filtered_hip_torque_R
-            else:
-                filter_L_cmd = L_cmd
-                filter_R_cmd = R_cmd
+            # ---- 统一扭矩滤波 (all NN, pre-delay path) ----
+            filter_L_cmd = torque_filter_L.filter(float(L_cmd))
+            filter_R_cmd = torque_filter_R.filter(float(R_cmd))
 
             # ---- lstm_pd: optional post-filter zero-mean balancing (RPi only) ----
             if pd_zm_enabled:
@@ -1238,8 +1269,9 @@ def main():
                 pd_zm_bias_L = 0.0
                 pd_zm_bias_R = 0.0
 
-            delay_input_L = filter_L_cmd if USE_FILTERED_FOR_DELAY else L_cmd
-            delay_input_R = filter_R_cmd if USE_FILTERED_FOR_DELAY else R_cmd
+            # 统一管线固定为: filter -> delay -> scale -> send
+            delay_input_L = float(filter_L_cmd)
+            delay_input_R = float(filter_R_cmd)
 
             # ---- velocity source for auto-delay power/motion evaluation ----
             # This affects ONLY auto-delay metrics/gating path (hist_vel_*), not NN inputs.

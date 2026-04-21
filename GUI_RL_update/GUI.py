@@ -7,6 +7,9 @@ import json
 import bisect
 from math import *
 from collections import deque
+import configparser
+import shlex
+import re
 from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
 from PyQt5.QtWidgets import *
@@ -65,10 +68,17 @@ RL_FILTER_TYPES = [
     ("Chebyshev2", 3),
 ]
 
+RPI_RL_TMUX_SESSION = "hip_rl"
+RPI_RL_POLL_INTERVAL_S = 1.0
+RPI_RL_SSH_TIMEOUT_S = 8.0
+
 CONN_TIMEOUT_S = 2.0
+AUTO_CONNECT_COOLDOWN_S = 2.0
+AUTO_CONNECT_ADAFRUIT_VIDS = {0x239A}
 
 REPLAY_AUTO_COMPUTE = "__AUTO_COMPUTE__"
 REPLAY_POWER_COLUMNS = {"L_pwr_W", "R_pwr_W"}
+REPLAY_PROGRESS_STEPS = 10000
 REPLAY_PLOT_COLUMN_ALIASES = {
     "L_angle_deg": ["L_angle_deg", "L_angle", "left_angle_deg"],
     "R_angle_deg": ["R_angle_deg", "R_angle", "right_angle_deg"],
@@ -541,9 +551,22 @@ class ConnectionDot(QWidget):
 # ============== Helper ==============
 def find_available_ports():
     # List only; do not open/close ports here to avoid unnecessary device reset.
-    ports = [p.device for p in list_ports.comports()]
-    # Keep stable order so the selection does not jump around.
-    return sorted(ports)
+    return [p["device"] for p in list_available_port_infos()]
+
+
+def list_available_port_infos():
+    infos = []
+    for p in list_ports.comports():
+        infos.append({
+            "device": str(getattr(p, "device", "") or ""),
+            "description": str(getattr(p, "description", "") or ""),
+            "manufacturer": str(getattr(p, "manufacturer", "") or ""),
+            "hwid": str(getattr(p, "hwid", "") or ""),
+            "vid": (int(p.vid) if getattr(p, "vid", None) is not None else None),
+            "pid": (int(p.pid) if getattr(p, "pid", None) is not None else None),
+        })
+    infos.sort(key=lambda it: it["device"])
+    return infos
 
 
 _section_labels = []  # track for theme updates
@@ -600,6 +623,15 @@ class MainWindow(QWidget):
         self._current_tag = ""
         self._last_rx_tag_char = ""
         self._tag_started_at = None
+        self._last_rx_tag_text = ""
+        self._align_mark_counter = 1
+        self._align_events_pending = []
+        self._uplink_prev_t_cs = None
+        self._uplink_wrap_count = 0
+        self._uplink_t_unwrapped_s = 0.0
+        self._csv_sample_idx = 0
+        self._csv_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._csv_start_wall_time = time.time()
         self._last_gait_freq = None
         self._pwr_band_scale_right = 5.0
         self._pwr_band_scale_left = 5.0
@@ -668,13 +700,35 @@ class MainWindow(QWidget):
         self._rpi_power_abs_max_w = 200.0
         self._rpi_delay_jump_guard_ms = 300.0
 
+        # Remote Pi RL launcher state (GUI local SSH -> Pi tmux)
+        self._pi_rl_tmux_session = RPI_RL_TMUX_SESSION
+        self._pi_rl_remote_running = False
+        self._pi_rl_remote_nn = ""
+        self._pi_rl_remote_last_error = ""
+        self._pi_rl_remote_last_poll_ts = 0.0
+        self._pi_rl_poll_inflight = False
+        self._pi_rl_cmd_inflight = False
+        self._pi_rl_remote_status_sig = None
+        self._async_job_next_id = 1
+        self._async_job_result_q = queue.Queue()
+        self._async_job_active = {}
+
         # Connection health
         self._last_rx_time = 0.0
         self._conn_healthy = False
         self._imu34_counter = 0
         self._imu_ok_state_cache = [None] * 6
+        self._imu_batt_cache = [None] * 6
+        self._imu_batt_style_cache = [None] * 6
         self._rx_buf = bytearray()
         self._last_port_scan = 0.0
+        self._port_infos = []
+        self._auto_connect_enabled = True
+        self._auto_connect_cooldown_s = AUTO_CONNECT_COOLDOWN_S
+        self._last_auto_connect_try_ts = 0.0
+        self._last_auto_connect_port = ""
+        self._last_connected_port = ""
+        self._last_auto_connect_err_sig = None
 
         # Screenshot & recording
         self._capture_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captures")
@@ -702,6 +756,9 @@ class MainWindow(QWidget):
         self._replay_speed = 1.0
         self._replay_csv_path = ""
         self._replay_time_axis = []
+        self._replay_finished = False
+        self._replay_slider_internal = False
+        self._replay_slider_dragging = False
         self._replay_mapping_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "mapping.json")
         self._replay_col_mapping = self._load_replay_mapping()
@@ -712,6 +769,8 @@ class MainWindow(QWidget):
         self._combo_boxes = []
 
         self._build_layout()
+        self._set_pi_rl_remote_state("Pi RL Remote: idle", C.text2, force=True)
+        self._reload_pi_profiles_ui()
         self._update_rl_filter_state_label()
         self._update_brand_apply_label()
         self._build_plots()
@@ -733,6 +792,16 @@ class MainWindow(QWidget):
             'L_cmd_Nm', 'R_cmd_Nm', 'L_est_Nm', 'R_est_Nm',
             'L_vel_dps', 'R_vel_dps', 'L_pwr_W', 'R_pwr_W',
             'gait_freq_Hz',
+            't_unwrapped_s', 'wall_time_s', 'wall_elapsed_s',
+            'csv_sample_idx', 'csv_session_id',
+            'algo_name', 'gui_tag', 'rx_tag_char', 'rx_tag_text',
+            'align_event',
+            'rl_cfg_tx_seq',
+            'rpi_online', 'rpi_status_version', 'rpi_nn_type',
+            'rpi_delay_ms_L', 'rpi_delay_ms_R',
+            'rpi_power_ratio_L', 'rpi_power_ratio_R',
+            'rpi_pos_per_s_L', 'rpi_pos_per_s_R',
+            'rpi_neg_per_s_L', 'rpi_neg_per_s_R',
         ])
         self._csv_last_flush = 0.0
 
@@ -800,12 +869,14 @@ class MainWindow(QWidget):
         self.cmb_port = QComboBox()
         self.cmb_port.addItems(find_available_ports())
         self.cmb_port.setFixedWidth(140)
+        self.cmb_port.setToolTip("Serial port list. While disconnected, GUI auto-connect prefers Adafruit devices.")
         self._setup_combo(self.cmb_port)
         conn_lay.addWidget(self.cmb_port)
 
         self.btn_connect = QPushButton("Connect")
         self.btn_connect.setFixedHeight(32)
         self.btn_connect.setCursor(Qt.PointingHandCursor)
+        self.btn_connect.setToolTip("Manually connect to the selected serial port.")
         self.btn_connect.clicked.connect(self._connect_clicked)
         conn_lay.addWidget(self.btn_connect)
 
@@ -1133,21 +1204,76 @@ class MainWindow(QWidget):
         self.btn_apply_rl.clicked.connect(self._on_apply_rl_clicked)
         rl_lay.addWidget(self.btn_apply_rl, 8, 0, 1, 2)
 
-        # Row 9: Status label
+        # Row 9: Pi profile selector + config entry
+        profile_row = QHBoxLayout()
+        self.cmb_pi_profile = QComboBox()
+        self._setup_combo(self.cmb_pi_profile)
+        self.cmb_pi_profile.setToolTip("Active Pi SSH profile for RL remote start/stop.")
+        self.cmb_pi_profile.currentIndexChanged.connect(self._on_pi_profile_changed)
+        self.btn_pi_profile_cfg = QPushButton("Configure Pi...")
+        self.btn_pi_profile_cfg.setToolTip("Add/edit Pi SSH profiles stored in user config directory.")
+        self.btn_pi_profile_cfg.clicked.connect(self._on_configure_pi_clicked)
+        profile_row.addWidget(self.cmb_pi_profile, 1)
+        profile_row.addWidget(self.btn_pi_profile_cfg, 0)
+        lbl_pi_profile = QLabel("Pi Profile")
+        lbl_pi_profile.setToolTip("Choose which Pi SSH profile is used for Start/Stop Pi RL.")
+        rl_lay.addWidget(lbl_pi_profile, 9, 0)
+        rl_lay.addLayout(profile_row, 9, 1)
+
+        # Row 10: Pi remote launcher controls (local SSH, not via Teensy)
+        rl_remote_row = QHBoxLayout()
+        self.btn_pi_rl_start_legdcp = QPushButton("Start LegDcp")
+        self.btn_pi_rl_start_legdcp.setToolTip(
+            "Start Pi RL in tmux session using nn=lstm_leg_dcp."
+        )
+        self.btn_pi_rl_start_legdcp.clicked.connect(
+            lambda: self._on_pi_rl_start_clicked("lstm_leg_dcp")
+        )
+        self.btn_pi_rl_start_pd = QPushButton("Start LSTM-PD")
+        self.btn_pi_rl_start_pd.setToolTip(
+            "Start Pi RL in tmux session using nn=lstm_pd."
+        )
+        self.btn_pi_rl_start_pd.clicked.connect(
+            lambda: self._on_pi_rl_start_clicked("lstm_pd")
+        )
+        self.btn_pi_rl_stop = QPushButton("Stop Pi RL")
+        self.btn_pi_rl_stop.setToolTip("Stop Pi RL tmux session on Raspberry Pi.")
+        self.btn_pi_rl_stop.clicked.connect(self._on_pi_rl_stop_clicked)
+        rl_remote_row.addWidget(self.btn_pi_rl_start_legdcp)
+        rl_remote_row.addWidget(self.btn_pi_rl_start_pd)
+        rl_remote_row.addWidget(self.btn_pi_rl_stop)
+        rl_remote_row.addStretch(1)
+        lbl_pi_remote = QLabel("Pi RL Remote")
+        lbl_pi_remote.setToolTip("Remote launcher controls for starting/stopping RL on Raspberry Pi via SSH.")
+        rl_lay.addWidget(lbl_pi_remote, 10, 0)
+        rl_lay.addLayout(rl_remote_row, 10, 1)
+
+        # Row 11: Pi remote launcher status
+        self.lbl_pi_rl_remote_state = QLabel("Pi RL Remote: idle")
+        self.lbl_pi_rl_remote_state.setWordWrap(True)
+        self.lbl_pi_rl_remote_state.setToolTip(
+            "Shows remote RL launcher state, including running NN type and SSH/tmux errors."
+        )
+        self.lbl_pi_rl_remote_state.setStyleSheet(
+            f"color:{C.text2}; font-size:11px; background:transparent; padding-top:1px;"
+        )
+        rl_lay.addWidget(self.lbl_pi_rl_remote_state, 11, 0, 1, 2)
+
+        # Row 12: Status label
         self.lbl_rl_filter_state = QLabel("")
         self.lbl_rl_filter_state.setWordWrap(True)
         self.lbl_rl_filter_state.setStyleSheet(
             f"color:{C.text2}; font-size:11px; background:transparent; padding-top:2px;"
         )
-        rl_lay.addWidget(self.lbl_rl_filter_state, 9, 0, 1, 2)
+        rl_lay.addWidget(self.lbl_rl_filter_state, 12, 0, 1, 2)
 
-        # Row 10: Auto-delay telemetry (from RPi status uplink)
+        # Row 13: Auto-delay telemetry (from RPi status uplink)
         self.lbl_rl_auto_state = QLabel("Auto Delay: waiting for RPi status...")
         self.lbl_rl_auto_state.setWordWrap(True)
         self.lbl_rl_auto_state.setStyleSheet(
             f"color:{C.purple}; font-size:11px; background:transparent; padding-top:1px;"
         )
-        rl_lay.addWidget(self.lbl_rl_auto_state, 10, 0, 1, 2)
+        rl_lay.addWidget(self.lbl_rl_auto_state, 13, 0, 1, 2)
         self.algo_stack.addWidget(rl_panel)
 
         # -- SOGI panel (phase-locked sinusoidal assist) --
@@ -1244,9 +1370,18 @@ class MainWindow(QWidget):
         self.btn_auto_mile.setCursor(Qt.PointingHandCursor)
         self.btn_auto_mile.setFixedHeight(32)
         self.btn_auto_mile.clicked.connect(self._auto_cycle_mile)
+        self.btn_auto_mile.setToolTip("Cycle preset labels and send as persistent log tags.")
         send_row.addWidget(self.btn_auto_mile)
         self._mile_values = ['sit-to-stand', 'walk', 'run', 'squat']
         self._mile_index = 0
+
+        self.btn_align_mark = QPushButton("Align Mark")
+        self.btn_align_mark.setCursor(Qt.PointingHandCursor)
+        self.btn_align_mark.setFixedHeight(32)
+        self.btn_align_mark.clicked.connect(self._on_align_mark_clicked)
+        self.btn_align_mark.setToolTip(
+            "Insert a manual alignment marker into GUI CSV (align_event) and send a short tag to Pi.")
+        send_row.addWidget(self.btn_align_mark)
 
         log_lay.addLayout(send_row)
         left.addWidget(log_card)
@@ -1468,6 +1603,38 @@ class MainWindow(QWidget):
 
         plot_card_vlay.addLayout(row2)
 
+        # --- Row 3: Replay progress (time + draggable seek bar) ---
+        row3 = QHBoxLayout(); row3.setSpacing(8)
+        self.lbl_replay_progress_cur = QLabel("--:--")
+        self.lbl_replay_progress_cur.setStyleSheet(
+            f"font-size:11px; color:{C.text2}; background:transparent; min-width:56px;")
+        self.lbl_replay_progress_cur.setToolTip("Current replay time")
+        row3.addWidget(self.lbl_replay_progress_cur)
+
+        self.sld_replay_progress = QSlider(Qt.Horizontal)
+        self.sld_replay_progress.setRange(0, REPLAY_PROGRESS_STEPS)
+        self.sld_replay_progress.setValue(0)
+        self.sld_replay_progress.setEnabled(False)
+        self.sld_replay_progress.setToolTip("Drag to seek replay timeline")
+        self.sld_replay_progress.sliderPressed.connect(self._on_replay_slider_pressed)
+        self.sld_replay_progress.sliderReleased.connect(self._on_replay_slider_released)
+        self.sld_replay_progress.sliderMoved.connect(self._on_replay_slider_moved)
+        row3.addWidget(self.sld_replay_progress, 1)
+
+        self.lbl_replay_progress_total = QLabel("/ --:--")
+        self.lbl_replay_progress_total.setStyleSheet(
+            f"font-size:11px; color:{C.text2}; background:transparent; min-width:64px;")
+        self.lbl_replay_progress_total.setToolTip("Total replay duration")
+        row3.addWidget(self.lbl_replay_progress_total)
+
+        self.lbl_replay_progress_rows = QLabel("[--/--]")
+        self.lbl_replay_progress_rows.setStyleSheet(
+            f"font-size:11px; color:{C.text2}; background:transparent;")
+        self.lbl_replay_progress_rows.setToolTip("Current sample index / total samples")
+        row3.addWidget(self.lbl_replay_progress_rows)
+
+        plot_card_vlay.addLayout(row3)
+
         # Display card goes to right side (plots area), added later in _build_plots
         self._plot_card = plot_card
 
@@ -1497,6 +1664,26 @@ class MainWindow(QWidget):
             imu_row.addWidget(lbl)
         imu_row.addStretch(1)
         hw_lay.addLayout(imu_row)
+
+        # IMU battery row
+        batt_row = QHBoxLayout()
+        self.lbl_imu_batt_title = QLabel("Battery")
+        self.lbl_imu_batt_title.setToolTip("IMU battery percentage from Teensy uplink (0-100%).")
+        self.lbl_imu_batt_title.setStyleSheet(
+            f"color:{C.text2}; font-size:11px; font-weight:600; background:transparent;"
+        )
+        self.lbl_imu_batt_title.setFixedWidth(76)
+        batt_row.addWidget(self.lbl_imu_batt_title)
+        self.lbl_imu_batts = []
+        for name in ["L", "R", "1", "2", "3", "4"]:
+            lbl = QLabel(f"{name}:--")
+            lbl.setToolTip(f"IMU {name} battery percentage.")
+            lbl.setStyleSheet(f"color:{C.text2}; font-size:11px; font-weight:500; background:transparent;")
+            lbl.setFixedWidth(55)
+            self.lbl_imu_batts.append(lbl)
+            batt_row.addWidget(lbl)
+        batt_row.addStretch(1)
+        hw_lay.addLayout(batt_row)
 
         # Motor row
         motor_row = QHBoxLayout()
@@ -1593,7 +1780,8 @@ class MainWindow(QWidget):
         self._combo_boxes.append(combo)
 
     def _refresh_ports(self):
-        ports = find_available_ports()
+        self._port_infos = list_available_port_infos()
+        ports = [p["device"] for p in self._port_infos]
         selected = self.cmb_port.currentText()
         self.cmb_port.blockSignals(True)
         self.cmb_port.clear()
@@ -1605,9 +1793,959 @@ class MainWindow(QWidget):
         self._last_port_scan = time.time()
         return len(ports)
 
+    def _score_auto_connect_port(self, info):
+        dev = str(info.get("device", "") or "")
+        dev_l = dev.lower()
+        desc_l = str(info.get("description", "") or "").lower()
+        mfg_l = str(info.get("manufacturer", "") or "").lower()
+        hwid_l = str(info.get("hwid", "") or "").lower()
+        blob = " ".join((desc_l, mfg_l, hwid_l))
+
+        score = 0
+        if info.get("vid") in AUTO_CONNECT_ADAFRUIT_VIDS:
+            score += 120
+        if "adafruit" in blob:
+            score += 120
+        if dev == self._last_connected_port and dev:
+            score += 200
+        if dev == self._last_auto_connect_port and dev:
+            score += 40
+        if "usbmodem" in dev_l:
+            score += 15
+        if "usbserial" in dev_l:
+            score += 8
+        # Avoid auto-connecting to generic Bluetooth serial endpoints.
+        if ("bluetooth" in dev_l) or ("bluetooth" in blob):
+            score -= 60
+        return score
+
+    def _pick_auto_connect_port(self):
+        if not self._port_infos:
+            return ""
+        best_port = ""
+        best_score = -10**9
+        for info in self._port_infos:
+            dev = str(info.get("device", "") or "")
+            if not dev:
+                continue
+            score = self._score_auto_connect_port(info)
+            if score > best_score:
+                best_score = score
+                best_port = dev
+        # Require moderate confidence to avoid grabbing random ports while still
+        # allowing plain usbmodem devices when metadata is sparse.
+        return best_port if best_score >= 12 else ""
+
     def _on_refresh_ports_clicked(self):
         n_ports = self._refresh_ports()
         self.lbl_status.setText(f"Ports refreshed ({n_ports})")
+
+    def _set_pi_rl_remote_buttons_enabled(self, enabled):
+        for btn_name in ("btn_pi_rl_start_legdcp", "btn_pi_rl_start_pd", "btn_pi_rl_stop"):
+            btn = getattr(self, btn_name, None)
+            if btn is not None:
+                btn.setEnabled(bool(enabled))
+
+    def _set_pi_rl_remote_state(self, text, color=None, force=False):
+        if not hasattr(self, "lbl_pi_rl_remote_state"):
+            return
+        if color is None:
+            color = C.text2
+        sig = (str(text), str(color))
+        if (not force) and sig == self._pi_rl_remote_status_sig:
+            return
+        self._pi_rl_remote_status_sig = sig
+        self.lbl_pi_rl_remote_state.setStyleSheet(
+            f"color:{color}; font-size:11px; background:transparent; padding-top:1px;"
+        )
+        self.lbl_pi_rl_remote_state.setText(str(text))
+
+    def _infer_pi_rl_remote_color(self, text):
+        t = (text or "").lower()
+        if "running" in t:
+            if ("traceback" in t) or ("error" in t) or ("failed" in t):
+                return C.orange
+            return C.green
+        if ("error" in t) or ("failed" in t):
+            return C.red
+        if ("starting" in t) or ("stopping" in t) or ("unknown" in t):
+            return C.orange
+        return C.text2
+
+    def _app_user_config_dir(self):
+        home = os.path.expanduser("~")
+        if sys.platform == "darwin":
+            return os.path.join(home, "Library", "Application Support", "HipExoController")
+        if os.name == "nt":
+            base = os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming")
+            return os.path.join(base, "HipExoController")
+        return os.path.join(home, ".config", "HipExoController")
+
+    def _legacy_rpi_profile_conf_path(self):
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tools", "rpi_profiles.conf"))
+
+    def _rpi_profile_conf_path(self):
+        return os.path.join(self._app_user_config_dir(), "rpi_profiles.conf")
+
+    def _ensure_rpi_profile_store(self):
+        cfg_dir = self._app_user_config_dir()
+        cfg_path = self._rpi_profile_conf_path()
+        try:
+            os.makedirs(cfg_dir, exist_ok=True)
+        except Exception as exc:
+            return False, f"cannot create config dir: {cfg_dir} ({exc})"
+
+        if os.path.isfile(cfg_path):
+            return True, None
+
+        legacy = self._legacy_rpi_profile_conf_path()
+        try:
+            if os.path.isfile(legacy):
+                shutil.copy2(legacy, cfg_path)
+            else:
+                with open(cfg_path, "w", encoding="utf-8") as f:
+                    f.write("[active]\n")
+                    f.write("profile = \n")
+        except Exception as exc:
+            return False, f"cannot initialize profile file: {cfg_path} ({exc})"
+        return True, None
+
+    def _load_rpi_profiles_cfg(self):
+        ok, err = self._ensure_rpi_profile_store()
+        if not ok:
+            return None, err
+        cfg_path = self._rpi_profile_conf_path()
+        cfg = configparser.ConfigParser()
+        try:
+            cfg.read(cfg_path, encoding="utf-8")
+        except Exception as exc:
+            return None, f"failed to read profile config: {exc}"
+        if not cfg.has_section("active"):
+            cfg.add_section("active")
+            cfg.set("active", "profile", "")
+        return cfg, None
+
+    def _save_rpi_profiles_cfg(self, cfg):
+        cfg_path = self._rpi_profile_conf_path()
+        try:
+            os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                cfg.write(f)
+        except Exception as exc:
+            return False, f"failed to write profile config: {exc}"
+        return True, None
+
+    @staticmethod
+    def _profile_section_names(cfg):
+        return [s for s in cfg.sections() if s.lower() != "active"]
+
+    @staticmethod
+    def _active_profile_name(cfg):
+        if cfg.has_section("active"):
+            return (cfg.get("active", "profile", fallback="") or "").strip()
+        return ""
+
+    def _set_active_profile_name(self, profile_name):
+        cfg, err = self._load_rpi_profiles_cfg()
+        if err:
+            return False, err
+        if not cfg.has_section("active"):
+            cfg.add_section("active")
+        cfg.set("active", "profile", str(profile_name or "").strip())
+        return self._save_rpi_profiles_cfg(cfg)
+
+    def _reload_pi_profiles_ui(self, select_name=None):
+        if not hasattr(self, "cmb_pi_profile"):
+            return
+        cfg, err = self._load_rpi_profiles_cfg()
+        self.cmb_pi_profile.blockSignals(True)
+        self.cmb_pi_profile.clear()
+        if err:
+            self.cmb_pi_profile.addItem("Config Error", "")
+            self.cmb_pi_profile.blockSignals(False)
+            self._set_pi_rl_remote_state(f"Pi RL Remote: {err}", C.red, force=True)
+            return
+
+        names = self._profile_section_names(cfg)
+        active = self._active_profile_name(cfg)
+        if not names:
+            self.cmb_pi_profile.addItem("Not Configured", "")
+            self.cmb_pi_profile.blockSignals(False)
+            self._set_pi_rl_remote_state(
+                "Pi RL Remote: Not Configured (click Configure Pi...)",
+                C.orange,
+                force=True,
+            )
+            return
+
+        names_sorted = sorted(names)
+        for n in names_sorted:
+            self.cmb_pi_profile.addItem(n, n)
+        target = (select_name or active or names_sorted[0]).strip()
+        idx = self.cmb_pi_profile.findData(target)
+        if idx < 0:
+            idx = 0
+            target = str(self.cmb_pi_profile.itemData(0) or self.cmb_pi_profile.itemText(0))
+        self.cmb_pi_profile.setCurrentIndex(idx)
+        self.cmb_pi_profile.blockSignals(False)
+        # Ensure on-disk active profile follows UI selection.
+        self._set_active_profile_name(target)
+
+    def _on_pi_profile_changed(self, _idx):
+        if not hasattr(self, "cmb_pi_profile"):
+            return
+        profile_name = (self.cmb_pi_profile.currentData() or "").strip()
+        if not profile_name:
+            return
+        self._set_active_profile_name(profile_name)
+
+    def _on_configure_pi_clicked(self, _checked=False, auto_prompt=False):
+        cfg, err = self._load_rpi_profiles_cfg()
+        if err:
+            self._set_pi_rl_remote_state(f"Pi RL Remote: {err}", C.red, force=True)
+            QMessageBox.warning(self, "Configure Pi", f"Failed to load profile config:\n{err}")
+            return False
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Configure Pi Profiles")
+        dlg.setModal(True)
+        dlg.resize(720, 430)
+
+        lay = QVBoxLayout(dlg)
+        path_label = QLabel(f"Profile store: {self._rpi_profile_conf_path()}")
+        path_label.setWordWrap(True)
+        path_label.setStyleSheet(f"color:{C.text2}; font-size:11px;")
+        path_label.setToolTip("Local user config file where Pi SSH profiles are stored.")
+        lay.addWidget(path_label)
+
+        profile_sel_row = QHBoxLayout()
+        lbl_profile = QLabel("Profile")
+        lbl_profile.setToolTip("Select an existing profile to edit, or choose New Profile.")
+        profile_sel_row.addWidget(lbl_profile)
+        cmb_profiles = QComboBox()
+        cmb_profiles.setView(QListView(cmb_profiles))
+        cmb_profiles.setToolTip("Pi SSH profile list.")
+        profile_sel_row.addWidget(cmb_profiles, 1)
+        btn_new = QPushButton("New")
+        btn_new.setToolTip("Create a new Pi SSH profile.")
+        btn_delete = QPushButton("Delete")
+        btn_delete.setToolTip("Delete the currently selected profile.")
+        profile_sel_row.addWidget(btn_new)
+        profile_sel_row.addWidget(btn_delete)
+        lay.addLayout(profile_sel_row)
+
+        form = QFormLayout()
+        le_name = QLineEdit()
+        le_name.setPlaceholderText("e.g. lab-pi5")
+        le_name.setToolTip("Unique profile name shown in the Pi Profile dropdown.")
+        le_host = QLineEdit()
+        le_host.setPlaceholderText("e.g. 192.168.1.50")
+        le_host.setToolTip("Raspberry Pi hostname or IP address.")
+        sb_port = QSpinBox()
+        sb_port.setRange(1, 65535)
+        sb_port.setValue(22)
+        sb_port.setToolTip("SSH port on Raspberry Pi (default 22).")
+        le_user = QLineEdit()
+        le_user.setPlaceholderText("e.g. pi")
+        le_user.setToolTip("SSH username.")
+        le_remote_dir = QLineEdit()
+        le_remote_dir.setPlaceholderText("e.g. ~/Desktop/RPi_Unified")
+        le_remote_dir.setToolTip("Remote directory containing RL_controller_torch.py on Pi.")
+
+        auth_row = QHBoxLayout()
+        cmb_auth = QComboBox()
+        cmb_auth.setView(QListView(cmb_auth))
+        cmb_auth.addItem("SSH Key", "key")
+        cmb_auth.addItem("Password", "password")
+        cmb_auth.setToolTip("Authentication method used by local SSH.")
+        auth_row.addWidget(cmb_auth, 1)
+        chk_set_active = QCheckBox("Set as active profile")
+        chk_set_active.setChecked(True)
+        chk_set_active.setToolTip("If checked, this profile becomes the default active profile.")
+        auth_row.addWidget(chk_set_active, 0)
+
+        identity_row = QHBoxLayout()
+        le_identity = QLineEdit()
+        le_identity.setPlaceholderText("e.g. ~/.ssh/id_ed25519")
+        le_identity.setToolTip("Path to local SSH private key file.")
+        btn_browse_id = QPushButton("Browse...")
+        btn_browse_id.setToolTip("Browse for local SSH private key file.")
+        identity_row.addWidget(le_identity, 1)
+        identity_row.addWidget(btn_browse_id, 0)
+
+        le_password = QLineEdit()
+        le_password.setEchoMode(QLineEdit.Password)
+        le_password.setPlaceholderText("Optional (requires sshpass on local machine)")
+        le_password.setToolTip("SSH password (used only in Password mode, requires sshpass).")
+
+        lbl_name = QLabel("Profile Name")
+        lbl_name.setToolTip("Unique profile identifier.")
+        lbl_host = QLabel("Host")
+        lbl_host.setToolTip("Pi hostname or IP.")
+        lbl_port = QLabel("Port")
+        lbl_port.setToolTip("Pi SSH port.")
+        lbl_user = QLabel("User")
+        lbl_user.setToolTip("Pi SSH user.")
+        lbl_remote_dir = QLabel("Remote Dir")
+        lbl_remote_dir.setToolTip("Directory where RL script runs on Pi.")
+        lbl_auth = QLabel("Auth")
+        lbl_auth.setToolTip("Select SSH key or password authentication.")
+        lbl_identity = QLabel("Identity File")
+        lbl_identity.setToolTip("Local private key path for SSH key mode.")
+        lbl_password = QLabel("Password")
+        lbl_password.setToolTip("Used only in Password mode.")
+
+        form.addRow(lbl_name, le_name)
+        form.addRow(lbl_host, le_host)
+        form.addRow(lbl_port, sb_port)
+        form.addRow(lbl_user, le_user)
+        form.addRow(lbl_remote_dir, le_remote_dir)
+        form.addRow(lbl_auth, auth_row)
+        form.addRow(lbl_identity, identity_row)
+        form.addRow(lbl_password, le_password)
+        lay.addLayout(form)
+
+        info = QLabel(
+            "Start/Stop Pi RL uses local SSH from this GUI app. "
+            "Keep at least one valid profile configured."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(f"color:{C.text2}; font-size:11px;")
+        info.setToolTip("Remote launcher uses your local machine SSH to control Pi tmux session.")
+        lay.addWidget(info)
+
+        action_row = QHBoxLayout()
+        btn_save = QPushButton("Save Profile")
+        btn_save.setToolTip("Save current profile changes to user config file.")
+        btn_save.setStyleSheet(
+            f"background-color:{C.blue}; color:white; font-weight:600; border-radius:8px; padding:6px 14px;"
+        )
+        action_row.addWidget(btn_save)
+        action_row.addStretch(1)
+        btn_close = QPushButton("Close")
+        btn_close.setToolTip("Close dialog.")
+        btn_close.clicked.connect(dlg.accept)
+        action_row.addWidget(btn_close)
+        lay.addLayout(action_row)
+
+        new_tag = "__new__"
+
+        def _apply_auth_mode_ui():
+            mode = str(cmb_auth.currentData() or "key")
+            use_key = (mode == "key")
+            le_identity.setEnabled(use_key)
+            btn_browse_id.setEnabled(use_key)
+            le_password.setEnabled(not use_key)
+
+        def _clear_form_defaults():
+            le_name.clear()
+            le_host.clear()
+            sb_port.setValue(22)
+            le_user.clear()
+            le_remote_dir.setText("~/Desktop/RPi_Unified")
+            cmb_auth.setCurrentIndex(0)
+            le_identity.clear()
+            le_password.clear()
+            chk_set_active.setChecked(True)
+            _apply_auth_mode_ui()
+
+        def _populate_from_profile(profile_name):
+            if not profile_name or (not cfg.has_section(profile_name)):
+                _clear_form_defaults()
+                btn_delete.setEnabled(False)
+                return
+            sec = cfg[profile_name]
+            le_name.setText(profile_name)
+            le_host.setText((sec.get("host") or "").strip())
+            try:
+                port_v = int((sec.get("port") or "22").strip())
+            except Exception:
+                port_v = 22
+            sb_port.setValue(max(1, min(65535, port_v)))
+            le_user.setText((sec.get("user") or "").strip())
+            le_remote_dir.setText((sec.get("remote_dir") or "").strip())
+            identity_file = (sec.get("identity_file") or "").strip()
+            password = (sec.get("password") or "").strip()
+            if password and (not identity_file):
+                cmb_auth.setCurrentIndex(1)
+            else:
+                cmb_auth.setCurrentIndex(0)
+            le_identity.setText(identity_file)
+            le_password.setText(password)
+            chk_set_active.setChecked(self._active_profile_name(cfg) == profile_name)
+            _apply_auth_mode_ui()
+            btn_delete.setEnabled(True)
+
+        def _refresh_profiles_combo(select_name=""):
+            names = sorted(self._profile_section_names(cfg))
+            cmb_profiles.blockSignals(True)
+            cmb_profiles.clear()
+            for nm in names:
+                cmb_profiles.addItem(nm, nm)
+            cmb_profiles.addItem("New Profile...", new_tag)
+            target = (select_name or "").strip()
+            if not target:
+                target = self._active_profile_name(cfg)
+            idx = cmb_profiles.findData(target)
+            if idx < 0:
+                idx = cmb_profiles.findData(new_tag) if not names else 0
+            cmb_profiles.setCurrentIndex(max(0, idx))
+            cmb_profiles.blockSignals(False)
+            current = str(cmb_profiles.currentData() or "")
+            _populate_from_profile("" if current == new_tag else current)
+
+        def _current_selected_profile():
+            sel = str(cmb_profiles.currentData() or "").strip()
+            if sel == new_tag:
+                return ""
+            return sel
+
+        def _collect_profile_from_form(for_save=True):
+            profile_name = le_name.text().strip()
+            if for_save and (not profile_name):
+                return None, "profile name is required"
+            if profile_name.lower() == "active":
+                return None, "profile name 'active' is reserved"
+            sec_map = {
+                "host": le_host.text().strip(),
+                "user": le_user.text().strip(),
+                "remote_dir": le_remote_dir.text().strip(),
+                "port": str(int(sb_port.value())),
+                "identity_file": le_identity.text().strip() if (str(cmb_auth.currentData() or "key") == "key") else "",
+                "password": le_password.text().strip() if (str(cmb_auth.currentData() or "key") == "password") else "",
+            }
+            parsed, parse_err = self._validate_profile_entry(profile_name, sec_map, validate_identity=False)
+            if parse_err:
+                return None, parse_err
+            auth_mode = str(cmb_auth.currentData() or "key")
+            if auth_mode == "key" and parsed.get("identity_file"):
+                id_path = str(parsed.get("identity_file"))
+                if not os.path.isfile(id_path):
+                    return None, f"identity_file not found: {id_path}"
+            return parsed, None
+
+        def _save_profile():
+            parsed, parse_err = _collect_profile_from_form(for_save=True)
+            if parse_err:
+                QMessageBox.warning(dlg, "Configure Pi", parse_err)
+                return
+
+            new_name = str(parsed["profile_name"]).strip()
+            old_name = _current_selected_profile()
+            if old_name and (old_name != new_name) and cfg.has_section(new_name):
+                QMessageBox.warning(
+                    dlg,
+                    "Configure Pi",
+                    f"profile '{new_name}' already exists. Choose another name.",
+                )
+                return
+
+            if old_name and (old_name != new_name) and cfg.has_section(old_name):
+                cfg.remove_section(old_name)
+            if not cfg.has_section(new_name):
+                cfg.add_section(new_name)
+            sec = cfg[new_name]
+            sec["host"] = str(parsed["host"])
+            sec["port"] = str(int(parsed["port"]))
+            sec["user"] = str(parsed["user"])
+            sec["remote_dir"] = str(parsed["remote_dir"])
+            if parsed.get("identity_file"):
+                sec["identity_file"] = str(parsed["identity_file"])
+                sec["password"] = ""
+            else:
+                sec["identity_file"] = ""
+                sec["password"] = str(le_password.text().strip())
+
+            if not cfg.has_section("active"):
+                cfg.add_section("active")
+            if chk_set_active.isChecked() or (not self._active_profile_name(cfg)):
+                cfg.set("active", "profile", new_name)
+
+            ok, save_err = self._save_rpi_profiles_cfg(cfg)
+            if not ok:
+                QMessageBox.warning(dlg, "Configure Pi", save_err or "failed to save profile")
+                return
+            _refresh_profiles_combo(select_name=new_name)
+            self._reload_pi_profiles_ui(select_name=new_name)
+            self._set_pi_rl_remote_state(
+                f"Pi RL Remote: profile [{new_name}] saved",
+                C.green,
+                force=True,
+            )
+
+        def _delete_profile():
+            profile_name = _current_selected_profile()
+            if not profile_name:
+                return
+            reply = QMessageBox.question(
+                dlg,
+                "Delete Profile",
+                f"Delete Pi profile '{profile_name}'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            if cfg.has_section(profile_name):
+                cfg.remove_section(profile_name)
+            names = sorted(self._profile_section_names(cfg))
+            if not cfg.has_section("active"):
+                cfg.add_section("active")
+            active_name = self._active_profile_name(cfg)
+            if (not names) or (active_name == profile_name):
+                cfg.set("active", "profile", names[0] if names else "")
+            ok, save_err = self._save_rpi_profiles_cfg(cfg)
+            if not ok:
+                QMessageBox.warning(dlg, "Configure Pi", save_err or "failed to save profile")
+                return
+            next_name = names[0] if names else ""
+            _refresh_profiles_combo(select_name=next_name)
+            self._reload_pi_profiles_ui(select_name=next_name)
+            self._set_pi_rl_remote_state(
+                f"Pi RL Remote: profile [{profile_name}] deleted",
+                C.orange,
+                force=True,
+            )
+
+        def _on_profile_choice_changed(_idx):
+            selected = str(cmb_profiles.currentData() or "")
+            _populate_from_profile("" if selected == new_tag else selected)
+
+        def _switch_to_new_profile():
+            idx = cmb_profiles.findData(new_tag)
+            if idx < 0:
+                _refresh_profiles_combo(select_name="")
+                idx = cmb_profiles.findData(new_tag)
+            if idx >= 0:
+                cmb_profiles.setCurrentIndex(idx)
+                _clear_form_defaults()
+                le_name.setFocus()
+
+        def _browse_identity():
+            path, _ = QFileDialog.getOpenFileName(
+                dlg,
+                "Select SSH private key",
+                os.path.expanduser("~/.ssh"),
+                "All Files (*)",
+            )
+            if path:
+                le_identity.setText(path)
+
+        cmb_auth.currentIndexChanged.connect(_apply_auth_mode_ui)
+        cmb_profiles.currentIndexChanged.connect(_on_profile_choice_changed)
+        btn_save.clicked.connect(_save_profile)
+        btn_new.clicked.connect(_switch_to_new_profile)
+        btn_delete.clicked.connect(_delete_profile)
+        btn_browse_id.clicked.connect(_browse_identity)
+
+        _refresh_profiles_combo()
+        if auto_prompt and (not self._profile_section_names(cfg)):
+            QMessageBox.information(
+                dlg,
+                "Configure Pi",
+                "No Pi profile is configured yet.\nPlease create one to start RL remotely.",
+            )
+            _switch_to_new_profile()
+
+        dlg.exec_()
+        self._reload_pi_profiles_ui()
+
+        profile, load_err = self._load_rpi_ssh_profile()
+        return bool(profile and (load_err is None))
+
+    def _validate_profile_entry(self, profile_name, sec, validate_identity=True):
+        host = (sec.get("host") or "").strip()
+        user = (sec.get("user") or "").strip()
+        remote_dir = (sec.get("remote_dir") or "").strip()
+        password = (sec.get("password") or "").strip()
+        port_txt = (sec.get("port") or "22").strip()
+        identity_file = (sec.get("identity_file") or "").strip()
+
+        if not host or not user or not remote_dir:
+            return None, f"profile [{profile_name}] missing host/user/remote_dir"
+        try:
+            port = int(port_txt)
+        except ValueError:
+            return None, f"profile [{profile_name}] invalid port: {port_txt}"
+        if not (1 <= port <= 65535):
+            return None, f"profile [{profile_name}] port out of range: {port}"
+        if identity_file:
+            identity_file = os.path.expanduser(identity_file)
+            if validate_identity and (not os.path.isfile(identity_file)):
+                return None, f"profile [{profile_name}] identity_file not found: {identity_file}"
+        else:
+            identity_file = None
+
+        return {
+            "profile_name": profile_name,
+            "host": host,
+            "user": user,
+            "remote_dir": remote_dir,
+            "password": password or None,
+            "port": port,
+            "identity_file": identity_file,
+        }, None
+
+    def _load_rpi_ssh_profile(self, profile_name=None):
+        cfg, err = self._load_rpi_profiles_cfg()
+        if err:
+            return None, err
+
+        names = self._profile_section_names(cfg)
+        if not names:
+            return None, "no Pi profile configured"
+
+        if profile_name is None and hasattr(self, "cmb_pi_profile"):
+            profile_name = (self.cmb_pi_profile.currentData() or "").strip()
+        if not profile_name:
+            profile_name = self._active_profile_name(cfg)
+        if not profile_name or (not cfg.has_section(profile_name)):
+            profile_name = names[0]
+
+        sec = cfg[profile_name]
+        return self._validate_profile_entry(profile_name, sec, validate_identity=True)
+
+    def _build_ssh_command(self, remote_body, profile=None):
+        if profile is None:
+            profile, err = self._load_rpi_ssh_profile()
+            if err:
+                return None, None, err
+
+        ssh_cmd = [
+            "ssh",
+            "-p", str(profile["port"]),
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "LogLevel=ERROR",
+        ]
+        if profile.get("identity_file"):
+            ssh_cmd.extend(["-i", str(profile["identity_file"])])
+        ssh_cmd.append(f"{profile['user']}@{profile['host']}")
+        ssh_cmd.append(f"bash -lc {shlex.quote(remote_body)}")
+
+        password = profile.get("password")
+        if password:
+            if shutil.which("sshpass") is None:
+                return None, profile, "sshpass not found; install sshpass or use SSH key login"
+            ssh_cmd = ["sshpass", "-p", str(password)] + ssh_cmd
+
+        return ssh_cmd, profile, None
+
+    def _dispatch_async_job(self, job_type, cmd, timeout_s=RPI_RL_SSH_TIMEOUT_S, meta=None):
+        if meta is None:
+            meta = {}
+        job_id = int(self._async_job_next_id)
+        self._async_job_next_id += 1
+        self._async_job_active[job_id] = {"type": str(job_type), "meta": dict(meta)}
+
+        def _worker():
+            t0 = time.time()
+            result = {
+                "job_id": job_id,
+                "type": str(job_type),
+                "meta": dict(meta),
+                "returncode": -999,
+                "stdout": "",
+                "stderr": "",
+                "elapsed_s": 0.0,
+            }
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=float(timeout_s),
+                    check=False,
+                )
+                result["returncode"] = int(proc.returncode)
+                result["stdout"] = proc.stdout or ""
+                result["stderr"] = proc.stderr or ""
+            except subprocess.TimeoutExpired as exc:
+                result["returncode"] = -124
+                result["stdout"] = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
+                result["stderr"] = (exc.stderr or "") if isinstance(exc.stderr, str) else "timeout"
+            except Exception as exc:
+                result["returncode"] = -999
+                result["stderr"] = str(exc)
+            result["elapsed_s"] = max(0.0, time.time() - t0)
+            self._async_job_result_q.put(result)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return job_id
+
+    @staticmethod
+    def _first_nonempty_line(*texts):
+        for txt in texts:
+            if not txt:
+                continue
+            for ln in str(txt).splitlines():
+                ln = ln.strip()
+                if ln:
+                    return ln
+        return ""
+
+    def _build_pi_rl_start_body(self, profile, nn_type):
+        session_q = shlex.quote(self._pi_rl_tmux_session)
+        remote_dir = str(profile["remote_dir"]).rstrip("/")
+        remote_dir_q = shlex.quote(remote_dir)
+        rl_script_q = shlex.quote(f"{remote_dir}/RL_controller_torch.py")
+        nn_q = shlex.quote(str(nn_type))
+        run_body = (
+            f"cd {remote_dir_q} && "
+            f"source ~/venvs/pytorch-env/bin/activate && "
+            f"python RL_controller_torch.py --nn {nn_q}"
+        )
+        return (
+            "set -e; "
+            "if ! command -v tmux >/dev/null 2>&1; then echo '__ERR__:tmux not found'; exit 101; fi; "
+            f"if [ ! -d {remote_dir_q} ]; then echo '__ERR__:remote_dir missing'; exit 102; fi; "
+            f"if [ ! -f {rl_script_q} ]; then echo '__ERR__:RL_controller_torch.py missing'; exit 103; fi; "
+            "if [ ! -f ~/venvs/pytorch-env/bin/activate ]; then echo '__ERR__:venv activate missing'; exit 104; fi; "
+            f"tmux kill-session -t {session_q} 2>/dev/null || true; "
+            f"tmux new-session -d -s {session_q} bash -lc {shlex.quote(run_body)}; "
+            "sleep 0.25; "
+            f"if tmux has-session -t {session_q} 2>/dev/null; then echo '__OK__:started'; else echo '__ERR__:tmux start failed'; exit 105; fi"
+        )
+
+    def _build_pi_rl_stop_body(self):
+        session_q = shlex.quote(self._pi_rl_tmux_session)
+        return f"tmux kill-session -t {session_q} 2>/dev/null || true; echo '__OK__:stopped'"
+
+    def _build_pi_rl_poll_body(self):
+        session_q = shlex.quote(self._pi_rl_tmux_session)
+        return (
+            f"if tmux has-session -t {session_q} 2>/dev/null; then "
+            "echo '__STATE__:RUNNING'; "
+            f"tmux capture-pane -pt {session_q} -S -120; "
+            "else "
+            "echo '__STATE__:STOPPED'; "
+            "fi"
+        )
+
+    def _on_pi_rl_start_clicked(self, nn_type):
+        if self._pi_rl_cmd_inflight:
+            return
+        nn_type = str(nn_type).strip()
+        if nn_type not in ("lstm_leg_dcp", "lstm_pd"):
+            self._set_pi_rl_remote_state(f"Pi RL Remote: unsupported nn '{nn_type}'", C.red, force=True)
+            return
+        profile, err = self._load_rpi_ssh_profile()
+        if err and ("no pi profile configured" in str(err).lower()):
+            self._set_pi_rl_remote_state(
+                "Pi RL Remote: no profile configured, opening Configure Pi...",
+                C.orange,
+                force=True,
+            )
+            ok = self._on_configure_pi_clicked(auto_prompt=True)
+            if ok:
+                profile, err = self._load_rpi_ssh_profile()
+        if err or profile is None:
+            self._set_pi_rl_remote_state(f"Pi RL Remote: {err}", C.red, force=True)
+            return
+        ssh_cmd, profile, err = self._build_ssh_command(
+            self._build_pi_rl_start_body(profile, nn_type),
+            profile=profile,
+        )
+        if err:
+            self._set_pi_rl_remote_state(f"Pi RL Remote: {err}", C.red, force=True)
+            return
+
+        self._pi_rl_cmd_inflight = True
+        self._set_pi_rl_remote_buttons_enabled(False)
+        self._set_pi_rl_remote_state(
+            f"Pi RL Remote: starting {nn_type} on [{profile['profile_name']}]...",
+            C.orange,
+            force=True,
+        )
+        self._queue_align_event(f"pi_rl_start_req:{nn_type}")
+        self._dispatch_async_job(
+            "pi_rl_start",
+            ssh_cmd,
+            timeout_s=RPI_RL_SSH_TIMEOUT_S,
+            meta={"nn_type": nn_type, "profile_name": profile["profile_name"]},
+        )
+
+    def _on_pi_rl_stop_clicked(self):
+        if self._pi_rl_cmd_inflight:
+            return
+        ssh_cmd, profile, err = self._build_ssh_command(self._build_pi_rl_stop_body())
+        if err:
+            self._set_pi_rl_remote_state(f"Pi RL Remote: {err}", C.red, force=True)
+            return
+        self._pi_rl_cmd_inflight = True
+        self._set_pi_rl_remote_buttons_enabled(False)
+        self._set_pi_rl_remote_state(
+            f"Pi RL Remote: stopping on [{profile['profile_name']}]...",
+            C.orange,
+            force=True,
+        )
+        self._queue_align_event("pi_rl_stop_req")
+        self._dispatch_async_job(
+            "pi_rl_stop",
+            ssh_cmd,
+            timeout_s=RPI_RL_SSH_TIMEOUT_S,
+            meta={"profile_name": profile["profile_name"]},
+        )
+
+    def _parse_pi_rl_poll_output(self, stdout_text):
+        out = stdout_text or ""
+        lines = out.splitlines()
+        state = "UNKNOWN"
+        body_lines = []
+        for i, raw_ln in enumerate(lines):
+            ln = raw_ln.strip()
+            if ln.startswith("__STATE__:"):
+                state = ln.split(":", 1)[1].strip().upper()
+                body_lines = lines[i + 1:]
+                break
+        if not body_lines:
+            body_lines = lines
+
+        nn_found = ""
+        pat_nn = re.compile(r"NN_TYPE\s*=\s*([A-Za-z0-9_]+)")
+        pat_arg = re.compile(r"--nn\s+([A-Za-z0-9_]+)")
+        for ln in reversed(body_lines):
+            m = pat_nn.search(ln)
+            if m:
+                nn_found = m.group(1)
+                break
+            m2 = pat_arg.search(ln)
+            if m2:
+                nn_found = m2.group(1)
+                break
+
+        err_hint = ""
+        text_blob = "\n".join(body_lines)
+        if "Traceback (most recent call last)" in text_blob:
+            err_hint = "traceback detected"
+        else:
+            err_pat = re.compile(r"(error|exception|failed|not found|No module named)", re.IGNORECASE)
+            for ln in reversed(body_lines):
+                ls = ln.strip()
+                if ls and err_pat.search(ls):
+                    err_hint = ls[:140]
+                    break
+        return state, nn_found, err_hint
+
+    def _drain_async_jobs(self):
+        while True:
+            try:
+                res = self._async_job_result_q.get_nowait()
+            except queue.Empty:
+                break
+            job_id = int(res.get("job_id", -1))
+            self._async_job_active.pop(job_id, None)
+            job_type = str(res.get("type", ""))
+            rc = int(res.get("returncode", -999))
+            out = str(res.get("stdout", "") or "")
+            err = str(res.get("stderr", "") or "")
+            meta = res.get("meta", {}) or {}
+
+            if job_type == "pi_rl_start":
+                self._pi_rl_cmd_inflight = False
+                self._set_pi_rl_remote_buttons_enabled(True)
+                nn_type = str(meta.get("nn_type", "") or "")
+                prof = str(meta.get("profile_name", "") or "")
+                if rc == 0 and "__OK__:started" in out:
+                    self._pi_rl_remote_running = True
+                    self._pi_rl_remote_nn = nn_type
+                    self._pi_rl_remote_last_error = ""
+                    self._set_pi_rl_remote_state(
+                        f"Pi RL Remote: RUNNING ({nn_type}) on [{prof}]",
+                        C.green,
+                        force=True,
+                    )
+                    nn_tag = "RLONPD" if nn_type == "lstm_pd" else "RLONLDC"
+                    self._queue_align_event(f"pi_rl_started:{nn_type}", pi_tag=nn_tag)
+                    self._pi_rl_remote_last_poll_ts = 0.0
+                else:
+                    msg = self._first_nonempty_line(out, err) or f"start failed (rc={rc})"
+                    self._pi_rl_remote_running = False
+                    self._pi_rl_remote_last_error = msg
+                    self._set_pi_rl_remote_state(
+                        f"Pi RL Remote: start failed | {msg}",
+                        C.red,
+                        force=True,
+                    )
+                    self._queue_align_event("pi_rl_start_failed")
+
+            elif job_type == "pi_rl_stop":
+                self._pi_rl_cmd_inflight = False
+                self._set_pi_rl_remote_buttons_enabled(True)
+                if rc == 0:
+                    self._pi_rl_remote_running = False
+                    self._pi_rl_remote_last_error = ""
+                    self._set_pi_rl_remote_state("Pi RL Remote: STOPPED", C.text2, force=True)
+                    self._queue_align_event("pi_rl_stopped", pi_tag="RLOFF")
+                else:
+                    msg = self._first_nonempty_line(out, err) or f"stop failed (rc={rc})"
+                    self._pi_rl_remote_last_error = msg
+                    self._set_pi_rl_remote_state(
+                        f"Pi RL Remote: stop failed | {msg}",
+                        C.red,
+                        force=True,
+                    )
+                    self._queue_align_event("pi_rl_stop_failed")
+
+            elif job_type == "pi_rl_poll":
+                self._pi_rl_poll_inflight = False
+                if rc != 0:
+                    msg = self._first_nonempty_line(err, out) or f"poll failed (rc={rc})"
+                    self._pi_rl_remote_last_error = msg
+                    self._set_pi_rl_remote_state(
+                        f"Pi RL Remote: poll error | {msg}",
+                        C.red,
+                    )
+                    continue
+
+                state, nn_found, err_hint = self._parse_pi_rl_poll_output(out)
+                if nn_found:
+                    self._pi_rl_remote_nn = nn_found
+                if state == "RUNNING":
+                    self._pi_rl_remote_running = True
+                    if err_hint:
+                        self._pi_rl_remote_last_error = err_hint
+                        nn_txt = self._pi_rl_remote_nn if self._pi_rl_remote_nn else "--"
+                        self._set_pi_rl_remote_state(
+                            f"Pi RL Remote: RUNNING ({nn_txt}) | {err_hint}",
+                            C.orange,
+                        )
+                    else:
+                        self._pi_rl_remote_last_error = ""
+                        nn_txt = self._pi_rl_remote_nn if self._pi_rl_remote_nn else "--"
+                        self._set_pi_rl_remote_state(
+                            f"Pi RL Remote: RUNNING ({nn_txt})",
+                            C.green,
+                        )
+                elif state == "STOPPED":
+                    self._pi_rl_remote_running = False
+                    self._set_pi_rl_remote_state("Pi RL Remote: STOPPED", C.text2)
+                else:
+                    self._set_pi_rl_remote_state("Pi RL Remote: state unknown", C.orange)
+
+    def _maybe_poll_pi_rl_remote(self, now=None, force=False):
+        if now is None:
+            now = time.time()
+        if (not force) and (self._algo_select != ALGO_RL) and (not self._pi_rl_remote_running):
+            return
+        if self._pi_rl_cmd_inflight or self._pi_rl_poll_inflight:
+            return
+        if (not force) and (now - self._pi_rl_remote_last_poll_ts) < RPI_RL_POLL_INTERVAL_S:
+            return
+
+        ssh_cmd, profile, err = self._build_ssh_command(self._build_pi_rl_poll_body())
+        self._pi_rl_remote_last_poll_ts = now
+        if err:
+            self._set_pi_rl_remote_state(f"Pi RL Remote: {err}", C.red)
+            return
+
+        self._pi_rl_poll_inflight = True
+        self._dispatch_async_job(
+            "pi_rl_poll",
+            ssh_cmd,
+            timeout_s=RPI_RL_SSH_TIMEOUT_S,
+            meta={"profile_name": profile["profile_name"]},
+        )
 
     def _build_rl_passthrough(self):
         """Pack RL runtime tuning payload for BLE payload[58:98]."""
@@ -1645,6 +2783,7 @@ class MainWindow(QWidget):
         """Apply RL button: send staged RL params to RPi via BLE passthrough."""
         if not (self.connected and self.ser):
             return
+        self._queue_align_event("rl_apply", pi_tag="RLAPPLY")
         self._tx_params()
         self._update_rl_filter_state_label()
         # Re-affirm motor direction after RPi params are sent
@@ -1951,7 +3090,16 @@ class MainWindow(QWidget):
 
     def _on_algo_confirm(self):
         self._algo_select = self._algo_pending
-        print(f"[GUI] Algorithm CONFIRMED: {ALGO_NAMES.get(self._algo_select, '?')}")
+        algo_name = ALGO_NAMES.get(self._algo_select, '?')
+        print(f"[GUI] Algorithm CONFIRMED: {algo_name}")
+        algo_tag_map = {
+            "EG": "ALG_EG",
+            "Samsung": "ALG_SAM",
+            "RL": "ALG_RL",
+            "SOGI": "ALG_SOGI",
+            "Test": "ALG_TEST",
+        }
+        self._queue_align_event(f"algo_apply:{algo_name}", pi_tag=algo_tag_map.get(algo_name))
         self._update_rl_filter_state_label()
         if self.connected and self.ser:
             # Send a short burst to survive occasional BLE/UART frame loss.
@@ -2100,6 +3248,14 @@ class MainWindow(QWidget):
         self._mile_index = (self._mile_index + 1) % len(self._mile_values)
         self.btn_auto_mile.setText(f"Auto Mile ({self._mile_values[self._mile_index]})")
 
+    def _on_align_mark_clicked(self):
+        mark_id = int(self._align_mark_counter)
+        self._align_mark_counter += 1
+        event_name = f"manual_align:{mark_id:03d}"
+        pi_tag = f"ALN{mark_id % 1000:03d}"
+        self._queue_align_event(event_name, pi_tag=pi_tag)
+        self.lbl_status.setText(f"Align mark inserted: {event_name} (pi_tag={pi_tag})")
+
     def _clear_buffers(self):
         self._init_buffers()
         self._prev_L_angle = 0.0
@@ -2166,6 +3322,12 @@ class MainWindow(QWidget):
         self.R_pwr_buf.append(R_pwr * vR)
 
         if log_csv and hasattr(self, '_csv_writer'):
+            now_wall = time.time()
+            event_txt = ""
+            if self._align_events_pending:
+                event_txt = " | ".join(self._align_events_pending)
+                self._align_events_pending.clear()
+            rx_tag_text = self._last_rx_tag_text if self._last_rx_tag_text else self._last_rx_tag_char
             self._csv_writer.writerow([
                 f'{float(t):.3f}',
                 f'{float(L_angle):.3f}', f'{float(R_angle):.3f}',
@@ -2174,8 +3336,30 @@ class MainWindow(QWidget):
                 f'{float(L_vel):.3f}',   f'{float(R_vel):.3f}',
                 f'{L_pwr:.4f}',   f'{R_pwr:.4f}',
                 f'{float(gait_freq):.3f}',
+                f'{float(self._uplink_t_unwrapped_s):.3f}',
+                f'{now_wall:.6f}',
+                f'{(now_wall - float(self._csv_start_wall_time)):.3f}',
+                str(int(self._csv_sample_idx)),
+                str(self._csv_session_id),
+                ALGO_NAMES.get(self._algo_select, "?"),
+                str(self._current_tag),
+                str(self._last_rx_tag_char),
+                str(rx_tag_text),
+                str(event_txt),
+                str(int(self._rl_cfg_tx_seq)),
+                str(int(1 if self._rpi_online else 0)),
+                str(int(self._rpi_status_version)),
+                str(int(self._rpi_nn_type)),
+                f'{float(self._rpi_delay_ms_L):.3f}',
+                f'{float(self._rpi_delay_ms_R):.3f}',
+                f'{float(self._rpi_power_ratio_L):.6f}',
+                f'{float(self._rpi_power_ratio_R):.6f}',
+                f'{float(self._rpi_pos_per_s_L):.4f}',
+                f'{float(self._rpi_pos_per_s_R):.4f}',
+                f'{float(self._rpi_neg_per_s_L):.4f}',
+                f'{float(self._rpi_neg_per_s_R):.4f}',
             ])
-            now_wall = time.time()
+            self._csv_sample_idx += 1
             if now_wall - self._csv_last_flush > 1.0:
                 self._csv_file.flush()
                 self._csv_last_flush = now_wall
@@ -2286,6 +3470,7 @@ class MainWindow(QWidget):
         self.setStyleSheet(qss)
         # Force one-pass style refresh for IMU badges after theme swap.
         self._imu_ok_state_cache = [None] * 6
+        self._imu_batt_style_cache = [None] * 6
 
         # Update cards
         for card in self._cards:
@@ -2422,6 +3607,62 @@ class MainWindow(QWidget):
                 background-color: {C.separator};
             }}
         """)
+        if hasattr(self, "btn_pi_profile_cfg"):
+            self.btn_pi_profile_cfg.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {C.fill};
+                    color: {C.text};
+                    border: none;
+                    border-radius: 8px;
+                    font-weight: 600;
+                    font-size: 12px;
+                    padding: 4px 10px;
+                }}
+                QPushButton:hover {{ background-color: {C.separator}; }}
+            """)
+        if hasattr(self, "btn_pi_rl_start_legdcp"):
+            self.btn_pi_rl_start_legdcp.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {C.fill};
+                    color: {C.text};
+                    border: none;
+                    border-radius: 8px;
+                    font-weight: 600;
+                    font-size: 12px;
+                    padding: 4px 10px;
+                }}
+                QPushButton:hover {{ background-color: {C.separator}; }}
+            """)
+        if hasattr(self, "btn_pi_rl_start_pd"):
+            self.btn_pi_rl_start_pd.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {C.fill};
+                    color: {C.text};
+                    border: none;
+                    border-radius: 8px;
+                    font-weight: 600;
+                    font-size: 12px;
+                    padding: 4px 10px;
+                }}
+                QPushButton:hover {{ background-color: {C.separator}; }}
+            """)
+        if hasattr(self, "btn_pi_rl_stop"):
+            self.btn_pi_rl_stop.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {C.red};
+                    color: white;
+                    border: none;
+                    border-radius: 8px;
+                    font-weight: 600;
+                    font-size: 12px;
+                    padding: 4px 10px;
+                }}
+                QPushButton:hover {{ background-color: #e02a20; }}
+            """)
+        if hasattr(self, "lbl_pi_rl_remote_state"):
+            txt = self.lbl_pi_rl_remote_state.text()
+            self._pi_rl_remote_status_sig = None
+            self._set_pi_rl_remote_state(txt, self._infer_pi_rl_remote_color(txt), force=True)
         if hasattr(self, "note_raw_data"):
             self.note_raw_data.setStyleSheet(
                 f"background:{C.fill}; border:1px solid {C.teal}; border-radius:4px;")
@@ -2430,6 +3671,10 @@ class MainWindow(QWidget):
                 f"color:{C.text2}; font-size:11px; background:transparent; padding-top:2px;"
             )
             self._update_rl_filter_state_label()
+        if hasattr(self, "lbl_imu_batt_title"):
+            self.lbl_imu_batt_title.setStyleSheet(
+                f"color:{C.text2}; font-size:11px; font-weight:600; background:transparent;"
+            )
 
         # Section labels
         for lbl in _section_labels:
@@ -2445,6 +3690,30 @@ class MainWindow(QWidget):
         self.lbl_tag_timer.setStyleSheet(f"font-size:13px; font-weight:400; background:transparent; color:{C.text2};")
         self.lbl_tag_rx.setStyleSheet(f"font-size:13px; font-weight:400; background:transparent; color:{C.text2};")
         self.lbl_tag_gait.setStyleSheet(f"font-size:13px; font-weight:400; background:transparent; color:{C.text2};")
+        self.lbl_replay_progress_cur.setStyleSheet(
+            f"font-size:11px; color:{C.text2}; background:transparent; min-width:56px;")
+        self.lbl_replay_progress_total.setStyleSheet(
+            f"font-size:11px; color:{C.text2}; background:transparent; min-width:64px;")
+        self.lbl_replay_progress_rows.setStyleSheet(
+            f"font-size:11px; color:{C.text2}; background:transparent;")
+        self.sld_replay_progress.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                height: 6px;
+                background: {C.fill};
+                border-radius: 3px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: {C.blue};
+                border-radius: 3px;
+            }}
+            QSlider::handle:horizontal {{
+                width: 12px;
+                margin: -4px 0;
+                background: {C.text};
+                border-radius: 6px;
+            }}
+        """)
+        self._set_replay_load_btn_active(self._replay_mode)
 
         # Re-apply power style
         self._set_power_ui(self.btn_power.isChecked())
@@ -2922,16 +4191,110 @@ class MainWindow(QWidget):
 
         return resolved
 
+    def _format_replay_time(self, t_s):
+        t = max(0.0, float(t_s))
+        h = int(t // 3600.0)
+        m = int((t % 3600.0) // 60.0)
+        s = t - (h * 3600.0 + m * 60.0)
+        if h > 0:
+            return f"{h:d}:{m:02d}:{s:04.1f}"
+        return f"{m:02d}:{s:04.1f}"
+
+    def _set_replay_load_btn_active(self, active: bool):
+        if active:
+            self.btn_replay_load.setStyleSheet(f"""
+                QPushButton {{
+                    font-size:11px; padding:2px 8px; font-weight:700;
+                    color:white; background-color:{C.green};
+                    border:none; border-radius:8px;
+                }}
+                QPushButton:hover {{ background-color:#25b44d; }}
+            """)
+        else:
+            self.btn_replay_load.setStyleSheet(f"""
+                QPushButton {{
+                    font-size:11px; padding:2px 8px; font-weight:600;
+                    color:{C.text}; background-color:{C.fill};
+                    border:none; border-radius:8px;
+                }}
+                QPushButton:hover {{ background-color:{C.separator}; }}
+            """)
+
     def _set_replay_controls_active(self, active: bool):
         self.btn_replay_pause.setEnabled(active)
         self.btn_replay_rw.setEnabled(active)
         self.btn_replay_ff.setEnabled(active)
         self.btn_replay_stop.setEnabled(active)
+        self.sld_replay_progress.setEnabled(active)
         if not active:
             self.btn_replay_pause.blockSignals(True)
             self.btn_replay_pause.setChecked(False)
             self.btn_replay_pause.blockSignals(False)
             self.btn_replay_pause.setText("Pause")
+        self._set_replay_load_btn_active(bool(active))
+        self._update_replay_progress_ui(force=True)
+
+    def _set_replay_finished(self, finished: bool):
+        self._replay_finished = bool(finished)
+        if self._replay_finished:
+            self._replay_paused = True
+            self.btn_replay_pause.blockSignals(True)
+            self.btn_replay_pause.setChecked(True)
+            self.btn_replay_pause.blockSignals(False)
+            self.btn_replay_pause.setText("Ended")
+        else:
+            self.btn_replay_pause.setText("Resume" if self._replay_paused else "Pause")
+
+    def _update_replay_progress_ui(self, force=False):
+        if not hasattr(self, "sld_replay_progress"):
+            return
+        if not self._replay_mode or not self._replay_samples:
+            self.lbl_replay_progress_cur.setText("--:--")
+            self.lbl_replay_progress_total.setText("/ --:--")
+            self.lbl_replay_progress_rows.setText("[--/--]")
+            if force or (not self._replay_slider_dragging):
+                self._replay_slider_internal = True
+                self.sld_replay_progress.setValue(0)
+                self._replay_slider_internal = False
+            return
+
+        total = len(self._replay_samples)
+        t_end = float(self._replay_time_axis[-1]) if self._replay_time_axis else float(self._replay_samples[-1][0])
+        t_cur = max(0.0, min(float(self._replay_play_t), t_end if t_end > 0.0 else float(self._replay_play_t)))
+        idx_show = min(total, max(0, int(self._replay_idx)))
+
+        self.lbl_replay_progress_cur.setText(self._format_replay_time(t_cur))
+        self.lbl_replay_progress_total.setText(f"/ {self._format_replay_time(t_end)}")
+        self.lbl_replay_progress_rows.setText(f"[{idx_show}/{total}]")
+
+        if (not self._replay_slider_dragging) or force:
+            pos = 0
+            if t_end > 1e-9:
+                pos = int(round((t_cur / t_end) * REPLAY_PROGRESS_STEPS))
+            pos = max(0, min(REPLAY_PROGRESS_STEPS, pos))
+            self._replay_slider_internal = True
+            self.sld_replay_progress.setValue(pos)
+            self._replay_slider_internal = False
+
+    def _on_replay_slider_pressed(self):
+        self._replay_slider_dragging = True
+
+    def _on_replay_slider_released(self):
+        self._replay_slider_dragging = False
+        self._update_replay_progress_ui(force=True)
+
+    def _on_replay_slider_moved(self, value):
+        if self._replay_slider_internal:
+            return
+        if not self._replay_mode or not self._replay_samples:
+            return
+        t_end = float(self._replay_time_axis[-1]) if self._replay_time_axis else float(self._replay_samples[-1][0])
+        if t_end <= 1e-9:
+            target_t = 0.0
+        else:
+            target_t = (max(0, min(REPLAY_PROGRESS_STEPS, int(value))) / float(REPLAY_PROGRESS_STEPS)) * t_end
+        self._seek_replay_time(target_t)
+        self._update_replay_progress_ui(force=True)
 
     def _set_replay_status(self, text, force=False):
         now = time.time()
@@ -3009,12 +4372,14 @@ class MainWindow(QWidget):
         self._replay_csv_path = csv_path
         self._replay_mode = True
         self._replay_paused = False
+        self._replay_finished = False
         self._replay_idx = 0
         self._replay_play_t = 0.0
         self._replay_last_wall_time = time.time()
         self._replay_status_last_ts = 0.0
         self._clear_buffers()
         self._set_replay_controls_active(True)
+        self._set_replay_finished(False)
         self.btn_replay_pause.blockSignals(True)
         self.btn_replay_pause.setChecked(False)
         self.btn_replay_pause.blockSignals(False)
@@ -3026,6 +4391,7 @@ class MainWindow(QWidget):
             force=True,
         )
         self._consume_replay_samples(max_steps=1, budget_ms=1.0)
+        self._update_replay_progress_ui(force=True)
         self._maybe_render_plot(force=True)
 
     def _stop_replay(self, finished=False):
@@ -3038,6 +4404,8 @@ class MainWindow(QWidget):
         self._replay_idx = 0
         self._replay_play_t = 0.0
         self._replay_last_wall_time = 0.0
+        self._replay_finished = False
+        self._replay_slider_dragging = False
         self._set_replay_controls_active(False)
         if finished and csv_name:
             self.lbl_status.setText(f"Replay finished: {csv_name}")
@@ -3071,6 +4439,14 @@ class MainWindow(QWidget):
             self.btn_replay_pause.blockSignals(False)
             self.btn_replay_pause.setText("Pause")
             return
+        if self._replay_finished and (not checked):
+            # Keep replay in ended-hold state until user seeks/rewinds or presses Stop.
+            self.btn_replay_pause.blockSignals(True)
+            self.btn_replay_pause.setChecked(True)
+            self.btn_replay_pause.blockSignals(False)
+            self.btn_replay_pause.setText("Ended")
+            self._set_replay_status("Replay finished. Drag timeline / rewind or press Stop.", force=True)
+            return
         self._replay_paused = bool(checked)
         self.btn_replay_pause.setText("Resume" if self._replay_paused else "Pause")
         self._replay_last_wall_time = time.time()
@@ -3079,6 +4455,7 @@ class MainWindow(QWidget):
                 f"Replay paused: {self._replay_idx}/{len(self._replay_samples)}",
                 force=True,
             )
+        self._update_replay_progress_ui(force=True)
 
     def _on_replay_speed_changed(self, _index):
         text = self.cmb_replay_speed.currentText().strip().lower().replace('x', '')
@@ -3102,11 +4479,13 @@ class MainWindow(QWidget):
         self._clear_buffers()
         if target_idx < 0:
             self._replay_idx = 0
+            self._set_replay_finished(False)
             self._replay_last_wall_time = time.time()
             self._set_replay_status(
                 f"Replay seek to t={self._replay_play_t:.2f}s ({self._replay_speed:.1f}x)",
                 force=True,
             )
+            self._update_replay_progress_ui(force=True)
             self._maybe_render_plot(force=True)
             return
 
@@ -3114,11 +4493,13 @@ class MainWindow(QWidget):
         for i in range(start_idx, target_idx + 1):
             self._apply_replay_sample(self._replay_samples[i], i, total)
         self._replay_idx = target_idx + 1
+        self._set_replay_finished(self._replay_idx >= total)
         self._replay_last_wall_time = time.time()
         self._set_replay_status(
             f"Replay seek to t={self._replay_play_t:.2f}s ({self._replay_speed:.1f}x)",
             force=True,
         )
+        self._update_replay_progress_ui(force=True)
         self._maybe_render_plot(force=True)
 
     def _on_replay_rewind(self):
@@ -3132,6 +4513,7 @@ class MainWindow(QWidget):
                 f"({self._replay_speed:.1f}x)",
                 force=True,
             )
+        self._update_replay_progress_ui(force=True)
 
     def _on_replay_fast_forward(self):
         if not self._replay_mode or not self._replay_samples:
@@ -3145,6 +4527,7 @@ class MainWindow(QWidget):
                 f"({self._replay_speed:.1f}x)",
                 force=True,
             )
+        self._update_replay_progress_ui(force=True)
 
     def _on_replay_stop_clicked(self):
         if not self._replay_mode:
@@ -3180,7 +4563,16 @@ class MainWindow(QWidget):
                 force=False,
             )
         if self._replay_idx >= total:
-            self._stop_replay(finished=True)
+            t_end = float(self._replay_time_axis[-1]) if self._replay_time_axis else float(self._replay_samples[-1][0])
+            self._replay_play_t = t_end
+            self._set_replay_finished(True)
+            self._set_replay_status(
+                f"Replay finished at {self._format_replay_time(t_end)}. Press Stop to exit replay mode.",
+                force=True,
+            )
+        else:
+            self._set_replay_finished(False)
+        self._update_replay_progress_ui(force=False)
         return steps, last_idx, last_t, total
 
     def _update_replay(self, now):
@@ -3195,13 +4587,16 @@ class MainWindow(QWidget):
                 pass
         if self._replay_paused:
             self._replay_last_wall_time = now
+            self._update_replay_progress_ui(force=False)
             return
         dt = now - self._replay_last_wall_time if self._replay_last_wall_time > 0 else 0.02
         self._replay_last_wall_time = now
         if dt < 0.0:
             dt = 0.02
-        self._replay_play_t += dt * self._replay_speed
+        t_end = float(self._replay_time_axis[-1]) if self._replay_time_axis else float(self._replay_samples[-1][0])
+        self._replay_play_t = min(t_end, self._replay_play_t + dt * self._replay_speed)
         self._consume_replay_samples()
+        self._update_replay_progress_ui(force=False)
         self._maybe_render_plot(now)
 
     def _apply_replay_sample(self, sample, _idx, _total):
@@ -3655,57 +5050,101 @@ class MainWindow(QWidget):
         self.plot_layout.addWidget(val_card)
 
     # ================================================================ Serial
+    def _on_serial_connected(self, port, now=None):
+        if now is None:
+            now = time.time()
+        self.connected = True
+        self._rx_buf.clear()
+        self._last_rx_time = now
+        self._conn_healthy = True
+        self._last_connected_port = port
+        self._last_auto_connect_port = port
+        self._last_auto_connect_err_sig = None
+        self._uplink_prev_t_cs = None
+        self._uplink_wrap_count = 0
+        self._uplink_t_unwrapped_s = 0.0
+        idx = self.cmb_port.findText(port)
+        if idx >= 0:
+            self.cmb_port.setCurrentIndex(idx)
+        # Reset RPi state on new connection
+        self._rpi_status_valid = False
+        self._rpi_online = False
+        self._rpi_last_rx_time = 0.0
+        self._rpi_nn_type = -1
+        self._rpi_status_version = 0
+        self._rpi_auto_delay_enable = False
+        self._rpi_auto_method_bo = False
+        self._rpi_auto_motion_valid = False
+        self._rpi_auto_motion_valid_L = False
+        self._rpi_auto_motion_valid_R = False
+        self._rpi_power_ratio = 0.0
+        self._rpi_power_ratio_L = 0.0
+        self._rpi_power_ratio_R = 0.0
+        self._rpi_pos_per_s = 0.0
+        self._rpi_pos_per_s_L = 0.0
+        self._rpi_pos_per_s_R = 0.0
+        self._rpi_neg_per_s = 0.0
+        self._rpi_neg_per_s_L = 0.0
+        self._rpi_neg_per_s_R = 0.0
+        self._rpi_best_delay_ms = 0.0
+        self._rpi_best_delay_ms_L = 0.0
+        self._rpi_best_delay_ms_R = 0.0
+        self._rpi_delay_ms_L = 0.0
+        self._rpi_delay_ms_R = 0.0
+        self._sam_auto_delay_enable = False
+        self._eg_auto_delay_enable = False
+        if hasattr(self, 'lbl_rpi_nn_type'):
+            self.lbl_rpi_nn_type.setText("RPi: waiting...")
+            self.lbl_rpi_nn_type.setStyleSheet(
+                f"color:{C.orange}; font-size:13px; font-weight:600; background:transparent;")
+            self.lbl_rpi_current_filter.setText("RPi Active: waiting for status...")
+            if hasattr(self, 'lbl_rl_auto_state'):
+                self.lbl_rl_auto_state.setText("Auto Delay: waiting for RPi status...")
+        self.conn_dot.set_state('connected')
+        self.btn_connect.setText("Connected")
+        self._set_power_ui(self.sb_max_torque_cfg.value() > 0.0)
+        self._tx_params()
+        self._queue_align_event(f"serial_connected:{port}", pi_tag="SERCON")
+
     def _connect_clicked(self):
         port = self.cmb_port.currentText()
         if not port:
             QMessageBox.warning(self, "Port", "No serial port found. Waiting for auto refresh.")
             return
         try:
+            if self.ser:
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
             self.ser = serial.Serial(port, 115200, timeout=0)
-            self.connected = True
-            self._rx_buf.clear()
-            self._last_rx_time = time.time()
-            self._conn_healthy = True
-            # Reset RPi state on new connection
-            self._rpi_status_valid = False
-            self._rpi_online = False
-            self._rpi_last_rx_time = 0.0
-            self._rpi_nn_type = -1
-            self._rpi_status_version = 0
-            self._rpi_auto_delay_enable = False
-            self._rpi_auto_method_bo = False
-            self._rpi_auto_motion_valid = False
-            self._rpi_auto_motion_valid_L = False
-            self._rpi_auto_motion_valid_R = False
-            self._rpi_power_ratio = 0.0
-            self._rpi_power_ratio_L = 0.0
-            self._rpi_power_ratio_R = 0.0
-            self._rpi_pos_per_s = 0.0
-            self._rpi_pos_per_s_L = 0.0
-            self._rpi_pos_per_s_R = 0.0
-            self._rpi_neg_per_s = 0.0
-            self._rpi_neg_per_s_L = 0.0
-            self._rpi_neg_per_s_R = 0.0
-            self._rpi_best_delay_ms = 0.0
-            self._rpi_best_delay_ms_L = 0.0
-            self._rpi_best_delay_ms_R = 0.0
-            self._rpi_delay_ms_L = 0.0
-            self._rpi_delay_ms_R = 0.0
-            self._sam_auto_delay_enable = False
-            self._eg_auto_delay_enable  = False
-            if hasattr(self, 'lbl_rpi_nn_type'):
-                self.lbl_rpi_nn_type.setText("RPi: waiting...")
-                self.lbl_rpi_nn_type.setStyleSheet(
-                    f"color:{C.orange}; font-size:13px; font-weight:600; background:transparent;")
-                self.lbl_rpi_current_filter.setText("RPi Active: waiting for status...")
-                if hasattr(self, 'lbl_rl_auto_state'):
-                    self.lbl_rl_auto_state.setText("Auto Delay: waiting for RPi status...")
-            self.conn_dot.set_state('connected')
-            self.btn_connect.setText("Connected")
-            self._set_power_ui(self.sb_max_torque_cfg.value() > 0.0)
-            self._tx_params()
-        except serial.SerialException:
+            self._on_serial_connected(port, now=time.time())
+        except (serial.SerialException, OSError):
             QMessageBox.critical(self, "Error", f"Cannot open {port}")
+
+    def _maybe_auto_connect(self, now):
+        if self.connected or (not self._auto_connect_enabled):
+            return
+        if (now - self._last_auto_connect_try_ts) < self._auto_connect_cooldown_s:
+            return
+        port = self._pick_auto_connect_port()
+        if not port:
+            return
+        self._last_auto_connect_try_ts = now
+        try:
+            if self.ser:
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+            self.ser = serial.Serial(port, 115200, timeout=0)
+            self._on_serial_connected(port, now=now)
+            self.lbl_status.setText(f"Auto-connected: {port}")
+        except (serial.SerialException, OSError) as e:
+            err_sig = (port, type(e).__name__, str(e))
+            if err_sig != self._last_auto_connect_err_sig:
+                self._last_auto_connect_err_sig = err_sig
+                self.lbl_status.setText(f"Auto-connect failed ({port}): {str(e)[:60]}")
 
     def _update_connect_btn(self, healthy):
         if not self.connected:
@@ -3780,11 +5219,21 @@ class MainWindow(QWidget):
             self._rl_last_tx_ts = time.time()
         self._update_rl_filter_state_label()
 
-    def _send_logtag(self):
-        if not (self.connected and self.ser): return
-        tag = self.edt_label.text().encode('ascii', 'ignore')[:10]
+    def _queue_align_event(self, label, pi_tag=None):
+        txt = str(label or "").strip()
+        if not txt:
+            return
+        self._align_events_pending.append(txt)
+        if pi_tag:
+            self._send_logtag_text(pi_tag, persist=False, update_current=False)
+
+    def _send_logtag_text(self, tag_text, persist=False, update_current=True):
+        if not (self.connected and self.ser):
+            return False
+        tag_raw = str(tag_text or "")
+        tag = tag_raw.encode('ascii', 'ignore')[:10]
         tag_txt = tag.decode('ascii', 'ignore').strip()
-        flags = 0x01 if self.sw_persist.isChecked() else 0x00
+        flags = 0x01 if persist else 0x00
         payload = bytearray(BLE_PAYLOAD_LEN)
         payload[0] = ord('L')
         payload[1] = ord('G')
@@ -3794,13 +5243,21 @@ class MainWindow(QWidget):
             payload[3:3+len(tag)] = tag
         header = struct.pack('<BBB', 0xA5, 0x5A, BLE_FRAME_LEN)
         self.ser.write(header + payload)
-        self._current_tag = tag_txt
-        self._tag_started_at = time.time() if tag_txt else None
-        self._update_tag_panel(self._tag_started_at if self._tag_started_at else time.time())
+        if update_current:
+            self._current_tag = tag_txt
+            self._tag_started_at = time.time() if tag_txt else None
+            self._update_tag_panel(self._tag_started_at if self._tag_started_at else time.time())
+        return True
+
+    def _send_logtag(self):
+        tag_txt = self.edt_label.text()
+        self._send_logtag_text(tag_txt, persist=self.sw_persist.isChecked(), update_current=True)
 
     # ================================================================ Main loop
     def _update_everything(self):
         now = time.time()
+        self._drain_async_jobs()
+        self._maybe_poll_pi_rl_remote(now)
         self._update_tag_panel(now)
         if self._replay_mode:
             self._update_replay(now)
@@ -3809,6 +5266,7 @@ class MainWindow(QWidget):
         if not self.connected:
             if now - self._last_port_scan > 1.0:
                 self._refresh_ports()
+            self._maybe_auto_connect(now)
             return
         if self._last_rx_time > 0 and (now - self._last_rx_time) > CONN_TIMEOUT_S:
             if self._conn_healthy:
@@ -3831,9 +5289,16 @@ class MainWindow(QWidget):
         try:
             avail = self.ser.in_waiting
         except (serial.SerialException, OSError):
+            self._queue_align_event("serial_lost")
             self.connected = False
             self._conn_healthy = False
             self._rx_buf.clear()
+            if self.ser is not None:
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
             self._update_connect_btn(False)
             return
 
@@ -3882,6 +5347,16 @@ class MainWindow(QWidget):
         L_tau_d = L_cmd_i   / 100.0
         R_tau_d = R_cmd_i   / 100.0
         t = (t_cs & 0xFFFF) / 100.0
+        t_cs_u16 = int(t_cs) & 0xFFFF
+        if self._uplink_prev_t_cs is not None:
+            dt_cs = t_cs_u16 - int(self._uplink_prev_t_cs)
+            if dt_cs < -30000:
+                self._uplink_wrap_count += 1
+            elif dt_cs > 30000:
+                # Likely Teensy timer reset/restart: resync unwrapped baseline.
+                self._uplink_wrap_count = 0
+        self._uplink_prev_t_cs = t_cs_u16
+        self._uplink_t_unwrapped_s = ((self._uplink_wrap_count * 65536) + t_cs_u16) / 100.0
 
         imu_ok_flag = payload[14]
         mt100 = struct.unpack('<h', payload[15:17])[0]
@@ -3898,6 +5373,7 @@ class MainWindow(QWidget):
         temp_R   = payload[27] if payload[27] else None
         active_algo = payload[28]
         self._last_rx_tag_char = tag_char if (tag_valid and tag_char) else ""
+        self._last_rx_tag_text = self._last_rx_tag_char
         if (not self._current_tag) and tag_valid and tag_char:
             self._current_tag = tag_char
             self._tag_started_at = time.time()
@@ -3916,6 +5392,10 @@ class MainWindow(QWidget):
         vtx2 = struct.unpack('<h', payload[43:45])[0] / 10.0
         vtx3 = struct.unpack('<h', payload[45:47])[0] / 10.0
         vtx4 = struct.unpack('<h', payload[47:49])[0] / 10.0
+        imu_batt_raw = [
+            int(payload[49]), int(payload[50]), int(payload[51]),
+            int(payload[52]), int(payload[53]), int(payload[54]),
+        ]
 
         # Velocity
         now = time.time()
@@ -4096,6 +5576,38 @@ class MainWindow(QWidget):
                 txt = f"{labels[i]}:-"
                 if self.lbl_imus[i].text() != txt:
                     self.lbl_imus[i].setText(txt)
+
+        # IMU battery labels (payload[49..54] => BATT L/R/1/2/3/4).
+        if hasattr(self, "lbl_imu_batts"):
+            for i in range(6):
+                b = imu_batt_raw[i]
+                valid_batt = (0 <= b <= 100)
+                if valid_batt:
+                    if b >= 60:
+                        color = C.green
+                        weight = "600"
+                    elif b >= 30:
+                        color = C.orange
+                        weight = "600"
+                    else:
+                        color = C.red
+                        weight = "700"
+                    txt = f"{labels[i]}:{b}%"
+                else:
+                    color = C.text2
+                    weight = "500"
+                    txt = f"{labels[i]}:--"
+
+                style_sig = (color, weight)
+                if self._imu_batt_style_cache[i] != style_sig:
+                    self.lbl_imu_batts[i].setStyleSheet(
+                        f"color:{color}; font-size:11px; font-weight:{weight}; background:transparent;"
+                    )
+                    self._imu_batt_style_cache[i] = style_sig
+
+                if self._imu_batt_cache[i] != txt:
+                    self.lbl_imu_batts[i].setText(txt)
+                    self._imu_batt_cache[i] = txt
 
         # Brand badge
         brand_names = {0: "-", 1: "SIG", 2: "TMOTOR"}

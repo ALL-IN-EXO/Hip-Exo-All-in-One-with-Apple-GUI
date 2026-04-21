@@ -20,6 +20,7 @@ public:
     float LTAVx=0, RTAVx=0;      // 左/右大腿角速度[deg/s]
     float TX1=0, TX2=0, TX3=0, TX4=0;          // 左/右大腿角度  [deg]
     float VTX1=0, VTX2=0, VTX3=0, VTX4=0;      // 左/右大腿角速度[deg/s]
+    uint8_t BattL=255, BattR=255, Batt1=255, Batt2=255, Batt3=255, Batt4=255; // 电量百分比[0-100], 255=未知
     /* 供 controller 调用的接口 */
     void INIT();          // 上电初始化（相当于 INIT()）
     void INIT_MEAN();     // 零点归一（相当于 INIT_MEAN()）
@@ -34,9 +35,12 @@ public:
 private:
     /* ——内部—— */
     void pollOneByte(HardwareSerial& port, uint8_t (&pktFunc)(uint8_t));
+    void queryBatteryRoundRobin();
     float offL = 0, offR = 0;    // 静止时零偏
     float off1 = 0, off2 = 0;    // 静止时零偏
     float off3 = 0, off4 = 0;    // 静止时零偏
     bool offset_locked = false;   // ★ 新增：offset锁
+    uint32_t batt_query_last_ms = 0;
+    uint8_t  batt_query_idx = 0;
 
 };

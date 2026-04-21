@@ -43,6 +43,17 @@ cd RPi_Unified
 python RL_controller_torch.py
 ```
 
+### GUI 远程启动依赖（Pi 端）
+
+如果使用 GUI 里的 `Start LegDcp / Start LSTM-PD / Stop Pi RL` 远程按钮，
+Pi 端需要安装 `tmux`（GUI 通过 `tmux` 托管 RL 进程）：
+
+```bash
+sudo apt update
+sudo apt install -y tmux
+tmux -V
+```
+
 ---
 
 ## 本地-树莓派自动同步 (代码下发 + 日志回传)
@@ -266,6 +277,87 @@ neg_per_s = W- / T_window             # 每秒负功 (W, ≤0)
 | `AUTO_PWR_USE_ANGLE_DIFF_VEL` | True | AutoDelay 评估速度源（角度差分/IMU原始） |
 | `AUTO_PWR_ANGLE_WRAP_DEG` | 180° | 角度差分回绕阈值 |
 | 窗口 | 8~8s | 当前默认固定 8s 窗口 |
+
+---
+
+## 功率显示链路对齐（计划 / 未实施）
+
+**状态**：设计已冻结，代码未改。记录在此是为了下次接手时可直接照做。
+
+### 背景 —— 现在 GUI 实时功率波形是偏相的
+
+GUI 面板上和"功率"相关的显示分两类：
+
+| 元件 | 数据来源 | 是否正确 |
+|---|---|---|
+| `+Ratio xx %` / `+P / −P` 文本 overlay | RPi passthru (`rpi_blob[24..39]`) | ✅ RPi 权威，τ·ω 同瞬 |
+| 紫色 Power 折线 (`L_pwr_line`/`R_pwr_line`) | GUI 本地 `L_vel_BLE × L_tau_d_BLE × π/180` (`GUI.py:3311-3312`) | ❌ 偏相 60–80ms |
+| 绿/红 Power 条带 (`_update_power_strip`) | 同上 `L_pwr_buf` | ❌ 偏相 |
+| CSV 里的 `L_pwr_W`/`R_pwr_W` | 同上 `_append_data_point` 写入 | ❌ 偏相 |
+
+**偏相根因**（详见 `Code Debug/BUG_ANALYSIS.md`）：BLE 上行单帧里的 `L_cmd_Nm` 是 RPi 几十毫秒前发的（经 Serial8→Teensy→20 Hz BLE 打包→BLE radio），而 `L_vel_dps` 是 Teensy 同帧现采的。两者相乘得到的 (τ·ω) 在 0.65 Hz 步态下有 23–47° 相移，足以让符号统计翻号。RPi 侧逐行 (cmd, vel) 是因果配对 (vel→NN→cmd)，所以 RPi CSV 的正功占比 ≈ 83 %，GUI CSV 的 ≈ 76 %。**数据本身没 bug，是 GUI 本地拼对造成的物理偏相。**
+
+### 方案 B：RPi 直接透传 `P_inst` —— 选定方案
+
+让 RPi 在每个 NN tick 算出瞬时功率 `P_inst = L_cmd_final × Lvel × (π/180)`（τ 和 ω 已经在同一行同一时刻配对），通过 40 B status passthru 发给 Teensy，Teensy **不改代码**，原样转发到 BLE 上行，GUI 直接取用。
+
+- RPi 侧：`RL_controller_torch.py:1463` 后一行加 `L_pwr_inst = L_cmd_final * Lvel * (π/180)`（右腿同理）；把这两个值塞进 `send_status`。
+- 频率：现在 `STATUS_SEND_INTERVAL = 50` 帧（2 Hz）不够，必须改成 `5`（20 Hz），和 BLE 上行同步。Serial8 占用从 ~23 % 升到 ~30 %，仍宽裕。
+- GUI 侧：`_append_data_point`（`GUI.py:3298-3322`）已经有 `power_override` 入口，原本只给 replay 用；live 模式当 `_rpi_online && algo==RL && _rpi_pwr_inst_valid` 时改走 `power_override=(pwr_inst_L, pwr_inst_R)`。非 RL 或 RPi 掉线时回退到本地算（保 DNN 等旧模式可用）。
+- Teensy 零改动，40 B passthru 透明转发。
+
+### 废弃方案 A（为什么不做）
+
+Option A 曾计划：Serial8 `PI_TORQUE_SIZE` 26→42 B，RPi 把自己用作 NN 输入的 (Lpos, Rpos, Lvel, Rvel) echo 回 Teensy，Teensy RL 模式下用 echo 值覆盖 BLE 上行里的 angle/vel 字段，这样 GUI 本地 `L_vel × L_tau_d` 自然对齐。**放弃原因**：同样的效果，B 只改两侧各几行 + 不动 Teensy，A 要改三侧而且扩协议，多此一举。
+
+### 40 B status passthru 布局变更（v3 → v4）
+
+当前 v3 布局（`RL_controller_torch.py:942` `send_status` 内注释，**勿重复改注释**）已用满 40 B，`[21..23]` 只有 3 B 空档，不够塞两个 int16。方案 B 借助"把两个精度过剩的 float32 降级成 int16"腾出 4 B：
+
+```
+v4 布局（差异字段加 ★）
+[0..1]   magic 'RL'
+[2]      version = 4          ★ 原 3
+[3]      nn_type
+[4..7]   filter_source / type_code / order / enable_mask
+[8..9]   cutoff_hz   int16 ×10      ★ 原 float32 @ 8..11；0.1 Hz 精度足够
+[10..11] scale       int16 ×1000    ★ 原 float32 @ 12..15；0.001 精度足够
+[12..13] P_inst_L    int16 ×100     ★ 新增，±327.68 W 量程
+[14..15] P_inst_R    int16 ×100     ★ 新增
+[16..17] delay_ms_L  int16 ×10
+[18..19] delay_ms_R  int16 ×10
+[20]     auto_flags
+[21..23] reserved (3 B)
+[24..25] ratio_L     int16 ×10000
+[26..27] ratio_R     int16 ×10000
+[28..29] pos_per_s_L int16 ×100
+[30..31] pos_per_s_R int16 ×100
+[32..33] neg_per_s_L int16 ×100
+[34..35] neg_per_s_R int16 ×100
+[36..37] best_delay_L int16 ×10
+[38..39] best_delay_R int16 ×10
+```
+
+量程核算：hip exo 峰值扭矩 15 Nm × 峰值角速度 ~400 °/s × π/180 ≈ 105 W，±327.68 W 充裕；cutoff 常用 20–40 Hz，int16 ×10 量程 6553 Hz；scale 常用 0.4–1.0，int16 ×1000 量程 ±32.767。
+
+### 改动清单（按顺序）
+
+1. `RL_controller_torch.py`
+   - `STATUS_SEND_INTERVAL = 50 → 5`
+   - `send_status` 加 `pwr_inst_L`, `pwr_inst_R` 入参；`buf[2] = 0x04`；按 v4 布局 `_pack_i16`
+   - 主循环 `L_cmd_final` / `R_cmd_final` 之后算 `L_pwr_inst = L_cmd_final * Lvel * (π/180)`，右腿同理；传进 `send_status`
+2. `GUI.py`
+   - 新增常量 `RPI_STATUS_VERSION_PWR_INST = 4`；`self._rpi_pwr_inst_L/_R` 状态 + `_rpi_pwr_inst_valid` + 同步超时机制（参考现有 `_rpi_status_valid` 写法）
+   - `_handle_uplink` 解析器（`GUI.py:5430` 附近）加 v4 分支：新偏移读 cutoff/scale/P_inst；v3 分支保留兼容
+   - `_append_data_point`（`GUI.py:3298-3312`）在本地计算分支前插一个条件：live+RL+valid 时走 `power_override`
+   - RPi 掉线 / status 过时 → `_rpi_pwr_inst_valid = False`，自动回退本地算
+3. Teensy：**零改动**
+4. 文档：`Docs/SYSTEM_ARCHITECTURE.md` §10.6 更新 v4 布局；`Docs/CHANGELOG.md` `[Unreleased]` 加一条
+
+### 向前兼容
+
+- 旧 RPi (v3) + 新 GUI：GUI parser 按 `version == 3` 走老分支 → `_rpi_pwr_inst_valid` 恒 False → live 模式回退本地算 → 和现在行为一致，不会崩。
+- 新 RPi (v4) + 旧 GUI：旧 parser 检查 `version >= 3` 放行后按 v3 偏移读，会把 int16 cutoff/scale 解释为错误的 float32 → 要么 NaN 要么乱码 → 旧 GUI 会因 `isfinite` 检查 `valid_sample=False`，退回到显示 0 / HOLD。不会崩但会退化。部署时应同步更新 GUI。
 
 ---
 
