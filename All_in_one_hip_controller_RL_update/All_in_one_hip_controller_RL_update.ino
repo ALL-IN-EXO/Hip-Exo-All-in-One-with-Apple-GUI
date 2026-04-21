@@ -636,6 +636,12 @@ void Transmit_ble_Data() {
   ud.VTX2_10  = (int16_t)roundf(imu.VTX2 * 10.0f);
   ud.VTX3_10  = (int16_t)roundf(imu.VTX3 * 10.0f);
   ud.VTX4_10  = (int16_t)roundf(imu.VTX4 * 10.0f);
+  ud.battL_pct = imu.BattL;
+  ud.battR_pct = imu.BattR;
+  ud.batt1_pct = imu.Batt1;
+  ud.batt2_pct = imu.Batt2;
+  ud.batt3_pct = imu.Batt3;
+  ud.batt4_pct = imu.Batt4;
 
   ble_pack_uplink(data_ble, ud);
 

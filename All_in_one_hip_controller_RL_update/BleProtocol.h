@@ -40,7 +40,13 @@
  * [46..47]   VTX2_10      int16   IMU2角速度×10 (deg/s)
  * [48..49]   VTX3_10      int16   IMU3角速度×10 (deg/s)
  * [50..51]   VTX4_10      int16   IMU4角速度×10 (deg/s)
- * [52..60]   (reserved for future Teensy data)
+ * [52]       BATT_L_pct   uint8   左腿 IMU 电量(0-100, 255=未知)
+ * [53]       BATT_R_pct   uint8   右腿 IMU 电量(0-100, 255=未知)
+ * [54]       BATT1_pct    uint8   IMU1 电量(0-100, 255=未知)
+ * [55]       BATT2_pct    uint8   IMU2 电量(0-100, 255=未知)
+ * [56]       BATT3_pct    uint8   IMU3 电量(0-100, 255=未知)
+ * [57]       BATT4_pct    uint8   IMU4 电量(0-100, 255=未知)
+ * [58..60]   (reserved for future Teensy data)
  * --- RPi 透传区 [61..100] ---
  * [61..100]  rpi_passthru  40 bytes, Teensy 不解析，原样透传
  * --- 预留 [101..127] ---
@@ -155,6 +161,7 @@ struct BleUplinkData {
   int16_t  TX1_100, TX2_100, TX3_100, TX4_100;  // IMU 1-4 angles
   int16_t  LTAVx_10, RTAVx_10;                  // Left/Right IMU angular velocity
   int16_t  VTX1_10, VTX2_10, VTX3_10, VTX4_10; // IMU 1-4 angular velocity
+  uint8_t  battL_pct, battR_pct, batt1_pct, batt2_pct, batt3_pct, batt4_pct;
 };
 
 static inline void ble_pack_uplink(uint8_t* data_ble, const BleUplinkData& d) {
@@ -200,6 +207,13 @@ static inline void ble_pack_uplink(uint8_t* data_ble, const BleUplinkData& d) {
   ble_put_i16(data_ble, 46, d.VTX2_10);
   ble_put_i16(data_ble, 48, d.VTX3_10);
   ble_put_i16(data_ble, 50, d.VTX4_10);
+  // [52..57] IMU battery percentage
+  data_ble[52] = d.battL_pct;
+  data_ble[53] = d.battR_pct;
+  data_ble[54] = d.batt1_pct;
+  data_ble[55] = d.batt2_pct;
+  data_ble[56] = d.batt3_pct;
+  data_ble[57] = d.batt4_pct;
 }
 
 // 上行 RPi 透传：Teensy 把从 Serial8 收到的数据放到 [61..100]

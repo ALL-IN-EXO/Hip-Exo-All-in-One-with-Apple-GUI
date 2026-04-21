@@ -57,6 +57,14 @@ void IMU_Adapter::INIT() {
     Cmd_19_2();            delay(200);
     Cmd_19_3();            delay(200);
     Cmd_19_4();            delay(200);
+
+    // 读取一次六路 IMU 状态（含电量字段），用于初始化电量显示。
+    Cmd_10_Left();         delay(30);
+    Cmd_10_Right();        delay(30);
+    Cmd_10_1();            delay(30);
+    Cmd_10_2();            delay(30);
+    Cmd_10_3();            delay(30);
+    Cmd_10_4();            delay(30);
 }
 
 void IMU_Adapter::INIT_MEAN() {
@@ -158,6 +166,10 @@ void IMU_Adapter::READ(){
         pollOneByte(SerialImuP3, Cmd_GetPkt_3);
     while(SerialImuP4.available())
         pollOneByte(SerialImuP4, Cmd_GetPkt_4);
+
+    // 轮询查询电量：每次只查询一路，避免一次性串口突发。
+    queryBatteryRoundRobin();
+
     LTx   = AngleXLeft  - offL;
     RTx   = AngleXRight - offR;
     LTAVx = VelXLeft;
@@ -173,6 +185,12 @@ void IMU_Adapter::READ(){
     VTX2 = VelX2;
     VTX3 = VelX3;
     VTX4 = VelX4;
+    BattL = BattLeftPct;
+    BattR = BattRightPct;
+    Batt1 = Batt1Pct;
+    Batt2 = Batt2Pct;
+    Batt3 = Batt3Pct;
+    Batt4 = Batt4Pct;
 // #if 1          // ← 改成 1 才打印！默认关
 //     static uint8_t dbg = 0;          // 每 10 帧打印一次
 //     if (++dbg >= 100) {
@@ -183,6 +201,23 @@ void IMU_Adapter::READ(){
 //         }
 //     }
 // #endif
+}
+
+void IMU_Adapter::queryBatteryRoundRobin() {
+    const uint32_t now = millis();
+    // 2Hz 查询一条状态命令，六路轮询后每路约 3s 更新一次电量。
+    if (now - batt_query_last_ms < 500) return;
+    batt_query_last_ms = now;
+
+    switch (batt_query_idx) {
+        case 0: Cmd_10_Left();  break;
+        case 1: Cmd_10_Right(); break;
+        case 2: Cmd_10_1();     break;
+        case 3: Cmd_10_2();     break;
+        case 4: Cmd_10_3();     break;
+        default: Cmd_10_4();    break;
+    }
+    batt_query_idx = (uint8_t)((batt_query_idx + 1) % 6);
 }
 
 

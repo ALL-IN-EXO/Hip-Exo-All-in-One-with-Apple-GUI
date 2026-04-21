@@ -1011,6 +1011,43 @@ void Cmd_10(void)
     Dbp("\r\nget report--\r\n");
     Cmd_PackAndTx(buf, 1);
 }
+
+void Cmd_10_Left(void)
+{
+    U8 buf[1] = {0x10};
+    Dbp("\r\nget left status--\r\n");
+    Cmd_PackAndTx_Left(buf, 1);
+}
+void Cmd_10_Right(void)
+{
+    U8 buf[1] = {0x10};
+    Dbp("\r\nget right status--\r\n");
+    Cmd_PackAndTx_Right(buf, 1);
+}
+void Cmd_10_1(void)
+{
+    U8 buf[1] = {0x10};
+    Dbp("\r\nget imu1 status--\r\n");
+    Cmd_PackAndTx_1(buf, 1);
+}
+void Cmd_10_2(void)
+{
+    U8 buf[1] = {0x10};
+    Dbp("\r\nget imu2 status--\r\n");
+    Cmd_PackAndTx_2(buf, 1);
+}
+void Cmd_10_3(void)
+{
+    U8 buf[1] = {0x10};
+    Dbp("\r\nget imu3 status--\r\n");
+    Cmd_PackAndTx_3(buf, 1);
+}
+void Cmd_10_4(void)
+{
+    U8 buf[1] = {0x10};
+    Dbp("\r\nget imu4 status--\r\n");
+    Cmd_PackAndTx_4(buf, 1);
+}
 /**
  * 设置设备参数
  * @param accStill    惯导-静止状态加速度阀值 单位dm/s?
@@ -1610,6 +1647,7 @@ F32 AngleX4,AngleY4,AngleZ4;    // 从Cmd_RxUnpack中获取到的欧拉角数据
 F32 VelXLeft,VelYLeft,VelZLeft,VelXRight,VelYRight,VelZRight;   
 F32 VelX1,VelY1,VelZ1,VelX2,VelY2,VelZ2;     
 F32 VelX3,VelY3,VelZ3,VelX4,VelY4,VelZ4; 
+U8 BattLeftPct = 255, BattRightPct = 255, Batt1Pct = 255, Batt2Pct = 255, Batt3Pct = 255, Batt4Pct = 255;
 
 
 U8 isNewData=0;// 1=更新了新的数据到全局变量里了  
@@ -1979,6 +2017,7 @@ static void Cmd_RxUnpack_Left(U8 *buf, U8 DLen)
         Dbp("\t subscribe tag: 0x%04X\r\n", (U16)(((U16)buf[10]<<8) | buf[9])); // 字节[10-9] 功能订阅标识
         Dbp("\t charged state: %u\r\n", buf[11]); // 字节11 充电状态指示 0=未接电源 1=充电中 2=已充满
         Dbp("\t battery level: %u%%\r\n", buf[12]); // 字节12 当前剩余电量[0-100%]
+        BattLeftPct = buf[12];
         Dbp("\t battery voltage: %u mv\r\n", (U16)(((U16)buf[14]<<8) | buf[13])); // 字节[14-13] 电池的当前电压mv
         Dbp("\t Mac: %02X:%02X:%02X:%02X:%02X:%02X\r\n", buf[15],buf[16],buf[17],buf[18],buf[19],buf[20]); // 字节[15-20] MAC地址
         Dbp("\t version: %s\r\n", &buf[21]); // 字节[21-26] 固件版本 字符串
@@ -2294,6 +2333,7 @@ static void Cmd_RxUnpack_Right(U8 *buf, U8 DLen)
         Dbp("\t subscribe tag: 0x%04X\r\n", (U16)(((U16)buf[10]<<8) | buf[9])); // 字节[10-9] 功能订阅标识
         Dbp("\t charged state: %u\r\n", buf[11]); // 字节11 充电状态指示 0=未接电源 1=充电中 2=已充满
         Dbp("\t battery level: %u%%\r\n", buf[12]); // 字节12 当前剩余电量[0-100%]
+        BattRightPct = buf[12];
         Dbp("\t battery voltage: %u mv\r\n", (U16)(((U16)buf[14]<<8) | buf[13])); // 字节[14-13] 电池的当前电压mv
         Dbp("\t Mac: %02X:%02X:%02X:%02X:%02X:%02X\r\n", buf[15],buf[16],buf[17],buf[18],buf[19],buf[20]); // 字节[15-20] MAC地址
         Dbp("\t version: %s\r\n", &buf[21]); // 字节[21-26] 固件版本 字符串
@@ -2608,6 +2648,7 @@ static void Cmd_RxUnpack_1(U8 *buf, U8 DLen)
         Dbp("\t subscribe tag: 0x%04X\r\n", (U16)(((U16)buf[10]<<8) | buf[9])); // 字节[10-9] 功能订阅标识
         Dbp("\t charged state: %u\r\n", buf[11]); // 字节11 充电状态指示 0=未接电源 1=充电中 2=已充满
         Dbp("\t battery level: %u%%\r\n", buf[12]); // 字节12 当前剩余电量[0-100%]
+        Batt1Pct = buf[12];
         Dbp("\t battery voltage: %u mv\r\n", (U16)(((U16)buf[14]<<8) | buf[13])); // 字节[14-13] 电池的当前电压mv
         Dbp("\t Mac: %02X:%02X:%02X:%02X:%02X:%02X\r\n", buf[15],buf[16],buf[17],buf[18],buf[19],buf[20]); // 字节[15-20] MAC地址
         Dbp("\t version: %s\r\n", &buf[21]); // 字节[21-26] 固件版本 字符串
@@ -2921,6 +2962,7 @@ static void Cmd_RxUnpack_2(U8 *buf, U8 DLen)
         Dbp("\t subscribe tag: 0x%04X\r\n", (U16)(((U16)buf[10]<<8) | buf[9])); // 字节[10-9] 功能订阅标识
         Dbp("\t charged state: %u\r\n", buf[11]); // 字节11 充电状态指示 0=未接电源 1=充电中 2=已充满
         Dbp("\t battery level: %u%%\r\n", buf[12]); // 字节12 当前剩余电量[0-100%]
+        Batt2Pct = buf[12];
         Dbp("\t battery voltage: %u mv\r\n", (U16)(((U16)buf[14]<<8) | buf[13])); // 字节[14-13] 电池的当前电压mv
         Dbp("\t Mac: %02X:%02X:%02X:%02X:%02X:%02X\r\n", buf[15],buf[16],buf[17],buf[18],buf[19],buf[20]); // 字节[15-20] MAC地址
         Dbp("\t version: %s\r\n", &buf[21]); // 字节[21-26] 固件版本 字符串
@@ -3234,6 +3276,7 @@ static void Cmd_RxUnpack_3(U8 *buf, U8 DLen)
         Dbp("\t subscribe tag: 0x%04X\r\n", (U16)(((U16)buf[10]<<8) | buf[9])); // 字节[10-9] 功能订阅标识
         Dbp("\t charged state: %u\r\n", buf[11]); // 字节11 充电状态指示 0=未接电源 1=充电中 2=已充满
         Dbp("\t battery level: %u%%\r\n", buf[12]); // 字节12 当前剩余电量[0-100%]
+        Batt3Pct = buf[12];
         Dbp("\t battery voltage: %u mv\r\n", (U16)(((U16)buf[14]<<8) | buf[13])); // 字节[14-13] 电池的当前电压mv
         Dbp("\t Mac: %02X:%02X:%02X:%02X:%02X:%02X\r\n", buf[15],buf[16],buf[17],buf[18],buf[19],buf[20]); // 字节[15-20] MAC地址
         Dbp("\t version: %s\r\n", &buf[21]); // 字节[21-26] 固件版本 字符串
@@ -3547,6 +3590,7 @@ static void Cmd_RxUnpack_4(U8 *buf, U8 DLen)
         Dbp("\t subscribe tag: 0x%04X\r\n", (U16)(((U16)buf[10]<<8) | buf[9])); // 字节[10-9] 功能订阅标识
         Dbp("\t charged state: %u\r\n", buf[11]); // 字节11 充电状态指示 0=未接电源 1=充电中 2=已充满
         Dbp("\t battery level: %u%%\r\n", buf[12]); // 字节12 当前剩余电量[0-100%]
+        Batt4Pct = buf[12];
         Dbp("\t battery voltage: %u mv\r\n", (U16)(((U16)buf[14]<<8) | buf[13])); // 字节[14-13] 电池的当前电压mv
         Dbp("\t Mac: %02X:%02X:%02X:%02X:%02X:%02X\r\n", buf[15],buf[16],buf[17],buf[18],buf[19],buf[20]); // 字节[15-20] MAC地址
         Dbp("\t version: %s\r\n", &buf[21]); // 字节[21-26] 固件版本 字符串
@@ -4139,4 +4183,3 @@ void im948_test(void)
 
     }
 }
-
