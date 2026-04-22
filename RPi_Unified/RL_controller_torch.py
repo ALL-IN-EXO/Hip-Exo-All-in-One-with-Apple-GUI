@@ -83,6 +83,17 @@ MAX_RUNTIME_DELAY_MS = 1000.0
 # +1: 同时覆盖 0ms 档位和 MAX_RUNTIME_DELAY_MS 档位 (100Hz 下即 0..100 帧)
 BUF_SIZE = int(round(MAX_RUNTIME_DELAY_MS / dt_ms)) + 1
 
+# ---- Runtime delay defaults (per NN) ----
+# Note:
+# - lstm_leg_dcp keeps historical default 100ms
+# - lstm_pd uses 200ms baseline so Grid auto-delay starts around expected timing
+DEFAULT_RUNTIME_DELAY_MS = {
+    'dnn': 0.0,
+    'lstm': 0.0,
+    'lstm_leg_dcp': 100.0,
+    'lstm_pd': 200.0,
+}
+
 # ---- CSV 日志 ----
 SAVE_VERBOSE_LOG = True
 
@@ -1081,8 +1092,8 @@ def main():
     pd_zm_hist_R = deque(maxlen=pd_zm_window_frames)
     pd_zm_bias_L = 0.0
     pd_zm_bias_R = 0.0
-    # LegDcp default delay: 100ms; others: 0ms
-    runtime_delay_ms = 100.0 if NN_TYPE == 'lstm_leg_dcp' else 0.0
+    # Per-NN default delay baseline (lstm_pd defaults to 200ms).
+    runtime_delay_ms = float(DEFAULT_RUNTIME_DELAY_MS.get(NN_TYPE, 0.0))
     # 每腿当前实际生效的 delay (auto 模式下独立漂移; 非 auto 模式与 runtime_delay_ms 同步)
     runtime_delay_ms_L = runtime_delay_ms
     runtime_delay_ms_R = runtime_delay_ms
@@ -1233,6 +1244,14 @@ def main():
                 _now_wall = time.time()
                 auto_last_eval_ts = _now_wall
                 if auto_delay_enable and not prev_auto_delay_enable:
+                    # Grid bootstrap for LSTM-PD: if GUI baseline is still ~0ms at the
+                    # moment auto turns on, seed to 200ms so scan does not start at 0ms.
+                    if NN_TYPE == 'lstm_pd' and auto_opt_method == 'grid' and runtime_delay_ms <= 0.5:
+                        runtime_delay_ms = 200.0
+                        runtime_delay_ms_L = runtime_delay_ms
+                        runtime_delay_ms_R = runtime_delay_ms
+                        auto_best_delay_ms_L = runtime_delay_ms
+                        auto_best_delay_ms_R = runtime_delay_ms
                     auto_last_change_ts_L = _now_wall
                     auto_last_change_ts_R = _now_wall
                     reset_bo_state(auto_bo_state_L)

@@ -7,6 +7,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **GUI 远程启动 RL 时的 Delay 默认显示对齐**（`GUI_RL_update/GUI.py`）：
+  - 点击 `Start LSTM-PD` 时，RL 面板 `Torque Delay (ms)` 预填为 `200ms`
+  - 点击 `Start LegDcp` 时，RL 面板 `Torque Delay (ms)` 预填为 `100ms`
+  - 作用是等待首帧 RPi 状态回传期间，GUI 显示不再与 Pi 运行时默认值错位
+
+- **架构文档补充滤波器位置（`Docs/SYSTEM_ARCHITECTURE.md`）**：
+  - `5.4 主循环流程` 明确新增“compute 后、下发前”的统一电机前滤波步骤
+  - `11.2` 长条数据流图补画 Teensy-native 的统一 LPF 节点
+  - 明确 RL 回传扭矩路径旁路 Teensy 该 LPF，保持 Pi 扭矩透明下发
+
+- **RPi LSTM-PD Grid AutoDelay 起点修正**（`RPi_Unified/RL_controller_torch.py`）：
+  - `lstm_pd` 运行时默认 delay 基线改为 `200ms`（此前会从 `0ms` 起）
+  - AutoDelay 从 OFF 切到 ON 且方法为 `grid` 时，若当前 baseline 仍接近 `0ms`，自动回填到 `200ms` 后再开始扫描
+
+- **RPi 环境文档补全（`RPi_Unified/README.md`）**：
+  - 新增“按当前项目配置”的完整环境准备章节（系统依赖、UART 开启、Python venv、必需 pip 包、快速自检）
+  - 明确 `tmux` 为 GUI 远程启动 Pi RL 的必需依赖
+  - 明确默认虚拟环境路径 `~/venvs/pytorch-env` 与 `run.sh`/GUI 远程控制一致
+
+- **Teensy 非RL算法统一“电机前滤波”并开放 cutoff 调节**（`All_in_one_hip_controller_RL_update/*`, `GUI_RL_update/GUI.py`）：
+  - 在 Teensy 主循环新增统一 2阶 Butterworth IIR（100Hz）扭矩滤波，位置固定在 `active_ctrl->compute(...)` 之后、下发电机之前
+  - RL 路径保持透明：`Controller_RL` 输出不经过 Teensy 该滤波器
+  - EG 内部原 `tau_cmd_*_filt_` 独立扭矩低通移除，避免与统一电机前滤波重复
+  - GUI 在 `Max Torque` 下新增 `Filter Before Torque (Hz)`（默认 5.0Hz，可调），通过 BLE 下发到 Teensy payload `[31..32]`
+  - Teensy 下行解析新增 `torque_filter_fc_hz` 字段（旧 GUI 未下发该字段时默认回退 5.0Hz）
+
+- **系统架构文档补充“算法×Pi在线状态”运行时数据流总览**（`Docs/SYSTEM_ARCHITECTURE.md`）：
+  - 新增按算法（EG/Samsung/SOGI/Test/RL）和 Pi 在线状态划分的统一矩阵
+  - 明确每个场景下的扭矩计算归属、auto-delay 归属、滤波器位置、GUI Auto 显示来源、overlay 指标来源
+  - 新增两条主链路 Mermaid 长条图与 GUI/RPi/Teensy 三端 CSV 对齐图
+
+- **非 Pi 模式功率 overlay 兜底修复**（`GUI_RL_update/GUI.py`）：
+  - `Right/Left Leg Power Sign` 右下角 `+Ratio / +P / -P` 叠字不再仅依赖 RPi 状态帧
+  - 当无 Pi 状态（`_rpi_status_valid = False`）时，改为从当前 Teensy 功率条带窗口实时计算并显示指标（ratio、+P、-P）
+  - 有 Pi 状态时保持原行为：继续优先使用 Pi/状态帧上报值
+
 - **Hardware 品牌交互可视化增强**（`GUI_RL_update/GUI.py`）：
   - Motor 品牌下拉框改为高对比样式（粗边框 + 粗体），当 pending 与 current 不一致时高亮为橙色，便于一眼识别“待应用”状态
   - `Apply` 按钮在目标品牌已生效时自动切为绿色并显示 `SIG Active` / `TMOTOR Active`

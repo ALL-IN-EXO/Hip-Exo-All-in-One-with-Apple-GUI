@@ -75,8 +75,6 @@ private:
 
   float  xL_prev_;
   float  xR_prev_;
-  float  tau_cmd_L_filt_;
-  float  tau_cmd_R_filt_;
 
   // === 后处理延迟缓冲 (auto delay output stage) ===
   float  post_buf_L_[EG_POST_DELAY_BUF];

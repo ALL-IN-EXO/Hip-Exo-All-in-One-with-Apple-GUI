@@ -78,6 +78,7 @@
  *              bit1: motor_reinit
  *              bit2-3: dir_bits (L,R)
  * [3..4]     max_torque_cfg int16  最大扭矩×100
+ * [31..32]   torque_filter_fc_hz int16  统一电机前滤波截止频率×100 (Hz, all algos)
  * --- 算法专用参数区 [5..57] (53 bytes) ---
  *   EG 参数 (algo=0):
  *     [5..6]   Rescaling_gain ×100    int16
@@ -282,6 +283,7 @@ struct BleDownlinkData {
   bool     motor_reinit;    // ctrl_flags bit1
   uint8_t  dir_bits;        // ctrl_flags bit2-3
   float    max_torque_cfg;  // [3..4] / 100
+  float    torque_filter_fc_hz; // [31..32] /100 (统一电机前滤波截止频率)
 
   // EG 参数
   float Rescaling_gain;     // [5..6]
@@ -334,6 +336,8 @@ static inline BleDownlinkData ble_parse_downlink(const uint8_t* payload) {
   d.dir_bits       = (flags >> 2) & 0x03;
 
   d.max_torque_cfg = ble_rd_i16(payload, 3) / 100.0f;
+  d.torque_filter_fc_hz = ble_rd_i16(payload, 31) / 100.0f;
+  if (!(d.torque_filter_fc_hz > 0.0f)) d.torque_filter_fc_hz = 5.0f;
 
   // 根据算法类型解析参数区 [5..57]
   switch (d.algo_select) {
