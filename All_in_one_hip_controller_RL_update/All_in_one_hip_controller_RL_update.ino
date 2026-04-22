@@ -770,6 +770,9 @@ void Transmit_ble_Data() {
     ctrl_samsung.fill_ble_status(rpi_uplink_buf);
   } else if (active_algo_id == ALGO_EG) {
     ctrl_eg.fill_ble_status(rpi_uplink_buf);
+  } else if (active_algo_id == ALGO_SOGI) {
+    // SOGI 也上报 ADO 指标到同一 40B 状态槽，供 GUI Power Sign overlay 显示 ratio/+P/-P。
+    ctrl_sogi.fill_ble_status(rpi_uplink_buf);
   } else {
     memset(rpi_uplink_buf, 0, 40);
   }
