@@ -49,8 +49,23 @@
  * [58..60]   (reserved for future Teensy data)
  * --- RPi 透传区 [61..100] ---
  * [61..100]  rpi_passthru  40 bytes, Teensy 不解析，原样透传
- * --- 预留 [101..127] ---
- * [101..127] reserved
+ * --- 同步扩展区 [101..127] ---
+ * [101]      'X'
+ * [102]      'T'
+ * [103]      version (=1)
+ * [104]      flags
+ * [105..106] sample_id     uint16
+ * [107..108] phys_pwr_L    int16 (W*100, actuator power)
+ * [109..110] phys_pwr_R    int16 (W*100, actuator power)
+ * [111..112] sync_ang_L    int16 (deg*100, control-aligned input)
+ * [113..114] sync_ang_R    int16
+ * [115..116] sync_vel_L    int16 (deg/s*10)
+ * [117..118] sync_vel_R    int16
+ * [119..120] sync_cmd_L    int16 (Nm*100, control-aligned command)
+ * [121..122] sync_cmd_R    int16
+ * [123..124] ctrl_pwr_L    int16 (W*100, control power)
+ * [125..126] ctrl_pwr_R    int16 (W*100, control power)
+ * [127]      age_ms_10     uint8 (staleness hint, ms/10)
  *
  * =========================================================
  * 下行 GUI → Teensy (data_rs232_rx[0..124], 去掉3字节帧头)
@@ -108,6 +123,8 @@
 static const uint8_t BLE_FRAME_LEN   = 128;
 static const uint8_t BLE_HEADER_LEN  = 3;
 static const uint8_t BLE_PAYLOAD_LEN = BLE_FRAME_LEN - BLE_HEADER_LEN; // 125
+static const uint8_t BLE_TELEM_EXT_OFFSET = 101;
+static const uint8_t BLE_TELEM_EXT_LEN = 27;
 
 // 算法 ID
 enum AlgoID : uint8_t {
@@ -220,6 +237,38 @@ static inline void ble_pack_uplink(uint8_t* data_ble, const BleUplinkData& d) {
 static inline void ble_pack_rpi_uplink(uint8_t* data_ble, const uint8_t* rpi_data, uint8_t len) {
   if (len > 40) len = 40;
   memcpy(&data_ble[61], rpi_data, len);
+}
+
+struct BleTelemetryExt {
+  uint8_t  flags;
+  uint16_t sample_id;
+  int16_t  phys_pwr_L100, phys_pwr_R100;
+  int16_t  sync_ang_L100, sync_ang_R100;
+  int16_t  sync_vel_L10, sync_vel_R10;
+  int16_t  sync_cmd_L100, sync_cmd_R100;
+  int16_t  ctrl_pwr_L100, ctrl_pwr_R100;
+  uint8_t  age_ms_10;
+};
+
+// 上行同步扩展区: data_ble[101..127]
+static inline void ble_pack_telem_ext(uint8_t* data_ble, const BleTelemetryExt& d) {
+  const int b = BLE_TELEM_EXT_OFFSET;
+  data_ble[b + 0] = 'X';
+  data_ble[b + 1] = 'T';
+  data_ble[b + 2] = 0x01;  // version
+  data_ble[b + 3] = d.flags;
+  ble_put_i16(data_ble, b + 4, (int16_t)d.sample_id);
+  ble_put_i16(data_ble, b + 6, d.phys_pwr_L100);
+  ble_put_i16(data_ble, b + 8, d.phys_pwr_R100);
+  ble_put_i16(data_ble, b + 10, d.sync_ang_L100);
+  ble_put_i16(data_ble, b + 12, d.sync_ang_R100);
+  ble_put_i16(data_ble, b + 14, d.sync_vel_L10);
+  ble_put_i16(data_ble, b + 16, d.sync_vel_R10);
+  ble_put_i16(data_ble, b + 18, d.sync_cmd_L100);
+  ble_put_i16(data_ble, b + 20, d.sync_cmd_R100);
+  ble_put_i16(data_ble, b + 22, d.ctrl_pwr_L100);
+  ble_put_i16(data_ble, b + 24, d.ctrl_pwr_R100);
+  data_ble[b + 26] = d.age_ms_10;
 }
 
 // ========== 下行解析 (GUI → Teensy) ==========

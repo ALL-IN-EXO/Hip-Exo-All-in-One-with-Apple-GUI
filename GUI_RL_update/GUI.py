@@ -61,6 +61,18 @@ RPI_AUTO_FLAG_MOTION_VALID_L = 0x02
 RPI_AUTO_FLAG_MOTION_VALID_R = 0x04
 RPI_AUTO_FLAG_METHOD_BO = 0x08
 
+# Teensy telemetry extension payload [98..124] (maps data_ble[101..127])
+TELEM_EXT_OFFSET = 98
+TELEM_EXT_LEN = 27
+TELEM_EXT_MAGIC0 = 0x58  # 'X'
+TELEM_EXT_MAGIC1 = 0x54  # 'T'
+TELEM_EXT_VERSION = 0x01
+TELEM_EXT_FLAG_VALID = 0x01
+TELEM_EXT_FLAG_PHYS_VALID = 0x02
+TELEM_EXT_FLAG_CTRL_VALID = 0x04
+TELEM_EXT_FLAG_SYNC_VALID = 0x08
+TELEM_EXT_FLAG_SYNC_FROM_PI = 0x10
+
 # Filter type codes (keep in sync with RL_controller_torch.py)
 RL_FILTER_TYPES = [
     ("Butterworth", 1),
@@ -79,17 +91,25 @@ AUTO_CONNECT_ADAFRUIT_VIDS = {0x239A}
 REPLAY_AUTO_COMPUTE = "__AUTO_COMPUTE__"
 REPLAY_POWER_COLUMNS = {"L_pwr_W", "R_pwr_W"}
 REPLAY_PROGRESS_STEPS = 10000
+REPLAY_OPTIONAL_COLUMNS = {"L_vel_dps", "R_vel_dps", "L_pwr_W", "R_pwr_W"}
+REPLAY_TIME_CANDIDATES = [
+    "teensy_t_s_unwrapped", "teensy_t_unwrapped_s", "t_unwrapped_s",
+    "teensy_t_ms_unwrapped",
+    "wall_elapsed_s", "t_s", "time_s", "timestamp_s",
+    "Time_ms", "time_ms",
+    "teensy_t_cs_u16", "t_cs",
+]
 REPLAY_PLOT_COLUMN_ALIASES = {
-    "L_angle_deg": ["L_angle_deg", "L_angle", "left_angle_deg"],
-    "R_angle_deg": ["R_angle_deg", "R_angle", "right_angle_deg"],
-    "L_cmd_Nm": ["L_cmd_Nm", "L_cmd", "left_cmd_Nm"],
-    "R_cmd_Nm": ["R_cmd_Nm", "R_cmd", "right_cmd_Nm"],
-    "L_est_Nm": ["L_est_Nm", "L_est", "left_est_Nm"],
-    "R_est_Nm": ["R_est_Nm", "R_est", "right_est_Nm"],
-    "L_vel_dps": ["L_vel_dps", "L_vel", "left_vel_dps"],
-    "R_vel_dps": ["R_vel_dps", "R_vel", "right_vel_dps"],
-    "L_pwr_W": ["L_pwr_W", "L_pwr", "left_pwr_W"],
-    "R_pwr_W": ["R_pwr_W", "R_pwr", "right_pwr_W"],
+    "L_angle_deg": ["L_angle_deg", "L_angle", "left_angle_deg", "imu_LTx", "sync_LTx"],
+    "R_angle_deg": ["R_angle_deg", "R_angle", "right_angle_deg", "imu_RTx", "sync_RTx"],
+    "L_cmd_Nm": ["L_cmd_Nm", "L_cmd", "left_cmd_Nm", "L_command_actuator", "sync_L_cmd_Nm", "sync_L_cmd"],
+    "R_cmd_Nm": ["R_cmd_Nm", "R_cmd", "right_cmd_Nm", "R_command_actuator", "sync_R_cmd_Nm", "sync_R_cmd"],
+    "L_est_Nm": ["L_est_Nm", "L_est", "left_est_Nm", "L_torque_meas", "filtered_LExoTorque", "raw_LExoTorque", "L_command_actuator"],
+    "R_est_Nm": ["R_est_Nm", "R_est", "right_est_Nm", "R_torque_meas", "filtered_RExoTorque", "raw_RExoTorque", "R_command_actuator"],
+    "L_vel_dps": ["L_vel_dps", "L_vel", "left_vel_dps", "imu_Lvel", "sync_Lvel"],
+    "R_vel_dps": ["R_vel_dps", "R_vel", "right_vel_dps", "imu_Rvel", "sync_Rvel"],
+    "L_pwr_W": ["L_pwr_W", "L_pwr", "left_pwr_W", "sync_ctrl_pwr_L", "phys_L_pwr_W", "ctrl_L_pwr_W", "L_pwr"],
+    "R_pwr_W": ["R_pwr_W", "R_pwr", "right_pwr_W", "sync_ctrl_pwr_R", "phys_R_pwr_W", "ctrl_R_pwr_W", "R_pwr"],
 }
 
 # ============== Apple Color System ==============
@@ -616,7 +636,7 @@ class MainWindow(QWidget):
         self._visual_sign_L = 1
         self._visual_sign_R = 1
         self._brand_request = 0
-        self._brand_pending = 2  # 1=SIG, 2=TMOTOR (default: TMOTOR)
+        self._brand_pending = 2  # 1=SIG, 2=TMOTOR (default TMOTOR)
         self._current_brand = 0
         self._algo_select = ALGO_EG
         self._algo_pending = ALGO_EG
@@ -633,6 +653,10 @@ class MainWindow(QWidget):
         self._csv_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._csv_start_wall_time = time.time()
         self._last_gait_freq = None
+        self._signal_source_mode = "Auto"   # Auto / Raw / Sync
+        self._power_source_mode = "Auto"    # Auto / Physical / Control
+        self._signal_source_active = "Raw"
+        self._power_source_active = "Physical"
         self._pwr_band_scale_right = 5.0
         self._pwr_band_scale_left = 5.0
         # Display-only power deglitch guards (do NOT affect controller torque path).
@@ -656,6 +680,30 @@ class MainWindow(QWidget):
         self._power_overlay_right_sig = None
         self._power_overlay_left_last_ts = 0.0
         self._power_overlay_right_last_ts = 0.0
+
+        # Latest raw/sync/control telemetry snapshot (for CSV + diagnostics)
+        self._raw_ang_L = 0.0
+        self._raw_ang_R = 0.0
+        self._raw_vel_L = 0.0
+        self._raw_vel_R = 0.0
+        self._raw_cmd_L = 0.0
+        self._raw_cmd_R = 0.0
+        self._sync_ang_L = 0.0
+        self._sync_ang_R = 0.0
+        self._sync_vel_L = 0.0
+        self._sync_vel_R = 0.0
+        self._sync_cmd_L = 0.0
+        self._sync_cmd_R = 0.0
+        self._phys_pwr_L = 0.0
+        self._phys_pwr_R = 0.0
+        self._ctrl_pwr_L = 0.0
+        self._ctrl_pwr_R = 0.0
+        self._sync_sample_id = 0
+        self._sync_from_pi = False
+        self._telem_ext_valid = False
+        self._telem_phys_valid = False
+        self._telem_ctrl_valid = False
+        self._telem_sync_valid = False
 
         # RPi status (received via BLE uplink passthrough)
         self._rpi_nn_type = -1          # -1=unknown, 0=dnn, 1=lstm, 2=lstm_leg_dcp, 3=lstm_pd
@@ -789,8 +837,20 @@ class MainWindow(QWidget):
         self._csv_writer = csv.writer(self._csv_file)
         self._csv_writer.writerow([
             't_s', 'L_angle_deg', 'R_angle_deg',
+            'teensy_t_cs_u16', 'teensy_t_s_unwrapped',
             'L_cmd_Nm', 'R_cmd_Nm', 'L_est_Nm', 'R_est_Nm',
             'L_vel_dps', 'R_vel_dps', 'L_pwr_W', 'R_pwr_W',
+            'signal_source_mode', 'signal_source_active',
+            'power_source_mode', 'power_source_active',
+            'raw_L_angle_deg', 'raw_R_angle_deg',
+            'raw_L_vel_dps', 'raw_R_vel_dps',
+            'raw_L_cmd_Nm', 'raw_R_cmd_Nm',
+            'sync_L_angle_deg', 'sync_R_angle_deg',
+            'sync_L_vel_dps', 'sync_R_vel_dps',
+            'sync_L_cmd_Nm', 'sync_R_cmd_Nm',
+            'phys_L_pwr_W', 'phys_R_pwr_W',
+            'ctrl_L_pwr_W', 'ctrl_R_pwr_W',
+            'sync_sample_id', 'sync_from_pi',
             'gait_freq_Hz',
             't_unwrapped_s', 'wall_time_s', 'wall_elapsed_s',
             'csv_sample_idx', 'csv_session_id',
@@ -1430,7 +1490,7 @@ class MainWindow(QWidget):
             "2) Vel 曲线: 优先来自 payload[40..43]，即 imu.LTAVx / imu.RTAVx（deg/s）。\n"
             "3) 若 payload[40..51] 全 0，GUI 才回退到 d(angle)/dt 差分速度。\n"
             "4) GUI 不对 Angle/Vel 做 LPF/IIR/Butterworth 滤波。\n"
-            "5) Power 的速度去毛刺只影响 Pwr 显示，不影响 Angle/Vel 曲线。\n"
+            "5) GUI 不再本地计算功率；Pwr 仅来自 Teensy/Pi 上报值。\n"
             "6) 这里“原始数据”指 IMU 模块输出值（可包含模块自身配置滤波），\n"
             "   不是 Teensy 的 LTx_filtered/RTx_filtered 控制链路。"
         )
@@ -1449,24 +1509,29 @@ class MainWindow(QWidget):
         self.btn_clear_buf = QPushButton("Clear")
         self.btn_clear_buf.setCursor(Qt.PointingHandCursor)
         self.btn_clear_buf.setFixedHeight(24)
+        self.btn_clear_buf.setToolTip("Clear plotting buffers.")
         self.btn_clear_buf.clicked.connect(self._clear_buffers)
         row1.addWidget(self.btn_clear_buf)
 
         lbl_w = QLabel("Win:")
         lbl_w.setStyleSheet("font-size:12px; background:transparent;")
+        lbl_w.setToolTip("Plot window length (number of samples).")
         row1.addWidget(lbl_w)
         self.sb_win_size = QSpinBox()
         self.sb_win_size.setRange(50, 2000)
         self.sb_win_size.setValue(self.win_size)
         self.sb_win_size.setFixedWidth(70)
         self.sb_win_size.setFixedHeight(24)
+        self.sb_win_size.setToolTip("Plot window length (number of samples).")
         self.sb_win_size.valueChanged.connect(self._on_win_size_changed)
         row1.addWidget(self.sb_win_size)
 
         lbl_a = QLabel("Auto")
         lbl_a.setStyleSheet("font-size:12px; background:transparent;")
+        lbl_a.setToolTip("Auto-scroll x-axis with incoming data.")
         row1.addWidget(lbl_a)
         self.sw_auto_scroll = ToggleSwitch(checked=True, on_color=C.blue)
+        self.sw_auto_scroll.setToolTip("Auto-scroll x-axis with incoming data.")
         row1.addWidget(self.sw_auto_scroll)
         row1.addStretch(1)
 
@@ -1505,6 +1570,44 @@ class MainWindow(QWidget):
 
         self.badge_original = PillBadge("Original", C.green)
         row2.addWidget(self.badge_original)
+
+        lbl_data_src = QLabel("Data:")
+        lbl_data_src.setStyleSheet("font-size:12px; background:transparent;")
+        lbl_data_src.setToolTip("Select plotted signal source (Raw / Sync / Auto).")
+        row2.addWidget(lbl_data_src)
+        self.cmb_signal_source = QComboBox()
+        self.cmb_signal_source.addItems(["Auto", "Raw", "Sync"])
+        self.cmb_signal_source.setCurrentText("Auto")
+        self.cmb_signal_source.setFixedWidth(76)
+        self.cmb_signal_source.setFixedHeight(24)
+        self.cmb_signal_source.setToolTip(
+            "Plot signal source.\n"
+            "Auto: RL+Pi uses control-synced input; otherwise Raw IMU.\n"
+            "Raw: direct Teensy IMU stream.\n"
+            "Sync: control-aligned input stream (Pi sync if available)."
+        )
+        self._setup_combo(self.cmb_signal_source)
+        self.cmb_signal_source.currentTextChanged.connect(self._on_signal_source_changed)
+        row2.addWidget(self.cmb_signal_source)
+
+        lbl_pwr_src = QLabel("Power:")
+        lbl_pwr_src.setStyleSheet("font-size:12px; background:transparent;")
+        lbl_pwr_src.setToolTip("Select plotted power source (Physical / Control / Auto).")
+        row2.addWidget(lbl_pwr_src)
+        self.cmb_power_source = QComboBox()
+        self.cmb_power_source.addItems(["Auto", "Physical", "Control"])
+        self.cmb_power_source.setCurrentText("Auto")
+        self.cmb_power_source.setFixedWidth(92)
+        self.cmb_power_source.setFixedHeight(24)
+        self.cmb_power_source.setToolTip(
+            "Power source.\n"
+            "Auto: RL+Pi uses Control power; otherwise Physical power.\n"
+            "Physical: actuator measured torque * IMU velocity.\n"
+            "Control: control-aligned torque * control-aligned velocity."
+        )
+        self._setup_combo(self.cmb_power_source)
+        self.cmb_power_source.currentTextChanged.connect(self._on_power_source_changed)
+        row2.addWidget(self.cmb_power_source)
 
         vsep_cap = QFrame(); vsep_cap.setFrameShape(QFrame.VLine)
         vsep_cap.setStyleSheet(f"background-color:{C.separator}; max-width:1px; border:none;")
@@ -1690,13 +1793,18 @@ class MainWindow(QWidget):
         self.btn_motor_init = QPushButton("Motor Init")
         self.btn_motor_init.setCursor(Qt.PointingHandCursor)
         self.btn_motor_init.setFixedHeight(28)
+        self.btn_motor_init.setToolTip("Reinitialize motors for current brand. If pending brand differs, GUI will switch brand first.")
         self.btn_motor_init.clicked.connect(self._on_click_motor_init)
         motor_row.addWidget(self.btn_motor_init)
 
-        motor_row.addWidget(QLabel("Brand:"))
+        lbl_brand = QLabel("Brand:")
+        lbl_brand.setToolTip("Target motor brand selection.")
+        motor_row.addWidget(lbl_brand)
         self.cmb_motor_brand = QComboBox()
         self.cmb_motor_brand.addItems(["SIG", "TMOTOR"])
-        self.cmb_motor_brand.setFixedWidth(100)
+        self.cmb_motor_brand.setCurrentIndex(1)  # default TMOTOR
+        self.cmb_motor_brand.setFixedWidth(116)
+        self.cmb_motor_brand.setToolTip("Select target brand, then click Apply.")
         self._setup_combo(self.cmb_motor_brand)
         self.cmb_motor_brand.currentIndexChanged.connect(self._on_brand_changed)
         motor_row.addWidget(self.cmb_motor_brand)
@@ -1704,10 +1812,12 @@ class MainWindow(QWidget):
         self.btn_brand_apply = QPushButton("Apply SIG")
         self.btn_brand_apply.setCursor(Qt.PointingHandCursor)
         self.btn_brand_apply.setFixedHeight(28)
+        self.btn_brand_apply.setToolTip("Apply selected brand switch on Teensy (switch + init).")
         self.btn_brand_apply.clicked.connect(self._on_brand_confirm)
         motor_row.addWidget(self.btn_brand_apply)
 
-        self.badge_brand = PillBadge("-", C.fill)
+        self.badge_brand = PillBadge("Current:-", C.fill)
+        self.badge_brand.setToolTip("Current active motor brand reported by Teensy.")
         motor_row.addWidget(self.badge_brand)
         self.lbl_temp_L = QLabel("")
         self.lbl_temp_L.setStyleSheet(f"color:{C.text2}; font-size:11px; background:transparent;")
@@ -3114,7 +3224,7 @@ class MainWindow(QWidget):
         self._brand_pending = index + 1
         self._update_brand_apply_label()
         target = "SIG" if self._brand_pending == 1 else "TMOTOR"
-        self.lbl_status.setText(f"Brand selected: {target}. Click Apply Brand.")
+        self.lbl_status.setText(f"Brand selected: {target}. Click Apply {target}.")
 
     def _update_brand_apply_label(self):
         if not hasattr(self, "btn_brand_apply"):
@@ -3124,6 +3234,47 @@ class MainWindow(QWidget):
             self.btn_brand_apply.setText(f"{target} Active")
         else:
             self.btn_brand_apply.setText(f"Apply {target}")
+        self._refresh_brand_apply_style()
+        self._refresh_brand_combo_style()
+
+    def _refresh_brand_apply_style(self):
+        if not hasattr(self, "btn_brand_apply"):
+            return
+        active = (self._current_brand in (1, 2) and self._current_brand == self._brand_pending)
+        bg = C.green if active else C.blue
+        self.btn_brand_apply.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {bg};
+                color: white; border: none; border-radius: 8px;
+                font-weight: 700; font-size: 12px; padding: 4px 10px;
+            }}
+        """)
+
+    def _refresh_brand_combo_style(self):
+        if not hasattr(self, "cmb_motor_brand"):
+            return
+        pending_diff = (
+            self._current_brand in (1, 2) and
+            self._brand_pending in (1, 2) and
+            self._brand_pending != self._current_brand
+        )
+        border = C.orange if pending_diff else C.blue
+        bg = C.fill if pending_diff else C.card
+        self.cmb_motor_brand.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {bg};
+                color: {C.text};
+                border: 2px solid {border};
+                border-radius: 8px;
+                padding: 2px 10px;
+                font-size: 13px;
+                font-weight: 700;
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 22px;
+            }}
+        """)
 
     def _on_brand_confirm(self):
         target = "SIG" if self._brand_pending == 1 else "TMOTOR"
@@ -3141,6 +3292,13 @@ class MainWindow(QWidget):
         QTimer.singleShot(200, lambda: setattr(self, "_brand_request", 0))
         self.lbl_status.setText(f"Applying brand: {target} ...")
 
+    def _pulse_motor_init_request(self):
+        self._motor_init_request = True
+        self._tx_params()
+        if self.ser:
+            self.ser.flush()
+        QTimer.singleShot(100, lambda: setattr(self, "_motor_init_request", False))
+
     def _on_click_imu_init(self):
         if not (self.connected and self.ser): return
         self._imu_init_request = True
@@ -3149,11 +3307,21 @@ class MainWindow(QWidget):
         QTimer.singleShot(100, lambda: setattr(self, "_imu_init_request", False))
 
     def _on_click_motor_init(self):
-        if not (self.connected and self.ser): return
-        self._motor_init_request = True
-        self._tx_params()
-        self.ser.flush()
-        QTimer.singleShot(100, lambda: setattr(self, "_motor_init_request", False))
+        if not (self.connected and self.ser):
+            return
+        target = "SIG" if self._brand_pending == 1 else "TMOTOR"
+        cur = "SIG" if self._current_brand == 1 else ("TMOTOR" if self._current_brand == 2 else "-")
+        if self._brand_pending in (1, 2) and self._brand_pending != self._current_brand:
+            # More intuitive UX: if target brand differs, switch brand first then init.
+            self._brand_request = self._brand_pending
+            for k in range(4):
+                QTimer.singleShot(35 * k, self._tx_params)
+            QTimer.singleShot(200, lambda: setattr(self, "_brand_request", 0))
+            QTimer.singleShot(280, self._pulse_motor_init_request)
+            self.lbl_status.setText(f"Motor Init: switch {cur}->{target}, then re-init")
+            return
+        self._pulse_motor_init_request()
+        self.lbl_status.setText(f"Motor Init sent ({cur})")
 
     def _toggle_left_dir(self):
         self._dir_bits ^= 0x01
@@ -3269,6 +3437,79 @@ class MainWindow(QWidget):
         self._last_render_values = None
         self._last_render_ts = 0.0
 
+    def _on_signal_source_changed(self, text):
+        self._signal_source_mode = str(text or "Auto")
+
+    def _on_power_source_changed(self, text):
+        self._power_source_mode = str(text or "Auto")
+
+    def _resolve_live_sources(self, active_algo: int):
+        signal_mode = str(self._signal_source_mode)
+        power_mode = str(self._power_source_mode)
+
+        sync_ok = bool(self._telem_sync_valid)
+        sync_from_pi = bool(self._sync_from_pi)
+        ctrl_ok = bool(self._telem_ctrl_valid)
+        phys_ok = bool(self._telem_phys_valid)
+
+        if signal_mode == "Raw":
+            signal_active = "Raw"
+        elif signal_mode == "Sync":
+            signal_active = "Sync" if sync_ok else "Raw"
+        else:
+            if active_algo == ALGO_RL and sync_ok and sync_from_pi:
+                signal_active = "Sync"
+            else:
+                signal_active = "Raw"
+
+        if power_mode == "Physical":
+            power_active = "Physical" if phys_ok else ("Control" if ctrl_ok else "None")
+        elif power_mode == "Control":
+            power_active = "Control" if ctrl_ok else ("Physical" if phys_ok else "None")
+        else:
+            if active_algo == ALGO_RL and ctrl_ok and sync_from_pi:
+                power_active = "Control"
+            elif phys_ok:
+                power_active = "Physical"
+            elif ctrl_ok:
+                power_active = "Control"
+            else:
+                power_active = "None"
+
+        self._signal_source_active = signal_active
+        self._power_source_active = power_active
+
+        if signal_active == "Sync":
+            L_angle_disp = float(self._sync_ang_L)
+            R_angle_disp = float(self._sync_ang_R)
+            L_vel_disp = float(self._sync_vel_L)
+            R_vel_disp = float(self._sync_vel_R)
+            L_cmd_disp = float(self._sync_cmd_L)
+            R_cmd_disp = float(self._sync_cmd_R)
+        else:
+            L_angle_disp = float(self._raw_ang_L)
+            R_angle_disp = float(self._raw_ang_R)
+            L_vel_disp = float(self._raw_vel_L)
+            R_vel_disp = float(self._raw_vel_R)
+            L_cmd_disp = float(self._raw_cmd_L)
+            R_cmd_disp = float(self._raw_cmd_R)
+
+        if power_active == "Control":
+            L_pwr_disp = float(self._ctrl_pwr_L)
+            R_pwr_disp = float(self._ctrl_pwr_R)
+        elif power_active == "Physical":
+            L_pwr_disp = float(self._phys_pwr_L)
+            R_pwr_disp = float(self._phys_pwr_R)
+        else:
+            L_pwr_disp = 0.0
+            R_pwr_disp = 0.0
+
+        return (
+            L_angle_disp, R_angle_disp, L_vel_disp, R_vel_disp,
+            L_cmd_disp, R_cmd_disp, L_pwr_disp, R_pwr_disp,
+            signal_active, power_active,
+        )
+
     def _sanitize_power_velocity(self, vel_raw: float, prev_good: float):
         """Display-only velocity guard for power calculation."""
         v = float(vel_raw)
@@ -3296,27 +3537,15 @@ class MainWindow(QWidget):
         self.R_vel_buf.append(float(R_vel) * vR)
 
         if power_override is None:
-            # Power = vel (deg/s) * torque (Nm) * pi/180 -> Watts.
-            # Use command torque for all brands for consistent sign and behavior.
-            L_vel_pwr, okL = self._sanitize_power_velocity(float(L_vel), self._pwr_vel_good_L)
-            R_vel_pwr, okR = self._sanitize_power_velocity(float(R_vel), self._pwr_vel_good_R)
-            if okL:
-                self._pwr_vel_good_L = L_vel_pwr
-            else:
-                self._pwr_glitch_count_L += 1
-            if okR:
-                self._pwr_vel_good_R = R_vel_pwr
-            else:
-                self._pwr_glitch_count_R += 1
-            L_pwr = L_vel_pwr * float(L_tau_d) * (pi / 180.0)
-            R_pwr = R_vel_pwr * float(R_tau_d) * (pi / 180.0)
+            L_pwr = 0.0
+            R_pwr = 0.0
         else:
             L_pwr = float(power_override[0])
             R_pwr = float(power_override[1])
             if not isfinite(L_pwr):
-                L_pwr = float(L_vel) * float(L_tau_d) * (pi / 180.0)
+                L_pwr = 0.0
             if not isfinite(R_pwr):
-                R_pwr = float(R_vel) * float(R_tau_d) * (pi / 180.0)
+                R_pwr = 0.0
 
         self.L_pwr_buf.append(L_pwr * vL)
         self.R_pwr_buf.append(R_pwr * vR)
@@ -3331,10 +3560,26 @@ class MainWindow(QWidget):
             self._csv_writer.writerow([
                 f'{float(t):.3f}',
                 f'{float(L_angle):.3f}', f'{float(R_angle):.3f}',
+                str(int(self._uplink_prev_t_cs) & 0xFFFF if self._uplink_prev_t_cs is not None else -1),
+                f'{float(self._uplink_t_unwrapped_s):.3f}',
                 f'{float(L_tau_d):.4f}', f'{float(R_tau_d):.4f}',
                 f'{float(L_tau):.4f}',   f'{float(R_tau):.4f}',
                 f'{float(L_vel):.3f}',   f'{float(R_vel):.3f}',
                 f'{L_pwr:.4f}',   f'{R_pwr:.4f}',
+                str(self._signal_source_mode),
+                str(self._signal_source_active),
+                str(self._power_source_mode),
+                str(self._power_source_active),
+                f'{float(self._raw_ang_L):.3f}', f'{float(self._raw_ang_R):.3f}',
+                f'{float(self._raw_vel_L):.3f}', f'{float(self._raw_vel_R):.3f}',
+                f'{float(self._raw_cmd_L):.4f}', f'{float(self._raw_cmd_R):.4f}',
+                f'{float(self._sync_ang_L):.3f}', f'{float(self._sync_ang_R):.3f}',
+                f'{float(self._sync_vel_L):.3f}', f'{float(self._sync_vel_R):.3f}',
+                f'{float(self._sync_cmd_L):.4f}', f'{float(self._sync_cmd_R):.4f}',
+                f'{float(self._phys_pwr_L):.4f}', f'{float(self._phys_pwr_R):.4f}',
+                f'{float(self._ctrl_pwr_L):.4f}', f'{float(self._ctrl_pwr_R):.4f}',
+                str(int(self._sync_sample_id) & 0xFFFF),
+                str(int(1 if self._sync_from_pi else 0)),
                 f'{float(gait_freq):.3f}',
                 f'{float(self._uplink_t_unwrapped_s):.3f}',
                 f'{now_wall:.6f}',
@@ -4008,14 +4253,14 @@ class MainWindow(QWidget):
                     vv = v.strip()
                     if not vv:
                         continue
+                    # Legacy: previously allowed "auto compute (vel*cmd)".
+                    # Current policy keeps replay power as logged value only.
                     if k in REPLAY_POWER_COLUMNS and vv == REPLAY_AUTO_COMPUTE:
-                        clean[k] = REPLAY_AUTO_COMPUTE
-                    else:
-                        clean[k] = [vv]
+                        continue
+                    clean[k] = [vv]
                     continue
                 if isinstance(v, list):
                     candidates = []
-                    auto_flag = False
                     for item in v:
                         if not isinstance(item, str):
                             continue
@@ -4023,14 +4268,11 @@ class MainWindow(QWidget):
                         if not col:
                             continue
                         if k in REPLAY_POWER_COLUMNS and col == REPLAY_AUTO_COMPUTE:
-                            auto_flag = True
                             continue
                         if col not in candidates:
                             candidates.append(col)
                     if candidates:
                         clean[k] = candidates
-                    elif k in REPLAY_POWER_COLUMNS and auto_flag:
-                        clean[k] = REPLAY_AUTO_COMPUTE
             return clean
         except (OSError, json.JSONDecodeError):
             return {}
@@ -4038,10 +4280,6 @@ class MainWindow(QWidget):
     def _save_replay_mapping(self):
         serializable = {}
         for key in REPLAY_PLOT_COLUMN_ALIASES.keys():
-            mapped = self._replay_col_mapping.get(key, None)
-            if key in REPLAY_POWER_COLUMNS and mapped == REPLAY_AUTO_COMPUTE:
-                serializable[key] = REPLAY_AUTO_COMPUTE
-                continue
             cands = self._get_replay_mapping_candidates(key)
             if isinstance(cands, list) and cands:
                 serializable[key] = cands
@@ -4054,8 +4292,6 @@ class MainWindow(QWidget):
     def _get_replay_mapping_candidates(self, key):
         mapped = self._replay_col_mapping.get(key, [])
         if isinstance(mapped, str):
-            if key in REPLAY_POWER_COLUMNS and mapped == REPLAY_AUTO_COMPUTE:
-                return REPLAY_AUTO_COMPUTE
             mapped = [mapped]
         if not isinstance(mapped, list):
             return []
@@ -4073,17 +4309,12 @@ class MainWindow(QWidget):
         return out
 
     def _merge_replay_mapping_choice(self, key, mapped_value):
-        if key in REPLAY_POWER_COLUMNS and mapped_value == REPLAY_AUTO_COMPUTE:
-            self._replay_col_mapping[key] = REPLAY_AUTO_COMPUTE
-            return
         if not isinstance(mapped_value, str):
             return
         col = mapped_value.strip()
         if not col:
             return
         existing = self._get_replay_mapping_candidates(key)
-        if existing == REPLAY_AUTO_COMPUTE:
-            existing = []
         existing = [x for x in existing if x != col]
         existing.insert(0, col)
         self._replay_col_mapping[key] = existing
@@ -4100,7 +4331,7 @@ class MainWindow(QWidget):
         lay = QVBoxLayout(dlg)
         tip = QLabel(
             "检测到以下绘图关键词缺失，请选择 CSV 中对应列。\n"
-            "功率列可选“自动计算（vel*cmd）”。\n\n"
+            "功率列若缺失将按 0W 显示（不做本地估算）。\n\n"
             + ", ".join(missing_keys)
         )
         tip.setWordWrap(True)
@@ -4110,21 +4341,16 @@ class MainWindow(QWidget):
         combos = {}
         for key in missing_keys:
             combo = QComboBox()
-            if key in REPLAY_POWER_COLUMNS:
-                combo.addItem("自动计算 (vel*cmd)", REPLAY_AUTO_COMPUTE)
             for h in headers:
                 combo.addItem(h, h)
             saved = self._replay_col_mapping.get(key, "")
-            if saved == REPLAY_AUTO_COMPUTE and key in REPLAY_POWER_COLUMNS:
-                combo.setCurrentIndex(0)
-            else:
-                candidates = self._get_replay_mapping_candidates(key)
-                if isinstance(candidates, list):
-                    for cand in candidates:
-                        idx = combo.findData(cand)
-                        if idx >= 0:
-                            combo.setCurrentIndex(idx)
-                            break
+            candidates = self._get_replay_mapping_candidates(key)
+            if isinstance(candidates, list):
+                for cand in candidates:
+                    idx = combo.findData(cand)
+                    if idx >= 0:
+                        combo.setCurrentIndex(idx)
+                        break
             form.addRow(f"{key} ->", combo)
             combos[key] = combo
         lay.addLayout(form)
@@ -4140,9 +4366,6 @@ class MainWindow(QWidget):
         resolved = {}
         for key, combo in combos.items():
             col = combo.currentData()
-            if col == REPLAY_AUTO_COMPUTE and key in REPLAY_POWER_COLUMNS:
-                resolved[key] = REPLAY_AUTO_COMPUTE
-                continue
             if not isinstance(col, str) or not col.strip():
                 QMessageBox.warning(self, "Replay", f"{key} 未选择映射列。")
                 return None
@@ -4157,10 +4380,6 @@ class MainWindow(QWidget):
         resolved = {}
         missing = []
         for key, aliases in REPLAY_PLOT_COLUMN_ALIASES.items():
-            mapped = self._replay_col_mapping.get(key, "")
-            if mapped == REPLAY_AUTO_COMPUTE and key in REPLAY_POWER_COLUMNS:
-                resolved[key] = None
-                continue
             candidates = self._get_replay_mapping_candidates(key)
             if isinstance(candidates, list):
                 hit = next((c for c in candidates if c in headers), None)
@@ -4175,7 +4394,10 @@ class MainWindow(QWidget):
             if found is not None:
                 resolved[key] = found
             else:
-                missing.append(key)
+                if key in REPLAY_OPTIONAL_COLUMNS:
+                    resolved[key] = None
+                else:
+                    missing.append(key)
 
         if missing:
             user_map = self._prompt_replay_column_mapping(headers, missing)
@@ -4183,13 +4405,16 @@ class MainWindow(QWidget):
                 raise ValueError("CSV 关键词映射已取消")
             for key, mapped in user_map.items():
                 self._merge_replay_mapping_choice(key, mapped)
-                if mapped == REPLAY_AUTO_COMPUTE and key in REPLAY_POWER_COLUMNS:
-                    resolved[key] = None
-                else:
-                    resolved[key] = mapped
+                resolved[key] = mapped
             self._save_replay_mapping()
 
         return resolved
+
+    def _resolve_replay_time_key(self, headers):
+        for key in REPLAY_TIME_CANDIDATES:
+            if key in headers:
+                return key
+        return None
 
     def _format_replay_time(self, t_s):
         t = max(0.0, float(t_s))
@@ -4326,13 +4551,26 @@ class MainWindow(QWidget):
             reader = csv.DictReader(f)
             if not reader.fieldnames:
                 raise ValueError("CSV header missing")
-            plot_cols = self._resolve_replay_plot_columns(reader.fieldnames)
+            headers = list(reader.fieldnames)
+            plot_cols = self._resolve_replay_plot_columns(headers)
+            time_key = self._resolve_replay_time_key(headers)
+            time_key_l = str(time_key or "").lower()
             prev_raw_t = None
             replay_t = 0.0
             for row in reader:
-                raw_t = self._row_float(
-                    row, ['t_s', 't', 'time_s', 'time', 'timestamp_s'],
-                    allow_none=True)
+                raw_t_native = None
+                if time_key:
+                    raw_t_native = self._row_float(row, [time_key], allow_none=True)
+
+                raw_t = None
+                if raw_t_native is not None:
+                    if time_key_l in ("teensy_t_cs_u16", "t_cs"):
+                        raw_t = float(raw_t_native) * 0.01
+                    elif time_key_l in ("teensy_t_ms_unwrapped",):
+                        raw_t = float(raw_t_native) * 0.001
+                    else:
+                        raw_t = float(raw_t_native)
+
                 if raw_t is None:
                     raw_t = (prev_raw_t + 0.02) if prev_raw_t is not None else 0.0
                 if prev_raw_t is not None:
@@ -4350,8 +4588,8 @@ class MainWindow(QWidget):
                 R_tau_d = self._row_float(row, [plot_cols['R_cmd_Nm']], 0.0)
                 L_tau = self._row_float(row, [plot_cols['L_est_Nm']], 0.0)
                 R_tau = self._row_float(row, [plot_cols['R_est_Nm']], 0.0)
-                L_vel = self._row_float(row, [plot_cols['L_vel_dps']], 0.0)
-                R_vel = self._row_float(row, [plot_cols['R_vel_dps']], 0.0)
+                L_vel = self._row_float(row, [plot_cols['L_vel_dps']], 0.0) if plot_cols.get('L_vel_dps') else 0.0
+                R_vel = self._row_float(row, [plot_cols['R_vel_dps']], 0.0) if plot_cols.get('R_vel_dps') else 0.0
                 L_pwr = nan
                 R_pwr = nan
                 if plot_cols.get('L_pwr_W'):
@@ -4602,8 +4840,8 @@ class MainWindow(QWidget):
     def _apply_replay_sample(self, sample, _idx, _total):
         (t, L_angle, R_angle, L_tau, R_tau, L_tau_d, R_tau_d,
          L_vel, R_vel, L_pwr_csv, R_pwr_csv, gait_freq) = sample
-        L_pwr = L_pwr_csv if isfinite(L_pwr_csv) else (L_vel * L_tau_d * (pi / 180.0))
-        R_pwr = R_pwr_csv if isfinite(R_pwr_csv) else (R_vel * R_tau_d * (pi / 180.0))
+        L_pwr = float(L_pwr_csv) if isfinite(L_pwr_csv) else 0.0
+        R_pwr = float(R_pwr_csv) if isfinite(R_pwr_csv) else 0.0
         self._last_gait_freq = gait_freq
         self._append_data_point(
             t, L_angle, R_angle, L_tau, R_tau, L_tau_d, R_tau_d, L_vel, R_vel,
@@ -5412,6 +5650,57 @@ class MainWindow(QWidget):
         self._prev_L_angle = L_angle
         self._prev_R_angle = R_angle
 
+        # Raw stream snapshot (always from Teensy uplink baseline fields)
+        self._raw_ang_L = float(L_angle)
+        self._raw_ang_R = float(R_angle)
+        self._raw_vel_L = float(L_vel)
+        self._raw_vel_R = float(R_vel)
+        self._raw_cmd_L = float(L_tau_d)
+        self._raw_cmd_R = float(R_tau_d)
+
+        # === Parse telemetry extension [98..124] ===
+        ext_blob = payload[TELEM_EXT_OFFSET:TELEM_EXT_OFFSET + TELEM_EXT_LEN]
+        self._telem_ext_valid = False
+        self._telem_phys_valid = False
+        self._telem_ctrl_valid = False
+        self._telem_sync_valid = False
+        self._sync_from_pi = False
+        if (len(ext_blob) == TELEM_EXT_LEN and
+                ext_blob[0] == TELEM_EXT_MAGIC0 and
+                ext_blob[1] == TELEM_EXT_MAGIC1 and
+                ext_blob[2] >= TELEM_EXT_VERSION):
+            flags = int(ext_blob[3])
+            self._sync_sample_id = int(struct.unpack_from('<H', ext_blob, 4)[0]) & 0xFFFF
+            self._phys_pwr_L = struct.unpack_from('<h', ext_blob, 6)[0] / 100.0
+            self._phys_pwr_R = struct.unpack_from('<h', ext_blob, 8)[0] / 100.0
+            self._sync_ang_L = struct.unpack_from('<h', ext_blob, 10)[0] / 100.0
+            self._sync_ang_R = struct.unpack_from('<h', ext_blob, 12)[0] / 100.0
+            self._sync_vel_L = struct.unpack_from('<h', ext_blob, 14)[0] / 10.0
+            self._sync_vel_R = struct.unpack_from('<h', ext_blob, 16)[0] / 10.0
+            self._sync_cmd_L = struct.unpack_from('<h', ext_blob, 18)[0] / 100.0
+            self._sync_cmd_R = struct.unpack_from('<h', ext_blob, 20)[0] / 100.0
+            self._ctrl_pwr_L = struct.unpack_from('<h', ext_blob, 22)[0] / 100.0
+            self._ctrl_pwr_R = struct.unpack_from('<h', ext_blob, 24)[0] / 100.0
+            self._telem_ext_valid = bool(flags & TELEM_EXT_FLAG_VALID)
+            self._telem_phys_valid = bool(flags & TELEM_EXT_FLAG_PHYS_VALID)
+            self._telem_ctrl_valid = bool(flags & TELEM_EXT_FLAG_CTRL_VALID)
+            self._telem_sync_valid = bool(flags & TELEM_EXT_FLAG_SYNC_VALID)
+            self._sync_from_pi = bool(flags & TELEM_EXT_FLAG_SYNC_FROM_PI)
+        else:
+            self._sync_sample_id = 0
+            self._phys_pwr_L = 0.0
+            self._phys_pwr_R = 0.0
+            self._ctrl_pwr_L = 0.0
+            self._ctrl_pwr_R = 0.0
+
+        if not self._telem_sync_valid:
+            self._sync_ang_L = self._raw_ang_L
+            self._sync_ang_R = self._raw_ang_R
+            self._sync_vel_L = self._raw_vel_L
+            self._sync_vel_R = self._raw_vel_R
+            self._sync_cmd_L = self._raw_cmd_L
+            self._sync_cmd_R = self._raw_cmd_R
+
         # === Parse RPi uplink passthrough [58..97] ===
         rpi_blob = payload[58:98]
         if (len(rpi_blob) >= 20 and rpi_blob[0] == RPI_PT_MAGIC0 and
@@ -5614,8 +5903,14 @@ class MainWindow(QWidget):
         bname = brand_names.get(brand_id, '?')
         self._current_brand = brand_id
         self._update_brand_apply_label()
-        self.badge_brand.setText(bname)
-        self.badge_brand.set_color(C.blue if brand_id > 0 else C.fill)
+        self.badge_brand.setText(f"Current:{bname}")
+        if brand_id in (1, 2):
+            if self._brand_pending in (1, 2) and self._brand_pending != brand_id:
+                self.badge_brand.set_color(C.orange)
+            else:
+                self.badge_brand.set_color(C.green)
+        else:
+            self.badge_brand.set_color(C.fill)
         if brand_id == 2 and temp_L:
             self.lbl_temp_L.setText(f"L:{temp_L}C")
             self.lbl_temp_R.setText(f"R:{temp_R}C" if temp_R else "")
@@ -5634,14 +5929,25 @@ class MainWindow(QWidget):
             self.badge_algo.set_color(C.orange)
 
         # Status
+        (L_angle_disp, R_angle_disp, L_vel_disp, R_vel_disp,
+         L_cmd_disp, R_cmd_disp, L_pwr_disp, R_pwr_disp,
+         signal_active, power_active) = self._resolve_live_sources(active_algo)
         self.lbl_status.setText(
             f"t={t:.2f}s  gait={gait_freq:.2f}Hz  algo={algo_name}"
             + (f"  tag='{tag_char}'" if tag_valid else "")
-            + f"  vel={'IMU' if has_imu_vel else 'DER'}")
+            + f"  vel={'IMU' if has_imu_vel else 'DER'}"
+            + f"  src={signal_active}/{power_active}")
 
         self._append_data_point(
-            t, L_angle, R_angle, L_tau, R_tau, L_tau_d, R_tau_d,
-            L_vel, R_vel, gait_freq, log_csv=True)
+            t,
+            L_angle_disp, R_angle_disp,
+            L_tau, R_tau,
+            L_cmd_disp, R_cmd_disp,
+            L_vel_disp, R_vel_disp,
+            gait_freq,
+            log_csv=True,
+            power_override=(L_pwr_disp, R_pwr_disp),
+        )
 
 
 if __name__ == "__main__":

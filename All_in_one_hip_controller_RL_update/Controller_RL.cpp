@@ -24,6 +24,16 @@ void Controller_RL::reset() {
   rx_state_ = WAIT_HEADER1;
   rx_idx_ = 0;
   rx_pkt_type_ = 0;
+  sync_valid = false;
+  sync_from_pi = false;
+  sync_flags = 0;
+  sync_sample_id = 0;
+  sync_ang_L100 = 0;
+  sync_ang_R100 = 0;
+  sync_vel_L10 = 0;
+  sync_vel_R10 = 0;
+  sync_ctrl_pwr_L100 = 0;
+  sync_ctrl_pwr_R100 = 0;
 }
 
 void Controller_RL::init_serial() {
@@ -41,22 +51,24 @@ uint8_t Controller_RL::cksum8(const uint8_t* p, size_t n) {
   return s;
 }
 
-void Controller_RL::send_imu_to_pi(float Lpos_rad, float Rpos_rad,
+void Controller_RL::send_imu_to_pi(uint16_t t_cs, float Lpos_rad, float Rpos_rad,
                                     float Lvel, float Rvel) {
-  // 32 bytes: 4(header) + 27(payload) + 1(checksum)
-  uint8_t pkt[32];
+  // v2 packet (34 bytes): 4(header) + 29(payload) + 1(checksum)
+  // payload = t_cs(2) + Lpos(4) + Rpos(4) + Lvel(4) + Rvel(4) + logtag(11)
+  uint8_t pkt[34];
   pkt[0] = 0xA5;
   pkt[1] = 0x5A;
-  pkt[2] = 28;      // TYPE(1) + payload(27)
+  pkt[2] = 30;      // TYPE(1) + payload(29)
   pkt[3] = 0x01;    // IMU packet type
 
-  memcpy(&pkt[4],  &Lpos_rad, 4);
-  memcpy(&pkt[8],  &Rpos_rad, 4);
-  memcpy(&pkt[12], &Lvel,     4);
-  memcpy(&pkt[16], &Rvel,     4);
-  memcpy(&pkt[20], logtag,    11);
+  memcpy(&pkt[4],  &t_cs,      2);
+  memcpy(&pkt[6],  &Lpos_rad,  4);
+  memcpy(&pkt[10], &Rpos_rad,  4);
+  memcpy(&pkt[14], &Lvel,      4);
+  memcpy(&pkt[18], &Rvel,      4);
+  memcpy(&pkt[22], logtag,    11);
 
-  pkt[31] = cksum8(&pkt[3], 28);
+  pkt[33] = cksum8(&pkt[3], 30);
   PI_SERIAL.write(pkt, sizeof(pkt));
 }
 
@@ -65,6 +77,7 @@ bool Controller_RL::read_torque_from_pi() {
    * RPi sends two packet types:
    *   AA 55 + 24B (6×float32) = torque      → PI_TORQUE_SIZE=26
    *   AA 56 + 40B (status)    = status       → PI_STATUS_SIZE=42
+   *   AA 59 + 40B (sync+torque)= sync torque → PI_SYNC_SIZE=42
    *
    * State machine parses both, byte by byte.
    */
@@ -79,16 +92,21 @@ bool Controller_RL::read_torque_from_pi() {
         break;
 
       case WAIT_HEADER2:
-        if (b == 0x55 || b == 0x56) {
+        if (b == 0x55 || b == 0x56 || b == 0x59) {
           rx_pkt_type_ = b;
           rx_idx_ = 2;  // header already consumed
-          rx_state_ = (b == 0x55) ? READING_TORQUE : READING_STATUS;
           if (b == 0x55) {
+            rx_state_ = READING_TORQUE;
             rx_torque_buf_[0] = 0xAA;
             rx_torque_buf_[1] = 0x55;
-          } else {
+          } else if (b == 0x56) {
+            rx_state_ = READING_STATUS;
             rx_status_buf_[0] = 0xAA;
             rx_status_buf_[1] = 0x56;
+          } else {
+            rx_state_ = READING_SYNC;
+            rx_sync_buf_[0] = 0xAA;
+            rx_sync_buf_[1] = 0x59;
           }
         } else {
           rx_state_ = WAIT_HEADER1;
@@ -107,6 +125,9 @@ bool Controller_RL::read_torque_from_pi() {
           memcpy(&tau_pi_Rp, rx_torque_buf_ + o, 4); o += 4;
           memcpy(&tau_pi_Rd, rx_torque_buf_ + o, 4);
 
+          sync_valid = false;
+          sync_from_pi = false;
+          sync_flags = 0;
           last_rx_ms_ = millis();
           pi_connected_ = true;
           got_torque = true;
@@ -126,6 +147,36 @@ bool Controller_RL::read_torque_from_pi() {
         }
         break;
 
+      case READING_SYNC:
+        rx_sync_buf_[rx_idx_++] = b;
+        if (rx_idx_ == PI_SYNC_SIZE) {
+          int o = 2;
+          memcpy(&sync_sample_id, rx_sync_buf_ + o, 2); o += 2;
+
+          memcpy(&tau_pi_L_, rx_sync_buf_ + o, 4); o += 4;
+          memcpy(&tau_pi_R_, rx_sync_buf_ + o, 4); o += 4;
+          memcpy(&tau_pi_Lp, rx_sync_buf_ + o, 4); o += 4;
+          memcpy(&tau_pi_Ld, rx_sync_buf_ + o, 4); o += 4;
+          memcpy(&tau_pi_Rp, rx_sync_buf_ + o, 4); o += 4;
+          memcpy(&tau_pi_Rd, rx_sync_buf_ + o, 4); o += 4;
+
+          memcpy(&sync_ang_L100, rx_sync_buf_ + o, 2); o += 2;
+          memcpy(&sync_ang_R100, rx_sync_buf_ + o, 2); o += 2;
+          memcpy(&sync_vel_L10, rx_sync_buf_ + o, 2); o += 2;
+          memcpy(&sync_vel_R10, rx_sync_buf_ + o, 2); o += 2;
+          memcpy(&sync_ctrl_pwr_L100, rx_sync_buf_ + o, 2); o += 2;
+          memcpy(&sync_ctrl_pwr_R100, rx_sync_buf_ + o, 2); o += 2;
+          sync_flags = rx_sync_buf_[o];
+
+          sync_valid = true;
+          sync_from_pi = true;
+          last_rx_ms_ = millis();
+          pi_connected_ = true;
+          got_torque = true;
+          rx_state_ = WAIT_HEADER1;
+        }
+        break;
+
       default:
         rx_state_ = WAIT_HEADER1;
         break;
@@ -140,8 +191,9 @@ void Controller_RL::compute(const CtrlInput& in, CtrlOutput& out) {
   float Rpos = in.RTx;
   float Lvel = in.LTAVx;
   float Rvel = in.RTAVx;
+  uint16_t t_cs = (uint16_t)((in.current_time_us / 10000UL) & 0xFFFF);
 
-  send_imu_to_pi(Lpos, Rpos, Lvel, Rvel);
+  send_imu_to_pi(t_cs, Lpos, Rpos, Lvel, Rvel);
 
   // 2) 尝试读取 RPi 返回的扭矩 (同时也处理状态包)
   read_torque_from_pi();
@@ -151,6 +203,9 @@ void Controller_RL::compute(const CtrlInput& in, CtrlOutput& out) {
     tau_pi_L_ = 0.0f;
     tau_pi_R_ = 0.0f;
     pi_connected_ = false;
+    sync_valid = false;
+    sync_from_pi = false;
+    sync_flags = 0;
   }
 
   // 4) 限幅输出

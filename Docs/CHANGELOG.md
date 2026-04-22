@@ -5,6 +5,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Hardware 品牌交互可视化增强**（`GUI_RL_update/GUI.py`）：
+  - Motor 品牌下拉框改为高对比样式（粗边框 + 粗体），当 pending 与 current 不一致时高亮为橙色，便于一眼识别“待应用”状态
+  - `Apply` 按钮在目标品牌已生效时自动切为绿色并显示 `SIG Active` / `TMOTOR Active`
+  - 右侧品牌徽标改为 `Current:SIG/TMOTOR`，当前生效品牌使用绿色显示
+- **Motor Init 行为优化（品牌一致性）**（`GUI_RL_update/GUI.py`）：
+  - 当用户点击 `Motor Init` 且 pending 品牌与 current 品牌不一致时，GUI 先下发品牌切换，再自动触发一次 `Motor Init`
+  - `Motor Init` / 品牌选择 / Apply 提示文案与 tooltip 同步更新，减少“按钮显示与当前品牌不一致”的误解
+- **默认电机品牌切换为 TMOTOR**（`GUI_RL_update/GUI.py`, `All_in_one_hip_controller_RL_update.ino`）：
+  - GUI 品牌下拉默认项改为 `TMOTOR`（初始 pending=TMOTOR）
+  - Teensy 上电默认品牌改为 `TMOTOR`（`motor_L/motor_R/current_brand` 初值同步）
+
+## [v4.0] - 2026-04-21
+
 ### Engineering Rules (铁规则 — 长期有效，不随版本失效)
 
 > **2026-04-21 确立：关于功率 / 正功比例 / auto-delay 的数据来源约定**
@@ -23,6 +38,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > 相关根因与延迟账见 `Code Debug/BUG_ANALYSIS.md` §3 / §4；本规则在 Option A (RPi 把用过的 `angle/vel` echo 回 Teensy，RL 模式下 Teensy 用 echo 值打 BLE) 落地后，可将 GUI RL 模式也纳入"权威来源"范围，但规则本身（τ 与 ω 必须同瞬间）永远有效。
 
 ### Added
+
+- **RL 同步真值链路（Pi→Teensy `AA 59` + BLE 扩展区）**：
+  - RPi 控制帧由 legacy `AA 55` 升级为同步帧 `AA 59`（40B payload），同包下发：
+    - `sample_id`
+    - `tauL/tauR/Lp/Ld/Rp/Rd`
+    - 控制对齐输入 `sync_ang/sync_vel`
+    - 控制功率 `ctrl_pwr`
+  - Teensy `Controller_RL` 新增 `0x59` 解析与同步缓存，保留 `0x55`/`0x56` 兼容解析
+  - BLE 上行新增同步扩展区 `data_ble[101..127]`（payload `[98..124]`）：
+    - `phys_pwr`（执行器物理功率）
+    - `sync_ang/sync_vel/sync_cmd`（控制对齐流）
+    - `ctrl_pwr`（控制功率）
+    - `sync_from_pi` 等 flags
+  - RL+Pi 时同步流优先来自 Pi；无 Pi 同步时 Teensy 自动回退本地同采样 sync 流
+
+- **三端日志统一 Teensy 时间轴（便于 GUI/RPi/SD 对齐）**：
+  - Teensy→RPi IMU 二进制帧升级为 v2：新增 `t_cs(uint16)`（保持 v1 兼容解析）
+  - RPi CSV 新增 `teensy_t_cs_u16`、`teensy_t_s_unwrapped`
+  - GUI CSV 新增 `teensy_t_cs_u16`、`teensy_t_s_unwrapped`（与既有 `t_unwrapped_s` 并存）
+  - Teensy SD CSV 新增统一时间与动力学字段：`teensy_t_cs_u16`、`teensy_t_s_unwrapped`、`imu_L/Rvel`、`L/R_pwr_W`
+  - GUI Replay 扩展为自动识别 RPi/Teensy/GUI 三类 CSV 常见字段映射；速度/功率列缺失时自动回退 `0`
 
 - **GUI 一键远程启动/停止 Pi RL（本地 SSH，不经 Teensy）**（`GUI_RL_update/GUI.py`）：
   - RL 面板新增 `Start LegDcp` / `Start LSTM-PD` / `Stop Pi RL` 按钮
@@ -67,6 +103,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `.gitignore` 新增 PyInstaller 产物忽略规则：`.venv-build-*/`、`release/`、`*.spec`
 
 ### Changed
+
+- **GUI 功率来源改为“仅控制端上报”，移除本地 `vel*cmd` 真值路径**（`GUI_RL_update/GUI.py`）：
+  - `L_pwr/R_pwr` 不再由 GUI 本地推导；live 显示仅使用 Teensy/Pi 上报功率
+  - Plot 控制区新增 `Data Source`（`Auto/Raw/Sync`）与 `Power Source`（`Auto/Physical/Control`）
+  - `Auto` 规则：
+    - RL+Pi 同步有效：优先 `Sync + Control`
+    - 其他场景：回退 `Raw + Physical`
+  - GUI CSV 新增 raw/sync/physical/control 全链路字段与 source 标记，便于离线对齐分析
+  - Replay 模式若 CSV 缺失功率列，显示回退为 `0`（不再本地 `vel*cmd` 估算）
 
 - **RL torque 滤波通路统一到主循环**（`RPi_Unified/RL_controller_torch.py`）：
   - 统一执行链改为：`raw torque -> unified torque filter -> delay -> scale -> send_torque`

@@ -404,7 +404,10 @@ logf = root + ts.strftime('%Y%m%d-%H%M%S') + '.csv'
 
 csv_header = [
     'Time_ms', 'imu_LTx', 'imu_RTx', 'imu_Lvel', 'imu_Rvel',
+    'teensy_t_cs_u16', 'teensy_t_s_unwrapped',
     'auto_eval_Lvel', 'auto_eval_Rvel', 'auto_vel_source',
+    'sync_sample_id', 'sync_LTx', 'sync_RTx', 'sync_Lvel', 'sync_Rvel',
+    'sync_ctrl_pwr_L', 'sync_ctrl_pwr_R',
     'L_command_actuator', 'R_command_actuator',
     'raw_LExoTorque', 'raw_RExoTorque',
     'filtered_LExoTorque', 'filtered_RExoTorque',
@@ -855,7 +858,7 @@ def apply_runtime_filter_to_lstm(nn_obj, filter_code, cutoff_hz, filter_order, e
 def read_packet(ser: serial.Serial):
     """
     Return dict or None:
-      {'type':'imu', 'Lpos':..., 'Rpos':..., 'Lvel':..., 'Rvel':..., 'logtag':...}
+      {'type':'imu', 'Lpos':..., 'Rpos':..., 'Lvel':..., 'Rvel':..., 'logtag':..., 't_cs':...}
       {'type':'cfg', 'payload': bytes}
     """
     if not PI_USE_BINARY:
@@ -868,6 +871,7 @@ def read_packet(ser: serial.Serial):
                 return None
             return {
                 'type': 'imu',
+                't_cs': None,
                 'Lpos': vals[0], 'Rpos': vals[1],
                 'Lvel': vals[2], 'Rvel': vals[3],
                 'logtag': str(vals[4]),
@@ -905,15 +909,27 @@ def read_packet(ser: serial.Serial):
         return None
 
     if typ_v == 0x01:
-        if payload_len != 27:
-            return None
-        Lpos, Rpos, Lvel, Rvel, logtag = struct.unpack('<ffff11s', payload)
-        return {
-            'type': 'imu',
-            'Lpos': Lpos, 'Rpos': Rpos,
-            'Lvel': Lvel, 'Rvel': Rvel,
-            'logtag': logtag.decode(errors='ignore').rstrip('\x00'),
-        }
+        # v2: payload_len=29 => t_cs(u16)+4 floats+tag11
+        # v1 (legacy): payload_len=27 => 4 floats+tag11
+        if payload_len == 29:
+            t_cs, Lpos, Rpos, Lvel, Rvel, logtag = struct.unpack('<Hffff11s', payload)
+            return {
+                'type': 'imu',
+                't_cs': int(t_cs) & 0xFFFF,
+                'Lpos': Lpos, 'Rpos': Rpos,
+                'Lvel': Lvel, 'Rvel': Rvel,
+                'logtag': logtag.decode(errors='ignore').rstrip('\x00'),
+            }
+        if payload_len == 27:
+            Lpos, Rpos, Lvel, Rvel, logtag = struct.unpack('<ffff11s', payload)
+            return {
+                'type': 'imu',
+                't_cs': None,
+                'Lpos': Lpos, 'Rpos': Rpos,
+                'Lvel': Lvel, 'Rvel': Rvel,
+                'logtag': logtag.decode(errors='ignore').rstrip('\x00'),
+            }
+        return None
 
     if typ_v == 0x02:
         return {'type': 'cfg', 'payload': payload}
@@ -921,10 +937,42 @@ def read_packet(ser: serial.Serial):
     return None
 
 
-def send_torque(ser: serial.Serial, tau_L: float, tau_R: float, L_p, L_d, R_p, R_d):
-    """向 Teensy 发送 6×float32 (小端), header=AA 55"""
-    payload = struct.pack('<ffffff', tau_L, tau_R, L_p, L_d, R_p, R_d)
-    packet = b'\xAA\x55' + payload
+def _sat_i16(v: float, scale_factor: float = 1.0) -> int:
+    x = int(round(float(v) * float(scale_factor)))
+    if x < -32768:
+        return -32768
+    if x > 32767:
+        return 32767
+    return x
+
+
+def send_torque(ser: serial.Serial, tau_L: float, tau_R: float, L_p, L_d, R_p, R_d,
+                sample_id: int,
+                sync_ang_L: float, sync_ang_R: float,
+                sync_vel_L: float, sync_vel_R: float,
+                ctrl_pwr_L: float, ctrl_pwr_R: float):
+    """
+    向 Teensy 发送同步控制帧 (header=AA 59), payload 40 bytes:
+      sample_id(u16),
+      tauL,tauR,Lp,Ld,Rp,Rd (6xfloat32),
+      sync_ang_L/R (i16, deg*100),
+      sync_vel_L/R (i16, deg/s*10),
+      ctrl_pwr_L/R (i16, W*100),
+      flags(u8), reserved(u8)
+    """
+    flags = 0x01  # sync-valid
+    payload = struct.pack(
+        '<HffffffhhhhhhBB',
+        int(sample_id) & 0xFFFF,
+        float(tau_L), float(tau_R),
+        float(L_p), float(L_d), float(R_p), float(R_d),
+        _sat_i16(sync_ang_L, 100.0), _sat_i16(sync_ang_R, 100.0),
+        _sat_i16(sync_vel_L, 10.0), _sat_i16(sync_vel_R, 10.0),
+        _sat_i16(ctrl_pwr_L, 100.0), _sat_i16(ctrl_pwr_R, 100.0),
+        int(flags) & 0xFF,
+        0,
+    )
+    packet = b'\xAA\x59' + payload
     ser.write(packet)
     ser.flush()
 
@@ -1070,6 +1118,17 @@ def main():
     auto_bo_state_L = make_bo_state()
     auto_bo_state_R = make_bo_state()
 
+    # Per-frame sample id + delayed sync-input buffers (aligned with delay_frames_L/R)
+    sample_counter = 0
+    teensy_prev_t_cs = None
+    teensy_wrap_count = 0
+    teensy_t_s_unwrapped = 0.0
+    sync_sid_buf = deque([0] * BUF_SIZE, maxlen=BUF_SIZE)
+    sync_ang_L_buf = deque([0.0] * BUF_SIZE, maxlen=BUF_SIZE)
+    sync_ang_R_buf = deque([0.0] * BUF_SIZE, maxlen=BUF_SIZE)
+    sync_vel_L_buf = deque([0.0] * BUF_SIZE, maxlen=BUF_SIZE)
+    sync_vel_R_buf = deque([0.0] * BUF_SIZE, maxlen=BUF_SIZE)
+
     last_gui_tag = ""
     frame_count = 0
     status_dirty = True  # 启动时立即发送一次状态
@@ -1212,6 +1271,16 @@ def main():
                 delay_buf_L.extend([0.0] * BUF_SIZE)
                 delay_buf_R.clear()
                 delay_buf_R.extend([0.0] * BUF_SIZE)
+                sync_sid_buf.clear()
+                sync_sid_buf.extend([0] * BUF_SIZE)
+                sync_ang_L_buf.clear()
+                sync_ang_L_buf.extend([0.0] * BUF_SIZE)
+                sync_ang_R_buf.clear()
+                sync_ang_R_buf.extend([0.0] * BUF_SIZE)
+                sync_vel_L_buf.clear()
+                sync_vel_L_buf.extend([0.0] * BUF_SIZE)
+                sync_vel_R_buf.clear()
+                sync_vel_R_buf.extend([0.0] * BUF_SIZE)
 
                 print(
                     f"[RPi CFG] scale={runtime_scale:.3f}, delay={runtime_delay_ms:.1f}ms "
@@ -1222,6 +1291,23 @@ def main():
 
             if pkt['type'] != 'imu':
                 continue
+
+            sample_counter += 1
+            pkt_t_cs = pkt.get('t_cs', None)
+            if pkt_t_cs is not None:
+                t_cs_u16 = int(pkt_t_cs) & 0xFFFF
+                if teensy_prev_t_cs is not None:
+                    dt_cs = t_cs_u16 - int(teensy_prev_t_cs)
+                    if dt_cs < -30000:
+                        teensy_wrap_count += 1
+                    elif dt_cs > 30000:
+                        teensy_wrap_count = 0
+                teensy_prev_t_cs = t_cs_u16
+                teensy_t_s_unwrapped = ((teensy_wrap_count * 65536) + t_cs_u16) / 100.0
+                cur_sample_id = t_cs_u16
+            else:
+                t_cs_u16 = -1
+                cur_sample_id = int(sample_counter) & 0xFFFF
 
             Lpos = pkt['Lpos']
             Rpos = pkt['Rpos']
@@ -1457,14 +1543,35 @@ def main():
 
             delay_buf_L.appendleft(delay_input_L)
             delay_buf_R.appendleft(delay_input_R)
+            sync_sid_buf.appendleft(cur_sample_id)
+            sync_ang_L_buf.appendleft(float(Lpos))
+            sync_ang_R_buf.appendleft(float(Rpos))
+            sync_vel_L_buf.appendleft(float(Lvel))
+            sync_vel_R_buf.appendleft(float(Rvel))
             L_cmd_shifted = delay_buf_L[delay_frames_L]
             R_cmd_shifted = delay_buf_R[delay_frames_R]
 
             L_cmd_final = L_cmd_shifted * runtime_scale
             R_cmd_final = R_cmd_shifted * runtime_scale
 
+            sync_sample_id_L = int(sync_sid_buf[delay_frames_L]) & 0xFFFF
+            sync_sample_id_R = int(sync_sid_buf[delay_frames_R]) & 0xFFFF
+            sync_sample_id = max(sync_sample_id_L, sync_sample_id_R) & 0xFFFF
+            sync_ang_L = float(sync_ang_L_buf[delay_frames_L])
+            sync_ang_R = float(sync_ang_R_buf[delay_frames_R])
+            sync_vel_L = float(sync_vel_L_buf[delay_frames_L])
+            sync_vel_R = float(sync_vel_R_buf[delay_frames_R])
+            sync_ctrl_pwr_L = float(L_cmd_final) * float(sync_vel_L) * (np.pi / 180.0)
+            sync_ctrl_pwr_R = float(R_cmd_final) * float(sync_vel_R) * (np.pi / 180.0)
+
             # ---- 发送给 Teensy ----
-            send_torque(ser, L_cmd_final, R_cmd_final, L_p, L_d, R_p, R_d)
+            send_torque(
+                ser, L_cmd_final, R_cmd_final, L_p, L_d, R_p, R_d,
+                sample_id=sync_sample_id,
+                sync_ang_L=sync_ang_L, sync_ang_R=sync_ang_R,
+                sync_vel_L=sync_vel_L, sync_vel_R=sync_vel_R,
+                ctrl_pwr_L=sync_ctrl_pwr_L, ctrl_pwr_R=sync_ctrl_pwr_R,
+            )
 
             # ---- 定期发送RPi状态 (供GUI显示) ----
             frame_count += 1
@@ -1495,9 +1602,18 @@ def main():
                 'imu_RTx': f'{Rpos:.4f}',
                 'imu_Lvel': f'{Lvel:.4f}',
                 'imu_Rvel': f'{Rvel:.4f}',
+                'teensy_t_cs_u16': str(int(t_cs_u16)),
+                'teensy_t_s_unwrapped': f'{teensy_t_s_unwrapped:.4f}',
                 'auto_eval_Lvel': f'{vel_eval_L:.4f}',
                 'auto_eval_Rvel': f'{vel_eval_R:.4f}',
                 'auto_vel_source': auto_vel_source,
+                'sync_sample_id': str(int(sync_sample_id)),
+                'sync_LTx': f'{sync_ang_L:.4f}',
+                'sync_RTx': f'{sync_ang_R:.4f}',
+                'sync_Lvel': f'{sync_vel_L:.4f}',
+                'sync_Rvel': f'{sync_vel_R:.4f}',
+                'sync_ctrl_pwr_L': f'{sync_ctrl_pwr_L:.6f}',
+                'sync_ctrl_pwr_R': f'{sync_ctrl_pwr_R:.6f}',
                 'L_command_actuator': f'{L_cmd_final:.6f}',
                 'R_command_actuator': f'{R_cmd_final:.6f}',
                 'raw_LExoTorque': f'{L_cmd:.6f}',
