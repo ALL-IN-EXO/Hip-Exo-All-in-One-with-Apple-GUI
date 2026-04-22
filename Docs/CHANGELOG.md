@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **左侧参数面板滚动修正（`GUI_RL_update/GUI.py`）**：
+  - 修复 `QScrollArea` 在部分平台出现左侧内容空白/不可见的问题（恢复 `setWidgetResizable(True)`）
+  - 保留纵向与横向滚动条 `AsNeeded`，满足窄屏/高缩放场景可平移查看
+
 - **GUI 远程启动 RL 时的 Delay 默认显示对齐**（`GUI_RL_update/GUI.py`）：
   - 点击 `Start LSTM-PD` 时，RL 面板 `Torque Delay (ms)` 预填为 `200ms`
   - 点击 `Start LegDcp` 时，RL 面板 `Torque Delay (ms)` 预填为 `100ms`

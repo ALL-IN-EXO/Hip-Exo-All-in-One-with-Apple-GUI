@@ -900,9 +900,9 @@ class MainWindow(QWidget):
 
         # Left panel (scrollable)
         scroll = QScrollArea()
-        # Keep intrinsic content width so narrow displays can pan horizontally
-        # instead of compressing parameter controls.
-        scroll.setWidgetResizable(False)
+        # Keep widget resizable to avoid blank/zero-size content on some platforms;
+        # horizontal/vertical scrollbars remain enabled as-needed.
+        scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
