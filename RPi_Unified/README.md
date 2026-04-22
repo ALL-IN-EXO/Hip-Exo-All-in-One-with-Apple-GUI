@@ -35,6 +35,100 @@ RPi_Unified/
 
 ---
 
+## 环境准备（按当前项目配置）
+
+> 目标环境：Raspberry Pi 5 + Raspberry Pi OS 64-bit  
+> 项目默认虚拟环境路径：`~/venvs/pytorch-env`（`run.sh` 和 GUI 远程启动都按这个路径）
+
+### 1) 安装系统依赖（必需）
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip tmux rsync
+```
+
+说明：
+- `tmux`：**必需**。GUI 的 `Start LegDcp / Start LSTM-PD / Stop Pi RL` 依赖 `tmux` 托管进程。
+- `rsync`：建议安装。用于本地工具脚本下发代码/回传数据。
+
+### 2) 打开串口硬件 UART（`/dev/ttyAMA0`）
+
+`RPi_Unified` 默认使用：
+
+```python
+SER_DEV = '/dev/ttyAMA0'
+```
+
+请在 Pi 上确认 UART 配置：
+
+```bash
+sudo raspi-config
+```
+
+进入 `Interface Options -> Serial Port`：
+- `Login shell over serial?` 选 `No`
+- `Serial hardware enabled?` 选 `Yes`
+
+然后重启：
+
+```bash
+sudo reboot
+```
+
+重启后检查：
+
+```bash
+ls -l /dev/ttyAMA0
+```
+
+### 3) 创建并安装 Python 环境（必需）
+
+```bash
+python3 -m venv ~/venvs/pytorch-env
+source ~/venvs/pytorch-env/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+pip install numpy pyserial torch
+```
+
+可选（仅用于可视化脚本 `tools/rpi_output_viewer.py`）：
+
+```bash
+pip install pandas matplotlib
+```
+
+### 4) 快速自检（建议）
+
+```bash
+source ~/venvs/pytorch-env/bin/activate
+python - <<'PY'
+import torch, serial, numpy
+print("torch:", torch.__version__)
+print("numpy:", numpy.__version__)
+print("pyserial:", serial.__version__)
+PY
+tmux -V
+ls -l /dev/ttyAMA0
+```
+
+### 5) 运行方式（与你当前配置一致）
+
+```bash
+source ~/venvs/pytorch-env/bin/activate
+cd RPi_Unified
+python RL_controller_torch.py --nn lstm_leg_dcp
+# 或
+python RL_controller_torch.py --nn lstm_pd
+```
+
+也可用项目自带脚本：
+
+```bash
+cd RPi_Unified
+./run.sh lstm_leg_dcp
+```
+
+---
+
 ## 快速使用
 
 ```bash

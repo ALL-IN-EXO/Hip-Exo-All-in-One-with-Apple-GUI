@@ -676,6 +676,7 @@ class MainWindow(QWidget):
         self._replay_status_min_interval_s = 0.12  # ~8 Hz
         self._replay_budget_ms = 5.0
         self._power_overlay_min_interval_s = 0.25  # ~4 Hz
+        self._power_overlay_local_min_abs_w = 0.05
         self._power_overlay_left_sig = None
         self._power_overlay_right_sig = None
         self._power_overlay_left_last_ts = 0.0
@@ -899,12 +900,16 @@ class MainWindow(QWidget):
 
         # Left panel (scrollable)
         scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        # Keep intrinsic content width so narrow displays can pan horizontally
+        # instead of compressing parameter controls.
+        scroll.setWidgetResizable(False)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         left_widget = QWidget()
         left_widget.setStyleSheet("background: transparent;")
+        left_widget.setMinimumWidth(480)
         left = QVBoxLayout(left_widget)
         left.setContentsMargins(0, 0, 8, 0)
         left.setSpacing(8)
@@ -1029,6 +1034,21 @@ class MainWindow(QWidget):
         self.sb_max_torque_cfg.setFixedWidth(90)
         mt_row.addWidget(self.sb_max_torque_cfg)
         param_lay.addLayout(mt_row)
+
+        torque_filter_tip = (
+            "Teensy unified filter before motor torque command (non-RL algorithms).\n"
+            "Type is fixed to Butterworth IIR (2nd order).\n"
+            "RL mode keeps Pi->Teensy torque path transparent (no Teensy pre-motor filtering)."
+        )
+        tf_row = QHBoxLayout()
+        lbl_tf_fc = QLabel("Filter Before Torque (Hz)")
+        lbl_tf_fc.setToolTip(torque_filter_tip)
+        tf_row.addWidget(lbl_tf_fc)
+        tf_row.addStretch(1)
+        self.sb_torque_filter_fc = make_dspin(5.0, 0.3, 20.0, 0.1, 1, torque_filter_tip)
+        self.sb_torque_filter_fc.setFixedWidth(90)
+        tf_row.addWidget(self.sb_torque_filter_fc)
+        param_lay.addLayout(tf_row)
 
         # Separator
         sep = QFrame(); sep.setFrameShape(QFrame.HLine)
@@ -2639,6 +2659,13 @@ class MainWindow(QWidget):
         if nn_type not in ("lstm_leg_dcp", "lstm_pd"):
             self._set_pi_rl_remote_state(f"Pi RL Remote: unsupported nn '{nn_type}'", C.red, force=True)
             return
+        # Keep staged GUI display aligned with Pi-side runtime defaults even before
+        # the first RPi status frame returns.
+        if nn_type == "lstm_pd":
+            self._set_rl_delay_spinbox_value(200.0)
+        elif nn_type == "lstm_leg_dcp":
+            self._set_rl_delay_spinbox_value(100.0)
+        self._update_rl_filter_state_label()
         profile, err = self._load_rpi_ssh_profile()
         if err and ("no pi profile configured" in str(err).lower()):
             self._set_pi_rl_remote_state(
@@ -5139,30 +5166,45 @@ class MainWindow(QWidget):
         self.pwr_strip_right.setTitle("Right Leg Power Sign", color=C.text2, size='10pt')
         self.pwr_strip_left.setTitle("Left Leg Power Sign", color=C.text2, size='10pt')
 
-        def _format_leg_overlay(side_label, ratio, pos_w, neg_w, delay_ms,
-                                motion_valid, valid):
+        def _format_leg_overlay(ratio, pos_w, neg_w, motion_valid, valid, auto_enable):
             if not valid:
                 line1 = f"+Ratio --.-% | WAIT"
                 line2 = f"+P --.-- W  -P --.-- W"
                 return line1, line2
             ratio_clamped = max(0.0, min(1.0, float(ratio)))
             ratio_pct = ratio_clamped * 100.0
-            auto_txt = "ON" if self._rpi_auto_delay_enable else "OFF"
+            auto_txt = "ON" if auto_enable else "OFF"
             motion_txt = "VALID" if motion_valid else "HOLD"
             line1 = f"+Ratio {ratio_pct:.1f}% | {auto_txt}/{motion_txt}"
             line2 = f"+P {float(pos_w):+.2f} W  -P {float(neg_w):+.2f} W"
             return line1, line2
 
-        valid = bool(self._rpi_status_valid)
+        if self._rpi_status_valid:
+            auto_enable = bool(self._rpi_auto_delay_enable)
+            ratio_L = float(self._rpi_power_ratio_L)
+            ratio_R = float(self._rpi_power_ratio_R)
+            pos_L = float(self._rpi_pos_per_s_L)
+            pos_R = float(self._rpi_pos_per_s_R)
+            neg_L = float(self._rpi_neg_per_s_L)
+            neg_R = float(self._rpi_neg_per_s_R)
+            mv_L = bool(self._rpi_auto_motion_valid_L)
+            mv_R = bool(self._rpi_auto_motion_valid_R)
+            valid_L = True
+            valid_R = True
+        else:
+            ratio_L, pos_L, neg_L, mv_L, valid_L = self._compute_local_power_overlay_metrics('left')
+            ratio_R, pos_R, neg_R, mv_R, valid_R = self._compute_local_power_overlay_metrics('right')
+            algo = int(getattr(self, "_algo_select", ALGO_EG))
+            auto_enable = (
+                (algo == ALGO_EG and bool(self._eg_auto_delay_enable)) or
+                (algo == ALGO_SAMSUNG and bool(self._sam_auto_delay_enable))
+            )
+
         l1_L, l2_L = _format_leg_overlay(
-            "L", self._rpi_power_ratio_L, self._rpi_pos_per_s_L,
-            self._rpi_neg_per_s_L, self._rpi_delay_ms_L,
-            self._rpi_auto_motion_valid_L, valid,
+            ratio_L, pos_L, neg_L, mv_L, valid_L, auto_enable
         )
         l1_R, l2_R = _format_leg_overlay(
-            "R", self._rpi_power_ratio_R, self._rpi_pos_per_s_R,
-            self._rpi_neg_per_s_R, self._rpi_delay_ms_R,
-            self._rpi_auto_motion_valid_R, valid,
+            ratio_R, pos_R, neg_R, mv_R, valid_R, auto_enable
         )
 
         self._set_power_overlay_html(
@@ -5181,6 +5223,37 @@ class MainWindow(QWidget):
             line2=l2_R,
             force=force,
         )
+
+    def _compute_local_power_overlay_metrics(self, side):
+        """Fallback overlay metrics from current GUI power strip window."""
+        buf = self.L_pwr_buf if side == 'left' else self.R_pwr_buf
+        vals = []
+        for v in buf:
+            fv = float(v)
+            if isfinite(fv):
+                vals.append(fv)
+        n = len(vals)
+        if n < 3:
+            return 0.0, 0.0, 0.0, False, False
+
+        pos_sum = 0.0
+        neg_abs_sum = 0.0
+        for v in vals:
+            if v > 0.0:
+                pos_sum += v
+            elif v < 0.0:
+                neg_abs_sum += (-v)
+        denom = pos_sum + neg_abs_sum
+        if denom <= 1e-6:
+            return 0.0, 0.0, 0.0, False, False
+
+        pos_per_s = pos_sum / float(n)
+        neg_per_s = -neg_abs_sum / float(n)
+        motion_valid = (
+            (abs(pos_per_s) + abs(neg_per_s)) >= float(self._power_overlay_local_min_abs_w)
+        )
+        ratio = pos_sum / denom
+        return ratio, pos_per_s, neg_per_s, motion_valid, True
 
     def _set_power_overlay_html(self, side, strip, overlay, line1, line2, force=False):
         if overlay is None or strip is None:
@@ -5415,6 +5488,8 @@ class MainWindow(QWidget):
         flags |= (self._dir_bits & 0x03) << 2
         payload[2] = flags
         put_s16(3, max(0.0, min(30.0, float(self.sb_max_torque_cfg.value()))))
+        # Unified Teensy pre-motor filter cutoff [31..32] (Hz*100).
+        put_s16(31, float(self.sb_torque_filter_fc.value()))
 
         algo = self._algo_select
         if algo == ALGO_EG:

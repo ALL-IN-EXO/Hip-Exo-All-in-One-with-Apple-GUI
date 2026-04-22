@@ -116,7 +116,59 @@ double RLTx_filtered = 0;
 
 float  gait_freq = 0;
 float  max_torque_cfg = 0.0f;
+float  torque_filter_fc_hz = 5.0f;  // 统一电机前滤波截止频率 (Hz)
 static uint8_t gait_inited = 0;
+
+// === 统一电机前滤波 (non-RL only): 2nd-order Butterworth IIR ===
+struct TorqueBiquadLPF {
+  float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f;
+  float a1 = 0.0f, a2 = 0.0f;
+  float x1 = 0.0f, x2 = 0.0f;
+  float y1 = 0.0f, y2 = 0.0f;
+
+  void reset_state() {
+    x1 = x2 = y1 = y2 = 0.0f;
+  }
+
+  void setup_lowpass(float fc_hz, float fs_hz) {
+    const float q = 0.70710678f;
+    const float nyq = 0.5f * fs_hz;
+    float fc = fc_hz;
+    if (!(fc > 0.0f)) fc = 5.0f;
+    if (fc < 0.3f) fc = 0.3f;
+    if (fc > (nyq - 0.5f)) fc = nyq - 0.5f;
+
+    const float omega = 2.0f * PI * fc / fs_hz;
+    const float sn = sinf(omega);
+    const float cs = cosf(omega);
+    const float alpha = sn / (2.0f * q);
+
+    float bb0 = (1.0f - cs) * 0.5f;
+    float bb1 = (1.0f - cs);
+    float bb2 = (1.0f - cs) * 0.5f;
+    float aa0 = 1.0f + alpha;
+    float aa1 = -2.0f * cs;
+    float aa2 = 1.0f - alpha;
+    if (fabsf(aa0) < 1e-6f) aa0 = 1.0f;
+
+    b0 = bb0 / aa0;
+    b1 = bb1 / aa0;
+    b2 = bb2 / aa0;
+    a1 = aa1 / aa0;
+    a2 = aa2 / aa0;
+  }
+
+  float process(float x) {
+    const float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+    x2 = x1; x1 = x;
+    y2 = y1; y1 = y;
+    return y;
+  }
+};
+
+static TorqueBiquadLPF torque_lpf_L;
+static TorqueBiquadLPF torque_lpf_R;
+static float torque_filter_fc_hz_prev = -1.0f;
 
 // RPi 透传缓冲
 static uint8_t rpi_uplink_buf[40] = {0};
@@ -144,6 +196,18 @@ static inline float clampf(float x, float lo, float hi) {
   if (x < lo) return lo;
   if (x > hi) return hi;
   return x;
+}
+
+static void update_torque_filter_if_needed() {
+  if (fabsf(torque_filter_fc_hz - torque_filter_fc_hz_prev) < 1e-4f) return;
+  torque_lpf_L.setup_lowpass(torque_filter_fc_hz, 100.0f);
+  torque_lpf_R.setup_lowpass(torque_filter_fc_hz, 100.0f);
+  torque_filter_fc_hz_prev = torque_filter_fc_hz;
+}
+
+static void reset_torque_filter_state() {
+  torque_lpf_L.reset_state();
+  torque_lpf_R.reset_state();
 }
 
 static uint8_t rpi_cksum8(const uint8_t* p, size_t n) {
@@ -204,6 +268,7 @@ void switch_motor_brand(uint8_t new_brand) {
 
   M1_torque_command = 0.0f;
   M2_torque_command = 0.0f;
+  reset_torque_filter_state();
 
   current_brand = new_brand;
   Serial.printf("[MOTOR] Switch done. Brand=%s\n", motor_L->brand_name());
@@ -230,6 +295,7 @@ void switch_algorithm(uint8_t new_algo) {
   motor_R->stop();
   M1_torque_command = 0.0f;
   M2_torque_command = 0.0f;
+  reset_torque_filter_state();
 
   Serial.printf("[ALGO] Switching from %s to %s\n",
     active_ctrl->name(), new_ctrl->name());
@@ -289,6 +355,9 @@ void setup() {
     Serial.println(F("SD card init or file create failed!"));
   }
 
+  update_torque_filter_if_needed();
+  reset_torque_filter_state();
+
   Serial.printf("[OK] Algorithm: %s\n", active_ctrl->name());
   t_0 = micros();
 }
@@ -317,6 +386,7 @@ void loop() {
     motor_R->init();
     M1_torque_command = 0.0f;
     M2_torque_command = 0.0f;
+    reset_torque_filter_state();
     Serial.println("[MOTOR] Reinitialization done");
   }
 
@@ -408,6 +478,29 @@ void loop() {
     // This is centralized here so all algorithms (EG/Samsung/RL/Test) behave consistently.
     cout.tau_L *= (cin.l_ctl_dir >= 0) ? 1.0f : -1.0f;
     cout.tau_R *= (cin.r_ctl_dir >= 0) ? 1.0f : -1.0f;
+
+    // 统一电机前滤波（仅 Teensy-native 算法；RL 路径保持 Pi→Teensy→Motor 透明）
+    if (active_algo_id != ALGO_RL) {
+      update_torque_filter_if_needed();
+      if (!imu_init_ok && active_algo_id != ALGO_TEST) {
+        // 安全门触发时立即清零，避免滤波尾迹。
+        reset_torque_filter_state();
+        cout.tau_L = 0.0f;
+        cout.tau_R = 0.0f;
+      } else {
+        cout.tau_L = torque_lpf_L.process(cout.tau_L);
+        cout.tau_R = torque_lpf_R.process(cout.tau_R);
+      }
+    }
+
+    // 最终安全限幅（滤波后再限幅，确保 Max Torque 严格生效）
+    {
+      const float max_abs_cmd = fabsf(max_torque_cfg);
+      if (cout.tau_L >  max_abs_cmd) cout.tau_L =  max_abs_cmd;
+      if (cout.tau_L < -max_abs_cmd) cout.tau_L = -max_abs_cmd;
+      if (cout.tau_R >  max_abs_cmd) cout.tau_R =  max_abs_cmd;
+      if (cout.tau_R < -max_abs_cmd) cout.tau_R = -max_abs_cmd;
+    }
 
     M2_torque_command = cout.tau_L;  // M2 = 左腿
     M1_torque_command = cout.tau_R;  // M1 = 右腿
@@ -571,6 +664,7 @@ void Receive_ble_Data() {
 #if GUI_WRITE_ENABLE
     // 通用参数
     max_torque_cfg = clampf(dl.max_torque_cfg, 0.0f, 30.0f);
+    torque_filter_fc_hz = clampf(dl.torque_filter_fc_hz, 0.3f, 20.0f);
     int prev_l_dir = l_ctl_dir;
     int prev_r_dir = r_ctl_dir;
     l_ctl_dir = (dl.dir_bits & 0x01) ? 1 : -1;

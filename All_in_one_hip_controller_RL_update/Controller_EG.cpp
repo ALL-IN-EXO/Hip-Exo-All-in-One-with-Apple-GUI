@@ -34,8 +34,6 @@ void Controller_EG::reset() {
   post_buf_idx_ = 0;
   xL_prev_ = 0.0f;
   xR_prev_ = 0.0f;
-  tau_cmd_L_filt_ = 0.0f;
-  tau_cmd_R_filt_ = 0.0f;
   ado_.reset(post_delay_ms_base_);
 }
 
@@ -148,12 +146,9 @@ void Controller_EG::compute(const CtrlInput& in, CtrlOutput& out) {
   float tau_gate_L = tau_raw_L * gate_L;
   float tau_gate_R = tau_raw_R * gate_R;
 
-  // 低通
-  tau_cmd_L_filt_ = 0.85f * tau_cmd_L_filt_ + 0.15f * tau_gate_L;
-  tau_cmd_R_filt_ = 0.85f * tau_cmd_R_filt_ + 0.15f * tau_gate_R;
-
-  float S_src_L = tau_cmd_L_filt_ * scale_all_;
-  float S_src_R = tau_cmd_R_filt_ * scale_all_;
+  // 统一的电机前滤波在 .ino 主循环执行；这里保持算法输出原始链路。
+  float S_src_L = tau_gate_L * scale_all_;
+  float S_src_R = tau_gate_R * scale_all_;
 
   // === 伸展复制 ===
   const int8_t flex_sign_L = -1;
