@@ -2,9 +2,9 @@
 
 A multi-component control system for the hip exoskeleton, consisting of Teensy 4.1 firmware, a Raspberry Pi RL controller, and a macOS GUI. Supports runtime-switchable control algorithms (Energy Gate, Samsung, RL neural networks, Test mode) via BLE.
 
-**Current Version: v3.3** (2026-04-15) | [Full Changelog](Docs/CHANGELOG.md)
+**Current Version: v4.0** (2026-04-21) | [Full Changelog](Docs/CHANGELOG.md)
 
-**What's new in v3.3:** CSV replay controls were added to the GUI (`Load/Pause/Speed/<<5s/>>5s/Stop`) with column mapping support; RL auto-delay now supports `Grid` and `BO` runtime method switching via GUI passthrough; GUI plotting performance was improved for long-running sessions (decoupled ingest/render, replay time-budget processing, overlay/style update throttling).
+**What's new in v4.0:** Introduced the RL synchronized truth pipeline (`AA 59` Pi→Teensy + BLE telemetry extension) so GUI power/signal display can use control-aligned data; unified Teensy-based timestamps across GUI/RPi/SD logs (`teensy_t_cs_u16`, `teensy_t_s_unwrapped`) for cross-file alignment; expanded replay CSV compatibility (GUI/RPi/Teensy schemas), added Pi remote launcher/profile workflow in GUI, and integrated 6-IMU battery reporting to the hardware panel.
 
 ## System Overview
 

@@ -78,9 +78,9 @@ static MotorDriver_Sig    sig_R(2, 9.76f);
 static MotorDriver_Tmotor tm_L(0x001, 104, 0.73f);
 static MotorDriver_Tmotor tm_R(0x002, 105, 0.73f);
 
-MotorDriver* motor_L = &sig_L;
-MotorDriver* motor_R = &sig_R;
-uint8_t current_brand = BRAND_SIG;
+MotorDriver* motor_L = &tm_L;
+MotorDriver* motor_R = &tm_R;
+uint8_t current_brand = BRAND_TMOTOR;
 bool motor_brand_switch_pending = false;
 uint8_t pending_brand = BRAND_NONE;
 
@@ -268,7 +268,7 @@ void setup() {
   // RL Serial8 初始化
   ctrl_rl.init_serial();
 
-  // 电机初始化（默认 SIG）
+  // 电机初始化（默认 TMOTOR）
   motor_L->init();
   motor_R->init();
   Serial.printf("[OK] Motor init done (brand=%s)\n", motor_L->brand_name());
@@ -278,8 +278,10 @@ void setup() {
     Serial.print(F("SD Logging file: "));
     Serial.println(logger.filename());
     logger.println(F(
-      "Time_ms,imu_RTx,imu_LTx,R_command_actuator,L_command_actuator,L_torque_meas,R_torque_meas,"
-      "brand,algo,L_pos_deg,R_pos_deg,tag"
+      "Time_ms,teensy_t_cs_u16,teensy_t_s_unwrapped,"
+      "imu_LTx,imu_RTx,imu_Lvel,imu_Rvel,"
+      "L_command_actuator,R_command_actuator,L_torque_meas,R_torque_meas,"
+      "L_pwr_W,R_pwr_W,brand,algo,L_pos_deg,R_pos_deg,tag"
     ));
     logger.flush();
     g_init_status = 1;
@@ -417,13 +419,26 @@ void loop() {
 
     // 8) SD 日志
     if (logger.isOpen()) {
+      uint16_t t_cs_u16 = (uint16_t)((current_time / 10000UL) & 0xFFFF);
+      float t_s_unwrapped = current_time / 1000000.0f;
+      float L_torque_meas = motor_L->get_torque_meas();
+      float R_torque_meas = motor_R->get_torque_meas();
+      float L_pwr_w = L_torque_meas * imu.LTAVx * (PI / 180.0f);
+      float R_pwr_w = R_torque_meas * imu.RTAVx * (PI / 180.0f);
+
       logger.print(current_time / 1000UL); logger.print(',');
-      logger.print(imu.RTx, 4);            logger.print(',');
+      logger.print(t_cs_u16);              logger.print(',');
+      logger.print(t_s_unwrapped, 4);      logger.print(',');
       logger.print(imu.LTx, 4);            logger.print(',');
-      logger.print(M1_torque_command, 4);   logger.print(',');
-      logger.print(M2_torque_command, 4);   logger.print(',');
-      logger.print(motor_L->get_torque_meas(), 4); logger.print(',');
-      logger.print(motor_R->get_torque_meas(), 4); logger.print(',');
+      logger.print(imu.RTx, 4);            logger.print(',');
+      logger.print(imu.LTAVx, 4);          logger.print(',');
+      logger.print(imu.RTAVx, 4);          logger.print(',');
+      logger.print(M2_torque_command, 4);  logger.print(',');
+      logger.print(M1_torque_command, 4);  logger.print(',');
+      logger.print(L_torque_meas, 4);      logger.print(',');
+      logger.print(R_torque_meas, 4);      logger.print(',');
+      logger.print(L_pwr_w, 4);            logger.print(',');
+      logger.print(R_pwr_w, 4);            logger.print(',');
       logger.print(motor_L->brand_name());  logger.print(',');
       logger.print(active_ctrl->name());    logger.print(',');
       logger.print(motor_L->get_pos_deg(), 2); logger.print(',');
@@ -599,6 +614,11 @@ void Receive_ble_Data() {
 /******************** BLE 发送 (128 字节帧) ********************/
 void Transmit_ble_Data() {
   memset(data_ble, 0, BLE_FRAME_LEN);
+  auto sat_i16 = [](float v) -> int16_t {
+    if (v > 32767.0f) return 32767;
+    if (v < -32768.0f) return -32768;
+    return (int16_t)roundf(v);
+  };
 
   BleUplinkData ud;
   ud.t_cs         = (uint16_t)((millis() / 10) & 0xFFFF);
@@ -660,6 +680,61 @@ void Transmit_ble_Data() {
     memset(rpi_uplink_buf, 0, 40);
   }
   ble_pack_rpi_uplink(data_ble, rpi_uplink_buf, 40);
+
+  // ===== 控制同步扩展区 [101..127] =====
+  const uint8_t TELE_FLAG_VALID      = 0x01;
+  const uint8_t TELE_FLAG_PHYS_VALID = 0x02;
+  const uint8_t TELE_FLAG_CTRL_VALID = 0x04;
+  const uint8_t TELE_FLAG_SYNC_VALID = 0x08;
+  const uint8_t TELE_FLAG_SYNC_FROM_PI = 0x10;
+
+  float phys_pwr_L = motor_L->get_torque_meas() * imu.LTAVx * (PI / 180.0f);
+  float phys_pwr_R = motor_R->get_torque_meas() * imu.RTAVx * (PI / 180.0f);
+
+  int16_t sync_ang_L100 = ud.L_ang100;
+  int16_t sync_ang_R100 = ud.R_ang100;
+  int16_t sync_vel_L10  = ud.LTAVx_10;
+  int16_t sync_vel_R10  = ud.RTAVx_10;
+  int16_t sync_cmd_L100 = ud.L_cmd100;
+  int16_t sync_cmd_R100 = ud.R_cmd100;
+  int16_t ctrl_pwr_L100 = sat_i16((sync_cmd_L100 / 100.0f) * (sync_vel_L10 / 10.0f) * (PI / 180.0f) * 100.0f);
+  int16_t ctrl_pwr_R100 = sat_i16((sync_cmd_R100 / 100.0f) * (sync_vel_R10 / 10.0f) * (PI / 180.0f) * 100.0f);
+  uint16_t sync_sample_id = 0;
+  uint8_t ext_flags = TELE_FLAG_VALID | TELE_FLAG_PHYS_VALID | TELE_FLAG_CTRL_VALID;
+  uint8_t ext_age_ms_10 = 0xFF;
+
+  // RL + Pi 同步链路有效时，优先使用 Pi 对齐输入/功率。
+  if (active_algo_id == ALGO_RL && ctrl_rl.sync_valid && ctrl_rl.sync_from_pi) {
+    sync_sample_id = ctrl_rl.sync_sample_id;
+    sync_ang_L100 = ctrl_rl.sync_ang_L100;
+    sync_ang_R100 = ctrl_rl.sync_ang_R100;
+    sync_vel_L10 = ctrl_rl.sync_vel_L10;
+    sync_vel_R10 = ctrl_rl.sync_vel_R10;
+    ctrl_pwr_L100 = ctrl_rl.sync_ctrl_pwr_L100;
+    ctrl_pwr_R100 = ctrl_rl.sync_ctrl_pwr_R100;
+    ext_flags |= (TELE_FLAG_SYNC_VALID | TELE_FLAG_SYNC_FROM_PI);
+    ext_age_ms_10 = 0;
+  } else {
+    // 非 RL / 无 Pi 同步时，sync 通道回退到本地同采样值。
+    ext_flags |= TELE_FLAG_SYNC_VALID;
+    ext_age_ms_10 = 0xFF;
+  }
+
+  BleTelemetryExt te;
+  te.flags = ext_flags;
+  te.sample_id = sync_sample_id;
+  te.phys_pwr_L100 = sat_i16(phys_pwr_L * 100.0f);
+  te.phys_pwr_R100 = sat_i16(phys_pwr_R * 100.0f);
+  te.sync_ang_L100 = sync_ang_L100;
+  te.sync_ang_R100 = sync_ang_R100;
+  te.sync_vel_L10 = sync_vel_L10;
+  te.sync_vel_R10 = sync_vel_R10;
+  te.sync_cmd_L100 = sync_cmd_L100;
+  te.sync_cmd_R100 = sync_cmd_R100;
+  te.ctrl_pwr_L100 = ctrl_pwr_L100;
+  te.ctrl_pwr_R100 = ctrl_pwr_R100;
+  te.age_ms_10 = ext_age_ms_10;
+  ble_pack_telem_ext(data_ble, te);
 
   Serial5.write(data_ble, BLE_FRAME_LEN);
 }
