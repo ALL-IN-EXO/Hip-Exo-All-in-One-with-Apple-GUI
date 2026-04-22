@@ -3229,6 +3229,13 @@ class MainWindow(QWidget):
         self._algo_select = self._algo_pending
         algo_name = ALGO_NAMES.get(self._algo_select, '?')
         print(f"[GUI] Algorithm CONFIRMED: {algo_name}")
+        # Force fresh status parsing after algorithm switch (avoid stale overlay state).
+        self._rpi_status_valid = False
+        self._rpi_online = False
+        self._rpi_last_rx_time = 0.0
+        self._rpi_status_version = 0
+        self._rpi_nn_type = -1
+        self._prev_rpi_nn_type = -1
         algo_tag_map = {
             "EG": "ALG_EG",
             "Samsung": "ALG_SAM",
@@ -3494,12 +3501,13 @@ class MainWindow(QWidget):
         elif power_mode == "Control":
             power_active = "Control" if ctrl_ok else ("Physical" if phys_ok else "None")
         else:
+            # Auto power should follow controller-synchronous power first.
             if active_algo == ALGO_RL and ctrl_ok and sync_from_pi:
+                power_active = "Control"
+            elif ctrl_ok:
                 power_active = "Control"
             elif phys_ok:
                 power_active = "Physical"
-            elif ctrl_ok:
-                power_active = "Control"
             else:
                 power_active = "None"
 

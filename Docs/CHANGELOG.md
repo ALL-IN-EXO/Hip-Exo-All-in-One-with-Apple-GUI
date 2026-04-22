@@ -7,6 +7,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Power Sign overlay 在 SOGI/Samsung 下的显示修复**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`, `GUI_RL_update/GUI.py`）：
+  - Teensy `Transmit_ble_Data()` 补齐 `ALGO_SOGI` 的 `fill_ble_status()` 上报，SOGI 不再写零状态槽
+  - GUI 算法切换时清空上一算法状态缓存，避免出现旧状态粘连导致的 `WAIT`/0 值
+  - GUI `Power: Auto` 逻辑调整为优先 `Control` 功率源（控制同步样本），减少 `Power Sign` 条带在非 RL 算法下“全红/近零”的误显示
+
 - **左侧参数面板滚动修正（`GUI_RL_update/GUI.py`）**：
   - 修复 `QScrollArea` 在部分平台出现左侧内容空白/不可见的问题（恢复 `setWidgetResizable(True)`）
   - 保留纵向与横向滚动条 `AsNeeded`，满足窄屏/高缩放场景可平移查看
