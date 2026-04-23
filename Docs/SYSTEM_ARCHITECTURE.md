@@ -467,7 +467,7 @@ RPi 每 50 帧 (~0.5s @100Hz) 发送状态帧 (header `AA 56` + 40B):
 | Samsung（Teensy native） | Teensy `Controller_Samsung` | Teensy `AutoDelayOptimizer`（grid） | Teensy（Samsung delay） | Teensy 主循环统一 2阶 Butterworth（电机前） | Raw | Physical | 同上（优先 Teensy v3 status，缺失时本地回退） | GUI + Teensy SD |
 | SOGI（Teensy native） | Teensy `Controller_SOGI` | Teensy `AutoDelayOptimizer` 仅算指标（`enabled=false`，不改 delay） | 无 auto delay 生效（固定控制链） | Teensy 主循环统一 2阶 Butterworth（电机前） | Raw | Physical | 通常走 Teensy v3 status（ratio 仅监视）；缺失时本地回退 | GUI + Teensy SD |
 | Test（Teensy native） | Teensy `Controller_Test` | 无 | 无 | Teensy 主循环统一 2阶 Butterworth（电机前） | Raw | Physical | 无专用 status，通常走本地回退 | GUI + Teensy SD |
-| RL + Pi 在线（sync from Pi） | RPi `RL_controller_torch.py` | RPi（grid 或 BO） | RPi（per-leg delay） | RPi 主循环统一 torque filter（默认 Butterworth 5Hz 2阶），顺序 `filter->delay->scale->send` | Sync | Control | Pi `AA56` 状态（经 Teensy 透传） | GUI + RPi `RPi_Unified/output/*.csv` + Teensy SD |
+| RL + Pi 在线（sync from Pi） | RPi `RL_controller_torch.py` | RPi（grid 或 BO） | RPi（per-leg delay） | RPi 主循环统一 torque filter（默认 Butterworth 5Hz 2阶），顺序 `filter->delay->scale->send` | Sync | Control | `Live`=power strip 实时流；`Eval`=Pi `AA56` 状态（经 Teensy 透传） | GUI + RPi `RPi_Unified/output/*.csv` + Teensy SD |
 | RL + Pi 离线/超时 | Teensy `Controller_RL` 超时回零 | 无 | 无（扭矩归零） | 无 | Raw（sync 无效回退） | Physical（有则用）否则 None | 通常无有效 Pi 状态，走本地回退 | GUI + Teensy SD（Pi 日志可能中断） |
 
 ### 11.2 两条主链路（长条视图）
@@ -515,10 +515,51 @@ flowchart LR
 - 否则优先 `Physical`（Teensy执行器功率）；若 `Physical` 无效才回退 `Control/None`。
 
 3. 紫色 overlay（`+Ratio/+P/-P`）
-- 若收到有效 v3 状态（Pi 或 Teensy-native ADO status）：优先用状态帧指标。
-- 若状态帧无效：从当前 power strip 窗口本地估算（兜底显示，不驱动控制）。
+- RL+Pi 且状态有效时：同时显示两套口径
+  - `Live`：从当前 power strip 窗口实时统计（对应条带当前流）
+  - `Eval`：来自 Pi `AA56` status（auto-delay 评估口径）
+- 非 RL 或状态无效时：仅显示本地窗口估算（兜底显示，不驱动控制）。
 
-### 11.4 滤波器放置（按实现）
+### 11.4 RL+Pi 功率双口径与三套速度（Live vs Eval）
+
+本小节只定义 **RL+Pi 在线** 的指标口径，防止把“优化评估值”误当“当前功率”。
+
+1. `Live`（Power Sign 实时口径）
+- 定义：`P_live(t) = tau_out(t) * vel_current(t)`（单位换算 `*pi/180`）
+- 其中：
+  - `tau_out(t)`：本周期 delay+scale 后下发给 Teensy 的扭矩（`L/R_command_actuator`）
+  - `vel_current(t)`：本周期当前 IMU 速度（`imu_Lvel/imu_Rvel`）
+- 此口径用于：
+  - GUI `Power Sign` 红/绿条带实时流
+  - GUI 右下角 `Live xx.x%`、`Live +P/-P` 文本
+
+2. `Eval`（auto-delay 评估口径）
+- 单腿候选 delay `d` 的评估公式：
+  - `P_eval_d[k] = tau_src[k-d] * vel_eval[k] * (pi/180)`
+  - `ratio = W+ / (W+ + |W-|)`，并同时给出 `+P/s`、`-P/s`
+- 其中：
+  - `tau_src`：delay 前扭矩源（滤波后、delay 前）
+  - `vel_eval`：评估链路速度，默认是角度差分速度 `d(angle)/dt`（`AUTO_PWR_USE_ANGLE_DIFF_VEL=True`），可切到 IMU 原始速度
+- 更新节奏：
+  - 每 `1 Hz` 更新（`AUTO_UPDATE_INTERVAL_S=1.0`）
+  - 当前窗口固定 `8 s`（`AUTO_WINDOW_MIN/MAX/FALLBACK = 8.0`）
+  - 即使 Auto Delay `OFF` 也持续计算并上报（用于监视）
+- 此口径用于：
+  - GUI 右下角 `Eval xx.x%`（来自 Pi status）
+  - Auto-delay 优化目标与候选 delay 比较
+
+3. 三套速度通道（字段语义）
+- `imu_Lvel/Rvel`：Pi 从 Teensy 收到的当前 IMU 速度（原始实时流）
+- `sync_Lvel/Rvel`：按当前 delay 从同步缓冲取出的对齐速度（用于 Sync 观察，不再参与 `ctrl_pwr` 计算）
+- `auto_eval_Lvel/Rvel`：仅供 auto-delay 评估链路使用（默认角度差分）
+
+4. 为什么 `Live Ratio` 与 `Eval Ratio` 会不同
+- 两者目的不同：
+  - `Live`：反映“当前显示流”的即时功率分布
+  - `Eval`：反映“优化链路”在固定窗口与候选 delay 定义下的评估结果
+- 因为速度源、延迟定义、窗口与更新频率都不同，二者数值不要求一致。
+
+### 11.5 滤波器放置（按实现）
 
 1. RL（Pi）
 - 统一 torque 滤波在 `RPi_Unified/RL_controller_torch.py` 主循环中执行。
@@ -530,7 +571,7 @@ flowchart LR
 - RL：显式旁路该滤波器，保持 Pi 回传扭矩透明下发。
 - SOGI 的 ADO 仅用于指标计算（默认不改 delay）。
 
-### 11.5 CSV 路线与对齐（谁写、怎么对）
+### 11.6 CSV 路线与对齐（谁写、怎么对）
 
 ```mermaid
 flowchart LR
@@ -545,7 +586,7 @@ flowchart LR
 - Teensy SD CSV：本地执行链路与物理量（含 `L_pwr_W/R_pwr_W` 与统一时间轴字段）。
 - 时间轴注意：`teensy_t_cs_u16` 是 `uint16` 厘秒计数，约 `655.36s` 回绕一次；离线分析优先使用 `*_t_s_unwrapped`。
 
-### 11.6 一句话结论（工程执行口径）
+### 11.7 一句话结论（工程执行口径）
 
 - 有 Pi 且 RL 正常：控制真值与 auto-delay 真值以 Pi 为主，GUI 以 `Sync/Control` 显示。
 - 无 Pi 或非 RL：控制与 auto-delay（EG/Samsung）均在 Teensy 本地闭环，GUI 以 `Raw/Physical` 为主。
