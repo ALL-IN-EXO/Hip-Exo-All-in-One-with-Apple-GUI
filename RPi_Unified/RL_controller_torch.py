@@ -1610,8 +1610,14 @@ def main():
             sync_ang_R = float(sync_ang_R_buf[delay_frames_R])
             sync_vel_L = float(sync_vel_L_buf[delay_frames_L])
             sync_vel_R = float(sync_vel_R_buf[delay_frames_R])
-            sync_ctrl_pwr_L = float(L_cmd_final) * float(sync_vel_L) * (np.pi / 180.0)
-            sync_ctrl_pwr_R = float(R_cmd_final) * float(sync_vel_R) * (np.pi / 180.0)
+            # GUI power display should represent instantaneous power:
+            # P(t) = tau_out(t) * vel_current(t)
+            # where tau_out(t) is delayed+scaled command sent this cycle.
+            # NOTE:
+            # - sync_vel_* keeps delayed/synchronized velocity for signal inspection.
+            # - ctrl_pwr_* uses current IMU velocity (Lvel/Rvel), not sync_vel_*.
+            sync_ctrl_pwr_L = float(L_cmd_final) * float(Lvel) * (np.pi / 180.0)
+            sync_ctrl_pwr_R = float(R_cmd_final) * float(Rvel) * (np.pi / 180.0)
 
             # ---- 发送给 Teensy ----
             send_torque(

@@ -5177,51 +5177,76 @@ class MainWindow(QWidget):
         self._position_power_ratio_overlay(strip, overlay)
 
     def _update_power_strip_titles(self, force=False):
-        """Keep strip titles static, and show per-leg ratio/power via in-plot overlay."""
+        """Keep strip titles static, and show both live(strip) and eval(auto) metrics."""
         if not hasattr(self, 'pwr_strip_right') or not hasattr(self, 'pwr_strip_left'):
             return
         self.pwr_strip_right.setTitle("Right Leg Power Sign", color=C.text2, size='10pt')
         self.pwr_strip_left.setTitle("Left Leg Power Sign", color=C.text2, size='10pt')
 
-        def _format_leg_overlay(ratio, pos_w, neg_w, motion_valid, valid, auto_enable):
-            if not valid:
-                line1 = f"+Ratio --.-% | WAIT"
-                line2 = f"+P --.-- W  -P --.-- W"
-                return line1, line2
-            ratio_clamped = max(0.0, min(1.0, float(ratio)))
-            ratio_pct = ratio_clamped * 100.0
+        def _format_leg_overlay(
+            live_ratio, live_pos_w, live_neg_w, live_valid,
+            eval_ratio, eval_valid,
+            motion_valid, auto_enable
+        ):
             auto_txt = "ON" if auto_enable else "OFF"
             motion_txt = "VALID" if motion_valid else "HOLD"
-            line1 = f"+Ratio {ratio_pct:.1f}% | {auto_txt}/{motion_txt}"
-            line2 = f"+P {float(pos_w):+.2f} W  -P {float(neg_w):+.2f} W"
+
+            if not live_valid and not eval_valid:
+                line1 = f"Live --.-% | Eval --.-% | WAIT"
+                line2 = f"Live +P --.-- W  -P --.-- W"
+                return line1, line2
+
+            if live_valid:
+                live_ratio_txt = f"{max(0.0, min(1.0, float(live_ratio))) * 100.0:.1f}%"
+                line2 = f"Live +P {float(live_pos_w):+.2f} W  -P {float(live_neg_w):+.2f} W"
+            else:
+                live_ratio_txt = "--.-%"
+                line2 = f"Live +P --.-- W  -P --.-- W"
+
+            if eval_valid:
+                eval_ratio_txt = f"{max(0.0, min(1.0, float(eval_ratio))) * 100.0:.1f}%"
+            else:
+                eval_ratio_txt = "--.-%"
+
+            line1 = f"Live {live_ratio_txt} | Eval {eval_ratio_txt} | {auto_txt}/{motion_txt}"
             return line1, line2
+
+        # Live strip metrics are always computed from the currently displayed power buffer.
+        live_ratio_L, live_pos_L, live_neg_L, live_mv_L, live_valid_L = \
+            self._compute_local_power_overlay_metrics('left')
+        live_ratio_R, live_pos_R, live_neg_R, live_mv_R, live_valid_R = \
+            self._compute_local_power_overlay_metrics('right')
 
         if self._rpi_status_valid:
             auto_enable = bool(self._rpi_auto_delay_enable)
-            ratio_L = float(self._rpi_power_ratio_L)
-            ratio_R = float(self._rpi_power_ratio_R)
-            pos_L = float(self._rpi_pos_per_s_L)
-            pos_R = float(self._rpi_pos_per_s_R)
-            neg_L = float(self._rpi_neg_per_s_L)
-            neg_R = float(self._rpi_neg_per_s_R)
+            eval_ratio_L = float(self._rpi_power_ratio_L)
+            eval_ratio_R = float(self._rpi_power_ratio_R)
+            eval_valid_L = True
+            eval_valid_R = True
             mv_L = bool(self._rpi_auto_motion_valid_L)
             mv_R = bool(self._rpi_auto_motion_valid_R)
-            valid_L = True
-            valid_R = True
         else:
-            ratio_L, pos_L, neg_L, mv_L, valid_L = self._compute_local_power_overlay_metrics('left')
-            ratio_R, pos_R, neg_R, mv_R, valid_R = self._compute_local_power_overlay_metrics('right')
+            eval_ratio_L = 0.0
+            eval_ratio_R = 0.0
+            eval_valid_L = False
+            eval_valid_R = False
             algo = int(getattr(self, "_algo_select", ALGO_EG))
             auto_enable = (
                 (algo == ALGO_EG and bool(self._eg_auto_delay_enable)) or
                 (algo == ALGO_SAMSUNG and bool(self._sam_auto_delay_enable))
             )
+            mv_L = bool(live_mv_L)
+            mv_R = bool(live_mv_R)
 
         l1_L, l2_L = _format_leg_overlay(
-            ratio_L, pos_L, neg_L, mv_L, valid_L, auto_enable
+            live_ratio_L, live_pos_L, live_neg_L, live_valid_L,
+            eval_ratio_L, eval_valid_L,
+            mv_L, auto_enable
         )
         l1_R, l2_R = _format_leg_overlay(
-            ratio_R, pos_R, neg_R, mv_R, valid_R, auto_enable
+            live_ratio_R, live_pos_R, live_neg_R, live_valid_R,
+            eval_ratio_R, eval_valid_R,
+            mv_R, auto_enable
         )
 
         self._set_power_overlay_html(

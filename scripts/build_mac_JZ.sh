@@ -18,7 +18,7 @@ set -euo pipefail
 #   ICON_ENABLED=1      # default ON; set 0 to disable
 #   VERSION_ENABLED=1   # default ON; set 0 to disable plist version stamping
 #   FFMPEG_BIN=/path/to/ffmpeg   # optional; default: `command -v ffmpeg`
-#   SIGN_ENABLED=1      # default ON; set 0 to skip Developer ID signing
+#   SIGN_ENABLED=0      # default ON; set 0 to skip Developer ID signing
 #   DEVELOPER_ID="Developer ID Application: Formideep"
 #   CODESIGN_OPTIONS=runtime
 #   NOTARIZE_ENABLED=0  # default OFF; set 1 to submit notarization
@@ -42,7 +42,7 @@ fi
 APP_NAME="${APP_NAME:-HipExoControllerGUI}"
 ICON_ENABLED="${ICON_ENABLED:-1}"
 VERSION_ENABLED="${VERSION_ENABLED:-1}"
-SIGN_ENABLED="${SIGN_ENABLED:-1}"
+SIGN_ENABLED="${SIGN_ENABLED:-0}"
 DEVELOPER_ID="${DEVELOPER_ID:-Developer ID Application: Formideep}"
 CODESIGN_OPTIONS="${CODESIGN_OPTIONS:-runtime}"
 NOTARIZE_ENABLED="${NOTARIZE_ENABLED:-0}"
