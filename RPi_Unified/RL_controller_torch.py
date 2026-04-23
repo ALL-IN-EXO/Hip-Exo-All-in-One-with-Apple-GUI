@@ -948,6 +948,38 @@ def read_packet(ser: serial.Serial):
     return None
 
 
+# Full IMU v2 frame on the wire: header(2) + len(1) + type(1) + payload(29) + cksum(1) = 34B.
+# Used by read_freshest_packet() to cheaply detect "another IMU frame already queued".
+IMU_PACKET_BYTES = 34
+
+
+def read_freshest_packet(ser: serial.Serial):
+    """
+    Drop-in replacement for read_packet() used by the main 100Hz loop.
+
+    Teensy emits IMU frames at ~1kHz while we consume at 100Hz, and the OS
+    serial FIFO is strict-FIFO: once we fall behind, every subsequent
+    read_packet() hands us an older frame, so real-time IMU is permanently
+    delayed. Here we peek at ser.in_waiting and, if at least one more full
+    IMU frame is already buffered, we keep reading and discard older IMU
+    frames until we hit the newest one. cfg frames are surfaced in order
+    so GUI runtime config is never dropped.
+    """
+    pkt = read_packet(ser)
+    if pkt is None:
+        return None
+    if not PI_USE_BINARY:
+        return pkt
+    while pkt is not None and pkt.get('type') == 'imu' and ser.in_waiting >= IMU_PACKET_BYTES:
+        nxt = read_packet(ser)
+        if nxt is None:
+            return pkt
+        if nxt.get('type') != 'imu':
+            return nxt
+        pkt = nxt
+    return pkt
+
+
 def _sat_i16(v: float, scale_factor: float = 1.0) -> int:
     x = int(round(float(v) * float(scale_factor)))
     if x < -32768:
@@ -985,7 +1017,6 @@ def send_torque(ser: serial.Serial, tau_L: float, tau_R: float, L_p, L_d, R_p, R
     )
     packet = b'\xAA\x59' + payload
     ser.write(packet)
-    ser.flush()
 
 
 def _pack_i16(buf: bytearray, off: int, value: float, scale_factor: float):
@@ -1072,7 +1103,6 @@ def send_status(ser: serial.Serial, filter_source, filter_type_code,
 
     packet = b'\xAA\x56' + bytes(buf)
     ser.write(packet)
-    ser.flush()
 
 
 # ========= 主程序 =========
@@ -1190,7 +1220,7 @@ def main():
         wr.writeheader()
 
         while True:
-            pkt = read_packet(ser)
+            pkt = read_freshest_packet(ser)
             if pkt is None:
                 continue
 
