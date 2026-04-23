@@ -1571,8 +1571,8 @@ class MainWindow(QWidget):
         lbl_md = QLabel("Motor:")
         lbl_md.setStyleSheet("font-size:12px; background:transparent;")
         row2.addWidget(lbl_md)
-        self.btn_toggle_L = _dir_btn("L+", "Real L direction")
-        self.btn_toggle_R = _dir_btn("R+", "Real R direction")
+        self.btn_toggle_L = _dir_btn("L+", "Real L direction (actuator only, plot sign unchanged)")
+        self.btn_toggle_R = _dir_btn("R+", "Real R direction (actuator only, plot sign unchanged)")
         self.btn_toggle_L.clicked.connect(self._toggle_left_dir)
         self.btn_toggle_R.clicked.connect(self._toggle_right_dir)
         row2.addWidget(self.btn_toggle_L)
@@ -1581,8 +1581,8 @@ class MainWindow(QWidget):
         lbl_vis = QLabel("Visual:")
         lbl_vis.setStyleSheet("font-size:12px; background:transparent;")
         row2.addWidget(lbl_vis)
-        self.btn_visual_L = _dir_btn("VL+", "Visual L (plot only)")
-        self.btn_visual_R = _dir_btn("VR+", "Visual R (plot only)")
+        self.btn_visual_L = _dir_btn("VL+", "Visual L torque sign (plot only)")
+        self.btn_visual_R = _dir_btn("VR+", "Visual R torque sign (plot only)")
         self.btn_visual_L.clicked.connect(self._toggle_visual_L)
         self.btn_visual_R.clicked.connect(self._toggle_visual_R)
         row2.addWidget(self.btn_visual_L)
@@ -3561,15 +3561,24 @@ class MainWindow(QWidget):
             L_vel, R_vel, gait_freq, *, log_csv=True, power_override=None):
         self._last_gait_freq = float(gait_freq)
         vL, vR = self._visual_sign_L, self._visual_sign_R
+        # Motor L+/R+ should only affect real actuator output, not plot sign.
+        # Compensate uplink torque/cmd back to logical sign for display.
+        if self._replay_mode:
+            mL = 1
+            mR = 1
+        else:
+            mL = 1 if (self._dir_bits & 0x01) else -1
+            mR = 1 if (self._dir_bits & 0x02) else -1
         self.t_buffer.append(float(t))
-        self.L_IMU_buf.append(float(L_angle) * vL)
-        self.R_IMU_buf.append(float(R_angle) * vR)
-        self.L_tau_buf.append(float(L_tau) * vL)
-        self.R_tau_buf.append(float(R_tau) * vR)
-        self.L_tau_d_buf.append(float(L_tau_d) * vL)
-        self.R_tau_d_buf.append(float(R_tau_d) * vR)
-        self.L_vel_buf.append(float(L_vel) * vL)
-        self.R_vel_buf.append(float(R_vel) * vR)
+        # Visual sign toggles affect torque display only (Cmd/Est).
+        self.L_IMU_buf.append(float(L_angle))
+        self.R_IMU_buf.append(float(R_angle))
+        self.L_tau_buf.append(float(L_tau) * mL * vL)
+        self.R_tau_buf.append(float(R_tau) * mR * vR)
+        self.L_tau_d_buf.append(float(L_tau_d) * mL * vL)
+        self.R_tau_d_buf.append(float(R_tau_d) * mR * vR)
+        self.L_vel_buf.append(float(L_vel))
+        self.R_vel_buf.append(float(R_vel))
 
         if power_override is None:
             L_pwr = 0.0
@@ -3582,8 +3591,8 @@ class MainWindow(QWidget):
             if not isfinite(R_pwr):
                 R_pwr = 0.0
 
-        self.L_pwr_buf.append(L_pwr * vL)
-        self.R_pwr_buf.append(R_pwr * vR)
+        self.L_pwr_buf.append(L_pwr)
+        self.R_pwr_buf.append(R_pwr)
 
         if log_csv and hasattr(self, '_csv_writer'):
             now_wall = time.time()

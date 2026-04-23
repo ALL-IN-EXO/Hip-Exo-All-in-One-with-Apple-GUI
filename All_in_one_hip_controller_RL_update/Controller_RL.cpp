@@ -5,11 +5,18 @@
 #define PI_SERIAL  Serial8
 #define PI_BAUD    115200
 
+// Teensy HardwareSerial 默认 RX 缓冲 = 64B。Pi 100Hz × 42B(AA59) + 周期性 AA56,
+// 一旦主循环被 BLE/SD/算法拖 >6ms, 64B 会 overrun, AA59 没校验和, 状态机会把
+// 下一帧头几个字节当成本帧尾 → 解出接近 int16 饱和的角度/速度 (现场观测 ~2.1%)。
+// 扩到 512B, 可容忍 ~45ms 的主循环停顿 (512/11520 s), 实际足够覆盖所有已知抖动源。
+static uint8_t PI_SERIAL_RX_EXTRA[512];
+
 Controller_RL::Controller_RL() {
   reset();
   memset(logtag, 0, sizeof(logtag));
   memset(rpi_status_buf, 0, sizeof(rpi_status_buf));
   rpi_status_valid = false;
+  bad_sync_frames = 0;
 }
 
 void Controller_RL::reset() {
@@ -37,6 +44,7 @@ void Controller_RL::reset() {
 }
 
 void Controller_RL::init_serial() {
+  PI_SERIAL.addMemoryForRead(PI_SERIAL_RX_EXTRA, sizeof(PI_SERIAL_RX_EXTRA));
   PI_SERIAL.begin(PI_BAUD);
 }
 
@@ -150,29 +158,63 @@ bool Controller_RL::read_torque_from_pi() {
       case READING_SYNC:
         rx_sync_buf_[rx_idx_++] = b;
         if (rx_idx_ == PI_SYNC_SIZE) {
+          // AA59 无校验和; Serial8 RX overrun 时本帧尾部可能混入下一帧头几个字节,
+          // 解出的 int16 会接近饱和边界。先解到临时变量, 通过物理量健壮性检查后
+          // 才提交到成员; 坏帧直接丢弃, 沿用上一帧有效值 (Pi→Teensy 控制链继续用
+          // 上一帧扭矩即可, 无需 reset tau_pi_L_/R_)。
           int o = 2;
-          memcpy(&sync_sample_id, rx_sync_buf_ + o, 2); o += 2;
+          uint16_t tmp_sample_id;
+          float tmp_tau_L, tmp_tau_R, tmp_Lp, tmp_Ld, tmp_Rp, tmp_Rd;
+          int16_t tmp_ang_L, tmp_ang_R, tmp_vel_L, tmp_vel_R, tmp_pwr_L, tmp_pwr_R;
 
-          memcpy(&tau_pi_L_, rx_sync_buf_ + o, 4); o += 4;
-          memcpy(&tau_pi_R_, rx_sync_buf_ + o, 4); o += 4;
-          memcpy(&tau_pi_Lp, rx_sync_buf_ + o, 4); o += 4;
-          memcpy(&tau_pi_Ld, rx_sync_buf_ + o, 4); o += 4;
-          memcpy(&tau_pi_Rp, rx_sync_buf_ + o, 4); o += 4;
-          memcpy(&tau_pi_Rd, rx_sync_buf_ + o, 4); o += 4;
+          memcpy(&tmp_sample_id, rx_sync_buf_ + o, 2); o += 2;
+          memcpy(&tmp_tau_L, rx_sync_buf_ + o, 4); o += 4;
+          memcpy(&tmp_tau_R, rx_sync_buf_ + o, 4); o += 4;
+          memcpy(&tmp_Lp,    rx_sync_buf_ + o, 4); o += 4;
+          memcpy(&tmp_Ld,    rx_sync_buf_ + o, 4); o += 4;
+          memcpy(&tmp_Rp,    rx_sync_buf_ + o, 4); o += 4;
+          memcpy(&tmp_Rd,    rx_sync_buf_ + o, 4); o += 4;
+          memcpy(&tmp_ang_L, rx_sync_buf_ + o, 2); o += 2;
+          memcpy(&tmp_ang_R, rx_sync_buf_ + o, 2); o += 2;
+          memcpy(&tmp_vel_L, rx_sync_buf_ + o, 2); o += 2;
+          memcpy(&tmp_vel_R, rx_sync_buf_ + o, 2); o += 2;
+          memcpy(&tmp_pwr_L, rx_sync_buf_ + o, 2); o += 2;
+          memcpy(&tmp_pwr_R, rx_sync_buf_ + o, 2); o += 2;
+          uint8_t tmp_flags = rx_sync_buf_[o];
 
-          memcpy(&sync_ang_L100, rx_sync_buf_ + o, 2); o += 2;
-          memcpy(&sync_ang_R100, rx_sync_buf_ + o, 2); o += 2;
-          memcpy(&sync_vel_L10, rx_sync_buf_ + o, 2); o += 2;
-          memcpy(&sync_vel_R10, rx_sync_buf_ + o, 2); o += 2;
-          memcpy(&sync_ctrl_pwr_L100, rx_sync_buf_ + o, 2); o += 2;
-          memcpy(&sync_ctrl_pwr_R100, rx_sync_buf_ + o, 2); o += 2;
-          sync_flags = rx_sync_buf_[o];
+          // 物理健壮性检查 (scale: ang×100, vel×10, pwr×100)
+          //   |angle| ≤ 200°  ⇒ |raw| ≤ 20000
+          //   |vel|   ≤ 2500 dps ⇒ |raw| ≤ 25000
+          //   |pwr|   ≤ 300 W ⇒ |raw| ≤ 30000
+          // float 字段不检 (NaN/Inf 也会被下游限幅到 ±max_torque_cfg)。
+          const bool sane =
+              (tmp_ang_L > -20000 && tmp_ang_L < 20000) &&
+              (tmp_ang_R > -20000 && tmp_ang_R < 20000) &&
+              (tmp_vel_L > -25000 && tmp_vel_L < 25000) &&
+              (tmp_vel_R > -25000 && tmp_vel_R < 25000) &&
+              (tmp_pwr_L > -30000 && tmp_pwr_L < 30000) &&
+              (tmp_pwr_R > -30000 && tmp_pwr_R < 30000);
 
-          sync_valid = true;
-          sync_from_pi = true;
-          last_rx_ms_ = millis();
-          pi_connected_ = true;
-          got_torque = true;
+          if (sane) {
+            sync_sample_id = tmp_sample_id;
+            tau_pi_L_ = tmp_tau_L; tau_pi_R_ = tmp_tau_R;
+            tau_pi_Lp = tmp_Lp;    tau_pi_Ld = tmp_Ld;
+            tau_pi_Rp = tmp_Rp;    tau_pi_Rd = tmp_Rd;
+            sync_ang_L100 = tmp_ang_L;
+            sync_ang_R100 = tmp_ang_R;
+            sync_vel_L10  = tmp_vel_L;
+            sync_vel_R10  = tmp_vel_R;
+            sync_ctrl_pwr_L100 = tmp_pwr_L;
+            sync_ctrl_pwr_R100 = tmp_pwr_R;
+            sync_flags = tmp_flags;
+            sync_valid = true;
+            sync_from_pi = true;
+            last_rx_ms_ = millis();
+            pi_connected_ = true;
+            got_torque = true;
+          } else {
+            bad_sync_frames++;
+          }
           rx_state_ = WAIT_HEADER1;
         }
         break;
