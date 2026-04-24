@@ -3638,6 +3638,12 @@ class MainWindow(QWidget):
                 L_pwr = 0.0
             if not isfinite(R_pwr):
                 R_pwr = 0.0
+            # Keep power sign consistent with torque/cmd logical display convention.
+            # Motor L+/R+ (dir_bits) may invert actuator sign at Teensy side; GUI already
+            # compensates Cmd/Est torque by mL/mR above, so power must be compensated too.
+            # NOTE: visual VL+/VR+ must NOT affect power sign (torque-only toggle).
+            L_pwr *= float(mL)
+            R_pwr *= float(mR)
 
         self.L_pwr_buf.append(L_pwr)
         self.R_pwr_buf.append(R_pwr)

@@ -9,6 +9,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - 详细问题说明与证据链见：`Code Debug/README_RL_LATENCY_AND_SYNC_SPIKE.md`
 
+- **Teensy-native 场景右腿 Live power 符号反向修复**（`GUI_RL_update/GUI.py`）：
+  - 根因：GUI 对 `Cmd/Est torque` 做了 `dir_bits`（L+/R+）符号补偿，但 `power_override` 写入 `L_pwr/R_pwr` 时未做同补偿
+  - 现象：当右腿方向配置为 `R-` 时，`Power Sign` 条带、`L/R pwr` 文本与 `Live ratio` 右腿口径出现反号
+  - 修复：在 `_append_data_point(...)` 中对 `L_pwr/R_pwr` 同步应用 `mL/mR`（仅 `dir_bits`，不受 `VL+/VR+` 视觉开关影响）
+
 - **RPi 下 GUI 角度/速度/力矩/功率“卡顿十几秒”修复**（`RPi_Unified/RL_controller_torch.py`）：
   - 症状：`Data Source=Auto` 或 `Raw` 下，开启 Pi 后 GUI 数据实时性严重丧失（约 10 秒延迟），即使快速晃动 IMU，Pi 端 CSV 的 `imu_LTx/Lvel` 也几乎不变，说明 Pi 读到的是串口 FIFO 里的旧帧
   - 根因：Teensy 以 ~1kHz 发送 IMU 帧，Pi 主循环名义 100Hz 消费；v4.0 后 Pi 每周期新增的开销（AA59 40B payload、统一 torque 滤波、`lstm_pd` zero-mean `np.mean`、sync buffers、更宽 CSV row、100Hz `print`）一旦令消费略慢于生产，Linux 串口 RX FIFO 即永久堆积旧帧，且原先没有任何排空机制
