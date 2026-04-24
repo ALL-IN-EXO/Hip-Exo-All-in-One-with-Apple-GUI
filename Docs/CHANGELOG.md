@@ -32,6 +32,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `Power Sign` 条带按 Live 实时流显示；右下角文本同时显示 `Live` 与 `Eval` 两种口径
   - 详细定义（公式、三套 vel 含义、更新频率、为何两者可不同）迁移至 `Docs/SYSTEM_ARCHITECTURE.md` §11.4
 
+- **RPi CSV 补齐 auto-delay 功率评估字段**（`RPi_Unified/RL_controller_torch.py`）：
+  - 新增每帧写出：`auto_ratio_L/R`、`auto_pos_per_s_L/R`、`auto_neg_per_s_L/R`
+  - 同步新增：`auto_motion_valid_L/R`、`auto_best_delay_ms_L/R`、`auto_window_s`、`auto_gait_freq_hz`、`auto_delay_enable`
+  - 目的：离线分析可直接复现 PPR / 正负功评估，不再依赖 GUI 透传状态或二次重算
+
 - **Visual 极性开关仅作用于 Torque 显示**（`GUI_RL_update/GUI.py`）：
   - `VL+/VR+` 现在只翻转 `Cmd/Est torque` 曲线符号
   - 角度、速度、功率曲线不再受 `Visual` 开关影响
