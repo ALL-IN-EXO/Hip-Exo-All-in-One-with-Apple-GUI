@@ -7,6 +7,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **SOGI 新增 STOPPED/MOVING 运动状态机（`All_in_one_hip_controller_RL_update/Controller_SOGI.*`）**：
+  - 在 SOGI 控制链路加入 `STOPPED`/`MOVING` 状态机，使用幅值迟滞和持续时间判据切换状态
+  - 新增阈值与时间参数：`AMP_ON=22`、`AMP_OFF=14`、`MOVE_ON=0.15s`、`MOVE_OFF=0.30s`、`STOP_HOLD=0.40s`
+  - 最终力矩输出新增 `gate_motion`（仅 `MOVING` 状态允许输出），用于抑制停稳阶段的误助力触发
+
+- **SOGI 状态机参数接入 GUI 实时调节（`BleProtocol.h`, `Controller_SOGI.*`, `GUI_RL_update/GUI.py`）**：
+  - SOGI 下行参数扩展新增 `amp_on`、`amp_off`、`move_on_sec`、`move_off_sec`（payload `[11..18]`）
+  - GUI 的 SOGI 面板新增 4 个参数控件，并沿用 `valueChanged -> _tx_params()` 机制实时下发到 Teensy
+  - Teensy `Controller_SOGI::parse_params()` 改为优先使用 GUI 下发值，旧 GUI 未发送扩展字段时自动回退默认值（兼容旧版本）
+
+- **SOGI 新增“过零频率判假”防抖（`All_in_one_hip_controller_RL_update/Controller_SOGI.*`）**：
+  - 使用 `SOGI x1` 检测左右腿过零，按相邻过零间隔估算频率 `f_cross = 0.5 / dt_cross`
+  - 当 `f_cross` 超过上限（默认 `3.0 Hz`）时判定为虚假过零，并在短窗内累计计数
+  - 若短窗内连续触发异常（默认 `0.30s` 内 `>=2` 次），进入 `0.35s` 输出关断（`gate_zc=0`），抑制过零风暴导致的高频扭矩翻转
+
 - **SOGI 新增站立角度门控（`All_in_one_hip_controller_RL_update/Controller_SOGI.*`）**：
   - 增加硬编码站立判定：当左右髋角度同时落在小角度窗内并持续一段时间后，强制左右力矩置 `0`
   - 目的为抑制站立阶段低频速度噪声导致的虚假助力输出，同时避免步态过零瞬间的短时误触发

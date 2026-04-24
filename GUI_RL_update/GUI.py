@@ -1373,18 +1373,50 @@ class MainWindow(QWidget):
             "Amplitude watchdog threshold (deg/s).\n"
             "When instantaneous amp falls below this, torque is gated off (standing/stop)."
         )
+        sogi_amp_on_tip = (
+            "STOPPED -> MOVING threshold (deg/s).\n"
+            "Requires amp to stay above this level for move_on_sec."
+        )
+        sogi_amp_off_tip = (
+            "MOVING -> STOPPED threshold (deg/s).\n"
+            "Requires amp to stay below this level for move_off_sec."
+        )
+        sogi_move_on_tip = (
+            "Required duration above amp_on before entering MOVING (s).\n"
+            "Lower value starts assist faster; higher value is more robust to noise."
+        )
+        sogi_move_off_tip = (
+            "Required duration below amp_off before entering STOPPED (s).\n"
+            "Lower value makes torque decay faster after motion stops."
+        )
         self.sb_sogi_A       = make_dspin(5.0, 0.0, 15.0, 0.1, 1, sogi_a_tip)
         self.sb_sogi_lead    = make_dspin(20.0, -90.0, 90.0, 1.0, 1, sogi_lead_tip)
         self.sb_sogi_amp_min = make_dspin(20.0, 0.0, 500.0, 1.0, 1, sogi_ampmin_tip)
+        self.sb_sogi_amp_on = make_dspin(22.0, 0.0, 500.0, 0.5, 1, sogi_amp_on_tip)
+        self.sb_sogi_amp_off = make_dspin(18.0, 0.0, 500.0, 0.5, 1, sogi_amp_off_tip)
+        self.sb_sogi_move_on = make_dspin(0.15, 0.0, 2.0, 0.01, 2, sogi_move_on_tip)
+        self.sb_sogi_move_off = make_dspin(0.20, 0.0, 2.0, 0.01, 2, sogi_move_off_tip)
         lbl_sogi_A = QLabel("A_gain (Nm)");       lbl_sogi_A.setToolTip(sogi_a_tip)
         lbl_sogi_lead = QLabel("Phi lead (°)");   lbl_sogi_lead.setToolTip(sogi_lead_tip)
         lbl_sogi_amp = QLabel("amp_min (deg/s)"); lbl_sogi_amp.setToolTip(sogi_ampmin_tip)
+        lbl_sogi_amp_on = QLabel("amp_on (deg/s)"); lbl_sogi_amp_on.setToolTip(sogi_amp_on_tip)
+        lbl_sogi_amp_off = QLabel("amp_off (deg/s)"); lbl_sogi_amp_off.setToolTip(sogi_amp_off_tip)
+        lbl_sogi_move_on = QLabel("move_on (s)"); lbl_sogi_move_on.setToolTip(sogi_move_on_tip)
+        lbl_sogi_move_off = QLabel("move_off (s)"); lbl_sogi_move_off.setToolTip(sogi_move_off_tip)
         sogi_grid.addWidget(lbl_sogi_A,          0, 0)
         sogi_grid.addWidget(self.sb_sogi_A,      0, 1)
         sogi_grid.addWidget(lbl_sogi_lead,       1, 0)
         sogi_grid.addWidget(self.sb_sogi_lead,   1, 1)
         sogi_grid.addWidget(lbl_sogi_amp,        2, 0)
         sogi_grid.addWidget(self.sb_sogi_amp_min,2, 1)
+        sogi_grid.addWidget(lbl_sogi_amp_on,     3, 0)
+        sogi_grid.addWidget(self.sb_sogi_amp_on, 3, 1)
+        sogi_grid.addWidget(lbl_sogi_amp_off,    4, 0)
+        sogi_grid.addWidget(self.sb_sogi_amp_off,4, 1)
+        sogi_grid.addWidget(lbl_sogi_move_on,    5, 0)
+        sogi_grid.addWidget(self.sb_sogi_move_on,5, 1)
+        sogi_grid.addWidget(lbl_sogi_move_off,   6, 0)
+        sogi_grid.addWidget(self.sb_sogi_move_off,6, 1)
         self.algo_stack.addWidget(sogi_panel)
 
         # -- Test panel (sin wave) --
@@ -5532,6 +5564,10 @@ class MainWindow(QWidget):
             put_s16(5, float(self.sb_sogi_A.value()))
             put_s16(7, float(self.sb_sogi_lead.value()))
             put_s16(9, float(self.sb_sogi_amp_min.value()), 10)
+            put_s16(11, float(self.sb_sogi_amp_on.value()), 10)
+            put_s16(13, float(self.sb_sogi_amp_off.value()), 10)
+            put_s16(15, float(self.sb_sogi_move_on.value()), 1000)
+            put_s16(17, float(self.sb_sogi_move_off.value()), 1000)
 
         header = struct.pack('<BBB', 0xA5, 0x5A, BLE_FRAME_LEN)
         self.ser.write(header + payload)

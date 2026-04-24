@@ -6,7 +6,7 @@
  *
  * 输入: 左右髋角速度 ω (deg/s)
  * 每侧独立跑一个 SOGI-FLL 提取瞬时相位 φ 和幅值 amp
- * 输出: τ = A_gain * ramp * gate(amp) * gate(angle_stand) * sin(φ + phi_lead)
+ * 输出: τ = A_gain * ramp * gate_motion * gate_zc * gate(amp) * gate(angle_stand) * sin(φ + phi_lead)
  *
  * 算法细节见 Docs/SOGI-FLL-CONTROLLER.md
  *
@@ -14,6 +14,8 @@
  *   A_gain        力矩幅值 (Nm)
  *   phi_lead_deg  相位超前补偿 (°)
  *   amp_min       幅值看门狗门限 (deg/s)
+ *   amp_on/off    STOPPED/MOVING 迟滞门限 (deg/s)
+ *   move_on/off   状态切换持续时间 (s)
  *
  * 其他参数硬编码 (见 .cpp 顶部常量)
  ************************************************************/
@@ -40,10 +42,19 @@ public:
   AutoDelayOptimizer ado_;  // public: .ino 可读取状态
 
 private:
+  enum MotionState : uint8_t {
+    MOTION_STOPPED = 0,
+    MOTION_MOVING  = 1,
+  };
+
   // === GUI 参数 ===
   float A_gain_;          // Nm
   float phi_lead_rad_;    // 由 deg 转换
   float amp_min_;         // deg/s
+  float amp_on_;          // deg/s
+  float amp_off_;         // deg/s
+  float move_on_sec_;     // s
+  float move_off_sec_;    // s
 
   // 站立角度门控持续计时（用于抑制站立低频速度噪声）
   float stand_hold_elapsed_s_;
@@ -59,6 +70,29 @@ private:
 
   // 冷启动 ramp
   float ramp_elapsed_;   // 秒
+
+  // STOPPED/MOVING 状态机（幅值迟滞 + 持续时间）
+  MotionState motion_state_;
+  float moving_candidate_s_;
+  float stopped_candidate_s_;
+  float stop_hold_elapsed_s_;
+
+  void update_motion_state(float ampL, float ampR, float dt);
+
+  // 过零频率防抖：若过零频率异常偏高，判定为虚假过零并临时关断输出
+  struct ZcTracker {
+    float prev_v;
+    float since_last_cross_s;
+    float fake_window_elapsed_s;
+    uint8_t fake_count_in_window;
+    bool initialized;
+  };
+  ZcTracker zc_L_;
+  ZcTracker zc_R_;
+  float zc_fake_hold_s_;
+
+  static void reset_zc_tracker(ZcTracker& z);
+  static bool update_zc_tracker(ZcTracker& z, float v, float dt);
 
   // 单步 SOGI-FLL 更新，返回 sin(phi+lead) 和 amp
   static void step_sogi(Sogi& s, float omega, float dt,
