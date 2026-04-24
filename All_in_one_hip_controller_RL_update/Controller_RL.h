@@ -77,6 +77,9 @@ public:
   int16_t  sync_ctrl_pwr_L100;
   int16_t  sync_ctrl_pwr_R100;
 
+  // AA 59 坏帧计数 (sanity check 拒绝的帧数); 用于观察 Serial8 抖动/overrun 频率。
+  uint32_t bad_sync_frames;
+
 private:
   float tau_pi_L_;   // RPi 返回的左腿扭矩
   float tau_pi_R_;   // RPi 返回的右腿扭矩

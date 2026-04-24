@@ -5,6 +5,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- 详细问题说明与证据链见：`Code Debug/README_RL_LATENCY_AND_SYNC_SPIKE.md`
+
+- **RPi 下 GUI 角度/速度/力矩/功率“卡顿十几秒”修复**（`RPi_Unified/RL_controller_torch.py`）：
+  - 症状：`Data Source=Auto` 或 `Raw` 下，开启 Pi 后 GUI 数据实时性严重丧失（约 10 秒延迟），即使快速晃动 IMU，Pi 端 CSV 的 `imu_LTx/Lvel` 也几乎不变，说明 Pi 读到的是串口 FIFO 里的旧帧
+  - 根因：Teensy 以 ~1kHz 发送 IMU 帧，Pi 主循环名义 100Hz 消费；v4.0 后 Pi 每周期新增的开销（AA59 40B payload、统一 torque 滤波、`lstm_pd` zero-mean `np.mean`、sync buffers、更宽 CSV row、100Hz `print`）一旦令消费略慢于生产，Linux 串口 RX FIFO 即永久堆积旧帧，且原先没有任何排空机制
+  - 修复 1：新增 `read_freshest_packet(ser)`，当 `ser.in_waiting` 中仍有完整 IMU 帧时，丢弃旧 IMU 帧只保留最新一帧（`cfg` 帧永远按序透传，GUI 运行时配置不丢）；主循环由 `read_packet(ser)` 切换到 `read_freshest_packet(ser)`
+  - 修复 2：移除 `send_torque()` 和 `send_status()` 末尾的 `ser.flush()`。在 115200 波特率下 `ser.flush()=tcdrain()` 每次阻塞 ~3.6ms（42B 帧），每周期直接吃掉主循环 ~36% 时间预算，把消费端从“足够快”推到“追不上”；内核 FIFO + Teensy 端无背压，不需要 drain
+  - 效果：Pi 端恢复对最新 IMU 的实时响应，GUI 中 Pi 同步路径（Auto/Sync/Control 功率）不再滞后；IMU 生产速率仍是 Teensy 侧（`~1kHz`），Pi 控制周期仍是 100Hz，均未改动
+
+- **GUI `POWER OFF` 按钮偶发需要点两次才关机修复**（`GUI_RL_update/GUI.py`）：
+  - 症状：某些情况下点一次 `POWER OFF` 按钮只把按钮文字/颜色翻了一下但力矩没归零；再点第二次才真的把 `Max Torque` 拉到 0
+  - 根因：`btn_power.isChecked()` 与 `sb_max_torque_cfg.value() > 0` 是隐含不变量，但只有 `_on_power_toggled` 维护它；一旦用户在 Parameters 面板手动改 Max Torque（敲数字或点 spinbox 箭头），`sb_max_torque_cfg` 变了但按钮 `checked` 没变 → 下一次点击按钮，Qt 先把 `checked` 从 unchecked 翻到 checked → 进入 `_on_power_toggled(True)`，`setValue(_maxT_before_off)` 与当前值相同是 no-op，只把按钮刷成绿 "POWER ON"；用户得再点一次才触发 `_on_power_toggled(False)` 真把力矩设为 0
+  - 修复：给 `sb_max_torque_cfg.valueChanged` 新增 `_sync_power_btn_from_torque`，任何路径改 torque 值都会自动对齐按钮 checked/text/颜色（`>0 → POWER ON 绿`，`=0 → POWER OFF 红`）；同步过程用 `btn_power.blockSignals(True)` 保护，避免重新进入 `_on_power_toggled` 造成回环
+  - 效果：`POWER OFF` 永远一次点击到位；直接编辑 Max Torque 数字/箭头后按钮即时跟随；不动 BLE、不动 `_on_power_toggled`、不动掉线自动关机、不动主题刷新
+
+- **GUI `Data Source=Sync` 下偶发 ±300° / ±3000 dps “爆帧”修复**（`All_in_one_hip_controller_RL_update/Controller_RL.h`, `Controller_RL.cpp`）：
+  - 症状：Pi backlog 修好后出现的二次问题 —— Sync 路径（GUI Auto/Sync 数据源）约 `2.1%` 帧出现角度 ±300°、速度 ±3000 dps 的刺尖；Raw 路径干净
+  - 诊断：对 `GUI_RL_update/data/20260422_213207.csv` 与 `Data from PI/PI5_lstm_pd-20260423-023206.csv` 做同 `sample_id` 交叉比对，发现 Pi 送上线前的 `sync_LTx/sync_Lvel` 始终在物理量程内；GUI 收到的却是 int16 / 100 和 int16 / 10 的近饱和值（`±32500/100=±325°`、`±32767/10=±3275 dps`）。`sync_sample_id`（AA59 payload 前 2 字节）以及 `sync_cmd_L`（走 Teensy 本地 `ud.L_cmd100`，不经 AA59 覆盖）都始终干净 → 错位只发生在 AA59 payload 偏移 `26..37` 的 6 个 int16 字段
+  - 根因：Teensy `Serial8` 默认 RX 缓冲仅 64 字节；当主循环被 BLE/SD/算法拖 ≳6 ms 时，Pi 100Hz 连续送达的 42B AA59 帧发生 RX overrun 丢字节。AA59 无校验和 → 状态机照常凑满 42 字节、尾部解到下一帧的头几个字节，int16 字段解成近饱和随机值
+  - 为什么以前没暴露：Pi 读旧 backlog 时实际 AA59 发送速率被消费速率压低，Teensy RX 压力小、极少 overrun；修好 backlog 后 100Hz 稳态，overrun 概率上升
+  - 修复 1：`Controller_RL::init_serial()` 增加 `Serial8.addMemoryForRead(PI_SERIAL_RX_EXTRA, 512)`，RX 缓冲从 64B 扩到 >512B，可容忍 ~45ms 的主循环停顿（`512B / 11520 B/s`），实测足够覆盖所有已知抖动源
+  - 修复 2：`READING_SYNC` 改为先解到临时变量，通过物理量健壮性检查（`|ang|≤20000`、`|vel|≤25000`、`|pwr|≤30000`）后才提交到成员；坏帧直接丢弃、沿用上一帧 sync 值。新增 `Controller_RL::bad_sync_frames` 计数供观察 RX 抖动频率
+  - 效果：两条改动叠加，overrun 几乎不发生、即便发生坏帧也不会传到 BLE → GUI，彻底消除 Sync 路径刺尖。未改动 AA59 协议（未加 checksum，留待后续观察 `bad_sync_frames` 是否仍增长再决定是否协议升级）
+
 ### Changed
 
 - **SOGI 新增 STOPPED/MOVING 运动状态机（`All_in_one_hip_controller_RL_update/Controller_SOGI.*`）**：
@@ -25,6 +51,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **SOGI 新增站立角度门控（`All_in_one_hip_controller_RL_update/Controller_SOGI.*`）**：
   - 增加硬编码站立判定：当左右髋角度同时落在小角度窗内并持续一段时间后，强制左右力矩置 `0`
   - 目的为抑制站立阶段低频速度噪声导致的虚假助力输出，同时避免步态过零瞬间的短时误触发
+- **RL+Pi 场景功率口径与 Overlay 文本统一**（`RPi_Unified/RL_controller_torch.py`, `GUI_RL_update/GUI.py`）：
+  - Pi `ctrl_pwr` 口径更新为当前功率：`P_live(t) = tau_out(t) * vel_current(t)`（替代旧 `*sync_vel` 口径）
+  - `Power Sign` 条带按 Live 实时流显示；右下角文本同时显示 `Live` 与 `Eval` 两种口径
+  - 详细定义（公式、三套 vel 含义、更新频率、为何两者可不同）迁移至 `Docs/SYSTEM_ARCHITECTURE.md` §11.4
+
+- **RPi CSV 补齐 auto-delay 功率评估字段**（`RPi_Unified/RL_controller_torch.py`）：
+  - 新增每帧写出：`auto_ratio_L/R`、`auto_pos_per_s_L/R`、`auto_neg_per_s_L/R`
+  - 同步新增：`auto_motion_valid_L/R`、`auto_best_delay_ms_L/R`、`auto_window_s`、`auto_gait_freq_hz`、`auto_delay_enable`
+  - 目的：离线分析可直接复现 PPR / 正负功评估，不再依赖 GUI 透传状态或二次重算
+
+- **Visual 极性开关仅作用于 Torque 显示**（`GUI_RL_update/GUI.py`）：
+  - `VL+/VR+` 现在只翻转 `Cmd/Est torque` 曲线符号
+  - 角度、速度、功率曲线不再受 `Visual` 开关影响
+  - 更新按钮 tooltip，明确“torque sign only”
+
+- **恢复“新树莓派首次配置与注册”文档**（`Docs/RPI_NEW_PI_SETUP.md`）：
+  - 补回 Pi4B / Pi5 串口差异、SSH优先、macOS 免密别名、同步部署、GUI 注册、常见故障排查
+  - 包含已验证问题：`remote_dir missing`（`~/` 展开）、`ModuleNotFoundError: scipy`、host key 变更告警
 
 - **Power Sign overlay 在 SOGI/Samsung 下的显示修复**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`, `GUI_RL_update/GUI.py`）：
   - Teensy `Transmit_ble_Data()` 补齐 `ALGO_SOGI` 的 `fill_ble_status()` 上报，SOGI 不再写零状态槽

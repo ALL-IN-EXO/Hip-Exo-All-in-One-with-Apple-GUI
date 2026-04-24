@@ -425,7 +425,13 @@ csv_header = [
     'pd_zm_bias_L', 'pd_zm_bias_R',
     'L_P', 'L_D', 'R_P', 'R_D',
     'scale_runtime', 'torque_delay_ms_L', 'torque_delay_ms_R',
-    'auto_opt_method',
+    'auto_opt_method', 'auto_delay_enable',
+    'auto_motion_valid_L', 'auto_motion_valid_R',
+    'auto_ratio_L', 'auto_ratio_R',
+    'auto_pos_per_s_L', 'auto_pos_per_s_R',
+    'auto_neg_per_s_L', 'auto_neg_per_s_R',
+    'auto_best_delay_ms_L', 'auto_best_delay_ms_R',
+    'auto_window_s', 'auto_gait_freq_hz',
     'tag',
 ]
 
@@ -948,6 +954,38 @@ def read_packet(ser: serial.Serial):
     return None
 
 
+# Full IMU v2 frame on the wire: header(2) + len(1) + type(1) + payload(29) + cksum(1) = 34B.
+# Used by read_freshest_packet() to cheaply detect "another IMU frame already queued".
+IMU_PACKET_BYTES = 34
+
+
+def read_freshest_packet(ser: serial.Serial):
+    """
+    Drop-in replacement for read_packet() used by the main 100Hz loop.
+
+    Teensy emits IMU frames at ~1kHz while we consume at 100Hz, and the OS
+    serial FIFO is strict-FIFO: once we fall behind, every subsequent
+    read_packet() hands us an older frame, so real-time IMU is permanently
+    delayed. Here we peek at ser.in_waiting and, if at least one more full
+    IMU frame is already buffered, we keep reading and discard older IMU
+    frames until we hit the newest one. cfg frames are surfaced in order
+    so GUI runtime config is never dropped.
+    """
+    pkt = read_packet(ser)
+    if pkt is None:
+        return None
+    if not PI_USE_BINARY:
+        return pkt
+    while pkt is not None and pkt.get('type') == 'imu' and ser.in_waiting >= IMU_PACKET_BYTES:
+        nxt = read_packet(ser)
+        if nxt is None:
+            return pkt
+        if nxt.get('type') != 'imu':
+            return nxt
+        pkt = nxt
+    return pkt
+
+
 def _sat_i16(v: float, scale_factor: float = 1.0) -> int:
     x = int(round(float(v) * float(scale_factor)))
     if x < -32768:
@@ -985,7 +1023,6 @@ def send_torque(ser: serial.Serial, tau_L: float, tau_R: float, L_p, L_d, R_p, R
     )
     packet = b'\xAA\x59' + payload
     ser.write(packet)
-    ser.flush()
 
 
 def _pack_i16(buf: bytearray, off: int, value: float, scale_factor: float):
@@ -1072,7 +1109,6 @@ def send_status(ser: serial.Serial, filter_source, filter_type_code,
 
     packet = b'\xAA\x56' + bytes(buf)
     ser.write(packet)
-    ser.flush()
 
 
 # ========= 主程序 =========
@@ -1190,7 +1226,7 @@ def main():
         wr.writeheader()
 
         while True:
-            pkt = read_packet(ser)
+            pkt = read_freshest_packet(ser)
             if pkt is None:
                 continue
 
@@ -1580,8 +1616,14 @@ def main():
             sync_ang_R = float(sync_ang_R_buf[delay_frames_R])
             sync_vel_L = float(sync_vel_L_buf[delay_frames_L])
             sync_vel_R = float(sync_vel_R_buf[delay_frames_R])
-            sync_ctrl_pwr_L = float(L_cmd_final) * float(sync_vel_L) * (np.pi / 180.0)
-            sync_ctrl_pwr_R = float(R_cmd_final) * float(sync_vel_R) * (np.pi / 180.0)
+            # GUI power display should represent instantaneous power:
+            # P(t) = tau_out(t) * vel_current(t)
+            # where tau_out(t) is delayed+scaled command sent this cycle.
+            # NOTE:
+            # - sync_vel_* keeps delayed/synchronized velocity for signal inspection.
+            # - ctrl_pwr_* uses current IMU velocity (Lvel/Rvel), not sync_vel_*.
+            sync_ctrl_pwr_L = float(L_cmd_final) * float(Lvel) * (np.pi / 180.0)
+            sync_ctrl_pwr_R = float(R_cmd_final) * float(Rvel) * (np.pi / 180.0)
 
             # ---- 发送给 Teensy ----
             send_torque(
@@ -1649,6 +1691,19 @@ def main():
                 'torque_delay_ms_L': f'{delay_ms_L_eff:.3f}',
                 'torque_delay_ms_R': f'{delay_ms_R_eff:.3f}',
                 'auto_opt_method': auto_opt_method,
+                'auto_delay_enable': str(int(bool(auto_delay_enable))),
+                'auto_motion_valid_L': str(int(bool(auto_motion_valid_L))),
+                'auto_motion_valid_R': str(int(bool(auto_motion_valid_R))),
+                'auto_ratio_L': f'{auto_cur_ratio_L:.6f}',
+                'auto_ratio_R': f'{auto_cur_ratio_R:.6f}',
+                'auto_pos_per_s_L': f'{auto_cur_pos_per_s_L:.6f}',
+                'auto_pos_per_s_R': f'{auto_cur_pos_per_s_R:.6f}',
+                'auto_neg_per_s_L': f'{auto_cur_neg_per_s_L:.6f}',
+                'auto_neg_per_s_R': f'{auto_cur_neg_per_s_R:.6f}',
+                'auto_best_delay_ms_L': f'{auto_best_delay_ms_L:.3f}',
+                'auto_best_delay_ms_R': f'{auto_best_delay_ms_R:.3f}',
+                'auto_window_s': f'{auto_window_s:.3f}',
+                'auto_gait_freq_hz': f'{auto_gait_freq_hz:.4f}',
                 'tag': tag_to_log,
             }
 

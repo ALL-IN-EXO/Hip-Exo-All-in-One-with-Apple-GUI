@@ -1032,6 +1032,9 @@ class MainWindow(QWidget):
 
         self.sb_max_torque_cfg = make_dspin(15.0, 0.0, 30.0, 0.1, 1, max_torque_tip)
         self.sb_max_torque_cfg.setFixedWidth(90)
+        # Keep btn_power aligned with spinbox: otherwise POWER OFF needs 2 clicks
+        # after a direct spinbox edit (first click only re-syncs the button).
+        self.sb_max_torque_cfg.valueChanged.connect(self._sync_power_btn_from_torque)
         mt_row.addWidget(self.sb_max_torque_cfg)
         param_lay.addLayout(mt_row)
 
@@ -1603,8 +1606,8 @@ class MainWindow(QWidget):
         lbl_md = QLabel("Motor:")
         lbl_md.setStyleSheet("font-size:12px; background:transparent;")
         row2.addWidget(lbl_md)
-        self.btn_toggle_L = _dir_btn("L+", "Real L direction")
-        self.btn_toggle_R = _dir_btn("R+", "Real R direction")
+        self.btn_toggle_L = _dir_btn("L+", "Real L direction (actuator only, plot sign unchanged)")
+        self.btn_toggle_R = _dir_btn("R+", "Real R direction (actuator only, plot sign unchanged)")
         self.btn_toggle_L.clicked.connect(self._toggle_left_dir)
         self.btn_toggle_R.clicked.connect(self._toggle_right_dir)
         row2.addWidget(self.btn_toggle_L)
@@ -1613,8 +1616,8 @@ class MainWindow(QWidget):
         lbl_vis = QLabel("Visual:")
         lbl_vis.setStyleSheet("font-size:12px; background:transparent;")
         row2.addWidget(lbl_vis)
-        self.btn_visual_L = _dir_btn("VL+", "Visual L (plot only)")
-        self.btn_visual_R = _dir_btn("VR+", "Visual R (plot only)")
+        self.btn_visual_L = _dir_btn("VL+", "Visual L torque sign (plot only)")
+        self.btn_visual_R = _dir_btn("VR+", "Visual R torque sign (plot only)")
         self.btn_visual_L.clicked.connect(self._toggle_visual_L)
         self.btn_visual_R.clicked.connect(self._toggle_visual_R)
         row2.addWidget(self.btn_visual_L)
@@ -3473,6 +3476,19 @@ class MainWindow(QWidget):
             self.sb_max_torque_cfg.setValue(0.0)
             self._set_power_ui(False)
 
+    def _sync_power_btn_from_torque(self, value):
+        # Invariant: btn_power.isChecked() iff sb_max_torque_cfg.value() > 0.
+        # Any path that sets torque without going through _on_power_toggled
+        # (direct spinbox edit, arrow buttons) would otherwise desync the button
+        # and make POWER OFF take two clicks. blockSignals prevents recursion
+        # back into _on_power_toggled.
+        want_checked = value > 0.0
+        if want_checked == self.btn_power.isChecked():
+            return
+        self.btn_power.blockSignals(True)
+        self._set_power_ui(want_checked)
+        self.btn_power.blockSignals(False)
+
     def _auto_cycle_mile(self):
         if not self._mile_values: return
         value = self._mile_values[self._mile_index]
@@ -3593,15 +3609,24 @@ class MainWindow(QWidget):
             L_vel, R_vel, gait_freq, *, log_csv=True, power_override=None):
         self._last_gait_freq = float(gait_freq)
         vL, vR = self._visual_sign_L, self._visual_sign_R
+        # Motor L+/R+ should only affect real actuator output, not plot sign.
+        # Compensate uplink torque/cmd back to logical sign for display.
+        if self._replay_mode:
+            mL = 1
+            mR = 1
+        else:
+            mL = 1 if (self._dir_bits & 0x01) else -1
+            mR = 1 if (self._dir_bits & 0x02) else -1
         self.t_buffer.append(float(t))
-        self.L_IMU_buf.append(float(L_angle) * vL)
-        self.R_IMU_buf.append(float(R_angle) * vR)
-        self.L_tau_buf.append(float(L_tau) * vL)
-        self.R_tau_buf.append(float(R_tau) * vR)
-        self.L_tau_d_buf.append(float(L_tau_d) * vL)
-        self.R_tau_d_buf.append(float(R_tau_d) * vR)
-        self.L_vel_buf.append(float(L_vel) * vL)
-        self.R_vel_buf.append(float(R_vel) * vR)
+        # Visual sign toggles affect torque display only (Cmd/Est).
+        self.L_IMU_buf.append(float(L_angle))
+        self.R_IMU_buf.append(float(R_angle))
+        self.L_tau_buf.append(float(L_tau) * mL * vL)
+        self.R_tau_buf.append(float(R_tau) * mR * vR)
+        self.L_tau_d_buf.append(float(L_tau_d) * mL * vL)
+        self.R_tau_d_buf.append(float(R_tau_d) * mR * vR)
+        self.L_vel_buf.append(float(L_vel))
+        self.R_vel_buf.append(float(R_vel))
 
         if power_override is None:
             L_pwr = 0.0
@@ -3614,8 +3639,8 @@ class MainWindow(QWidget):
             if not isfinite(R_pwr):
                 R_pwr = 0.0
 
-        self.L_pwr_buf.append(L_pwr * vL)
-        self.R_pwr_buf.append(R_pwr * vR)
+        self.L_pwr_buf.append(L_pwr)
+        self.R_pwr_buf.append(R_pwr)
 
         if log_csv and hasattr(self, '_csv_writer'):
             now_wall = time.time()
@@ -5200,51 +5225,76 @@ class MainWindow(QWidget):
         self._position_power_ratio_overlay(strip, overlay)
 
     def _update_power_strip_titles(self, force=False):
-        """Keep strip titles static, and show per-leg ratio/power via in-plot overlay."""
+        """Keep strip titles static, and show both live(strip) and eval(auto) metrics."""
         if not hasattr(self, 'pwr_strip_right') or not hasattr(self, 'pwr_strip_left'):
             return
         self.pwr_strip_right.setTitle("Right Leg Power Sign", color=C.text2, size='10pt')
         self.pwr_strip_left.setTitle("Left Leg Power Sign", color=C.text2, size='10pt')
 
-        def _format_leg_overlay(ratio, pos_w, neg_w, motion_valid, valid, auto_enable):
-            if not valid:
-                line1 = f"+Ratio --.-% | WAIT"
-                line2 = f"+P --.-- W  -P --.-- W"
-                return line1, line2
-            ratio_clamped = max(0.0, min(1.0, float(ratio)))
-            ratio_pct = ratio_clamped * 100.0
+        def _format_leg_overlay(
+            live_ratio, live_pos_w, live_neg_w, live_valid,
+            eval_ratio, eval_valid,
+            motion_valid, auto_enable
+        ):
             auto_txt = "ON" if auto_enable else "OFF"
             motion_txt = "VALID" if motion_valid else "HOLD"
-            line1 = f"+Ratio {ratio_pct:.1f}% | {auto_txt}/{motion_txt}"
-            line2 = f"+P {float(pos_w):+.2f} W  -P {float(neg_w):+.2f} W"
+
+            if not live_valid and not eval_valid:
+                line1 = f"Live --.-% | Eval --.-% | WAIT"
+                line2 = f"Live +P --.-- W  -P --.-- W"
+                return line1, line2
+
+            if live_valid:
+                live_ratio_txt = f"{max(0.0, min(1.0, float(live_ratio))) * 100.0:.1f}%"
+                line2 = f"Live +P {float(live_pos_w):+.2f} W  -P {float(live_neg_w):+.2f} W"
+            else:
+                live_ratio_txt = "--.-%"
+                line2 = f"Live +P --.-- W  -P --.-- W"
+
+            if eval_valid:
+                eval_ratio_txt = f"{max(0.0, min(1.0, float(eval_ratio))) * 100.0:.1f}%"
+            else:
+                eval_ratio_txt = "--.-%"
+
+            line1 = f"Live {live_ratio_txt} | Eval {eval_ratio_txt} | {auto_txt}/{motion_txt}"
             return line1, line2
+
+        # Live strip metrics are always computed from the currently displayed power buffer.
+        live_ratio_L, live_pos_L, live_neg_L, live_mv_L, live_valid_L = \
+            self._compute_local_power_overlay_metrics('left')
+        live_ratio_R, live_pos_R, live_neg_R, live_mv_R, live_valid_R = \
+            self._compute_local_power_overlay_metrics('right')
 
         if self._rpi_status_valid:
             auto_enable = bool(self._rpi_auto_delay_enable)
-            ratio_L = float(self._rpi_power_ratio_L)
-            ratio_R = float(self._rpi_power_ratio_R)
-            pos_L = float(self._rpi_pos_per_s_L)
-            pos_R = float(self._rpi_pos_per_s_R)
-            neg_L = float(self._rpi_neg_per_s_L)
-            neg_R = float(self._rpi_neg_per_s_R)
+            eval_ratio_L = float(self._rpi_power_ratio_L)
+            eval_ratio_R = float(self._rpi_power_ratio_R)
+            eval_valid_L = True
+            eval_valid_R = True
             mv_L = bool(self._rpi_auto_motion_valid_L)
             mv_R = bool(self._rpi_auto_motion_valid_R)
-            valid_L = True
-            valid_R = True
         else:
-            ratio_L, pos_L, neg_L, mv_L, valid_L = self._compute_local_power_overlay_metrics('left')
-            ratio_R, pos_R, neg_R, mv_R, valid_R = self._compute_local_power_overlay_metrics('right')
+            eval_ratio_L = 0.0
+            eval_ratio_R = 0.0
+            eval_valid_L = False
+            eval_valid_R = False
             algo = int(getattr(self, "_algo_select", ALGO_EG))
             auto_enable = (
                 (algo == ALGO_EG and bool(self._eg_auto_delay_enable)) or
                 (algo == ALGO_SAMSUNG and bool(self._sam_auto_delay_enable))
             )
+            mv_L = bool(live_mv_L)
+            mv_R = bool(live_mv_R)
 
         l1_L, l2_L = _format_leg_overlay(
-            ratio_L, pos_L, neg_L, mv_L, valid_L, auto_enable
+            live_ratio_L, live_pos_L, live_neg_L, live_valid_L,
+            eval_ratio_L, eval_valid_L,
+            mv_L, auto_enable
         )
         l1_R, l2_R = _format_leg_overlay(
-            ratio_R, pos_R, neg_R, mv_R, valid_R, auto_enable
+            live_ratio_R, live_pos_R, live_neg_R, live_valid_R,
+            eval_ratio_R, eval_valid_R,
+            mv_R, auto_enable
         )
 
         self._set_power_overlay_html(
