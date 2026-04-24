@@ -6,7 +6,7 @@
  *
  * 输入: 左右髋角速度 ω (deg/s)
  * 每侧独立跑一个 SOGI-FLL 提取瞬时相位 φ 和幅值 amp
- * 输出: τ = A_gain * ramp * gate(amp) * sin(φ + phi_lead)
+ * 输出: τ = A_gain * ramp * gate(amp) * gate(angle_stand) * sin(φ + phi_lead)
  *
  * 算法细节见 Docs/SOGI-FLL-CONTROLLER.md
  *
@@ -44,6 +44,9 @@ private:
   float A_gain_;          // Nm
   float phi_lead_rad_;    // 由 deg 转换
   float amp_min_;         // deg/s
+
+  // 站立角度门控持续计时（用于抑制站立低频速度噪声）
+  float stand_hold_elapsed_s_;
 
   // === 单侧 SOGI-FLL 状态 ===
   struct Sogi {

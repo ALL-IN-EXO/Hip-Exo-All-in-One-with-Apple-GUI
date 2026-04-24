@@ -7,6 +7,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **SOGI 新增站立角度门控（`All_in_one_hip_controller_RL_update/Controller_SOGI.*`）**：
+  - 增加硬编码站立判定：当左右髋角度同时落在小角度窗内并持续一段时间后，强制左右力矩置 `0`
+  - 目的为抑制站立阶段低频速度噪声导致的虚假助力输出，同时避免步态过零瞬间的短时误触发
+
 - **Power Sign overlay 在 SOGI/Samsung 下的显示修复**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`, `GUI_RL_update/GUI.py`）：
   - Teensy `Transmit_ble_Data()` 补齐 `ALGO_SOGI` 的 `fill_ble_status()` 上报，SOGI 不再写零状态槽
   - GUI 算法切换时清空上一算法状态缓存，避免出现旧状态粘连导致的 `WAIT`/0 值

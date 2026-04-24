@@ -8,12 +8,16 @@ static constexpr float SOGI_GAMMA    = 40.0f;   // FLL 学习率
 static constexpr float SOGI_F_MIN    = 0.3f;    // 频率夹紧下限 (Hz)
 static constexpr float SOGI_F_MAX    = 3.5f;    // 频率夹紧上限 (Hz)
 static constexpr float SOGI_RAMP_SEC = 1.5f;    // 冷启动斜坡时长
+// 站立门控：双腿角度长时间处于小角度窗时，强制 τ=0，抑制站立噪声触发
+static constexpr float SOGI_STAND_ANGLE_DEG  = 10.0f;   // 站立角度窗 (deg)
+static constexpr float SOGI_STAND_HOLD_SEC   = 0.25f;  // 连续保持时长 (s)
 static constexpr float TWO_PI_F      = 6.28318530718f;
 
 Controller_SOGI::Controller_SOGI() {
   A_gain_        = 0.0f;
   phi_lead_rad_  = 0.0f;
   amp_min_       = 20.0f;
+  stand_hold_elapsed_s_ = 0.0f;
   reset();
 }
 
@@ -25,6 +29,7 @@ void Controller_SOGI::reset() {
   R_.x1 = 0.0f;
   R_.x2 = 0.0f;
   ramp_elapsed_ = 0.0f;
+  stand_hold_elapsed_s_ = 0.0f;
   // ADO 用于显示功率指标；delay 永不启用。
   ado_.reset(0.0f);
 }
@@ -90,6 +95,21 @@ void Controller_SOGI::compute(const CtrlInput& in, CtrlOutput& out) {
   float tau_L = A_gain_ * ramp * gateL * sinL;
   float tau_R = A_gain_ * ramp * gateR * sinR;
 
+  // 角度门控：用于抑制站立时低频速度噪声造成的虚假助力
+  // 仅当双腿同时长时间停留在小角度窗内，才强制置零，避免走路过中立位被误触发。
+  const bool in_stand_angle_window =
+      (fabsf(in.LTx_filtered) <= SOGI_STAND_ANGLE_DEG) &&
+      (fabsf(in.RTx_filtered) <= SOGI_STAND_ANGLE_DEG);
+  if (in_stand_angle_window) {
+    stand_hold_elapsed_s_ += dt;
+  } else {
+    stand_hold_elapsed_s_ = 0.0f;
+  }
+  if (stand_hold_elapsed_s_ >= SOGI_STAND_HOLD_SEC) {
+    tau_L = 0.0f;
+    tau_R = 0.0f;
+  }
+
   // 限幅
   float max_abs = fabsf(in.max_torque_cfg);
   if (tau_L >  max_abs) tau_L =  max_abs;
@@ -112,4 +132,3 @@ void Controller_SOGI::tick_auto_delay(unsigned long now_us, float gait_freq_hz) 
 void Controller_SOGI::fill_ble_status(uint8_t* buf40) const {
   ado_.fill_ble_status(buf40, 1.0f);
 }
-
