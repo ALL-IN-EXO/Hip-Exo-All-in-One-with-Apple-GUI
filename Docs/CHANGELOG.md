@@ -16,6 +16,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - 修复 2：移除 `send_torque()` 和 `send_status()` 末尾的 `ser.flush()`。在 115200 波特率下 `ser.flush()=tcdrain()` 每次阻塞 ~3.6ms（42B 帧），每周期直接吃掉主循环 ~36% 时间预算，把消费端从“足够快”推到“追不上”；内核 FIFO + Teensy 端无背压，不需要 drain
   - 效果：Pi 端恢复对最新 IMU 的实时响应，GUI 中 Pi 同步路径（Auto/Sync/Control 功率）不再滞后；IMU 生产速率仍是 Teensy 侧（`~1kHz`），Pi 控制周期仍是 100Hz，均未改动
 
+- **GUI `POWER OFF` 按钮偶发需要点两次才关机修复**（`GUI_RL_update/GUI.py`）：
+  - 症状：某些情况下点一次 `POWER OFF` 按钮只把按钮文字/颜色翻了一下但力矩没归零；再点第二次才真的把 `Max Torque` 拉到 0
+  - 根因：`btn_power.isChecked()` 与 `sb_max_torque_cfg.value() > 0` 是隐含不变量，但只有 `_on_power_toggled` 维护它；一旦用户在 Parameters 面板手动改 Max Torque（敲数字或点 spinbox 箭头），`sb_max_torque_cfg` 变了但按钮 `checked` 没变 → 下一次点击按钮，Qt 先把 `checked` 从 unchecked 翻到 checked → 进入 `_on_power_toggled(True)`，`setValue(_maxT_before_off)` 与当前值相同是 no-op，只把按钮刷成绿 "POWER ON"；用户得再点一次才触发 `_on_power_toggled(False)` 真把力矩设为 0
+  - 修复：给 `sb_max_torque_cfg.valueChanged` 新增 `_sync_power_btn_from_torque`，任何路径改 torque 值都会自动对齐按钮 checked/text/颜色（`>0 → POWER ON 绿`，`=0 → POWER OFF 红`）；同步过程用 `btn_power.blockSignals(True)` 保护，避免重新进入 `_on_power_toggled` 造成回环
+  - 效果：`POWER OFF` 永远一次点击到位；直接编辑 Max Torque 数字/箭头后按钮即时跟随；不动 BLE、不动 `_on_power_toggled`、不动掉线自动关机、不动主题刷新
+
 - **GUI `Data Source=Sync` 下偶发 ±300° / ±3000 dps “爆帧”修复**（`All_in_one_hip_controller_RL_update/Controller_RL.h`, `Controller_RL.cpp`）：
   - 症状：Pi backlog 修好后出现的二次问题 —— Sync 路径（GUI Auto/Sync 数据源）约 `2.1%` 帧出现角度 ±300°、速度 ±3000 dps 的刺尖；Raw 路径干净
   - 诊断：对 `GUI_RL_update/data/20260422_213207.csv` 与 `Data from PI/PI5_lstm_pd-20260423-023206.csv` 做同 `sample_id` 交叉比对，发现 Pi 送上线前的 `sync_LTx/sync_Lvel` 始终在物理量程内；GUI 收到的却是 int16 / 100 和 int16 / 10 的近饱和值（`±32500/100=±325°`、`±32767/10=±3275 dps`）。`sync_sample_id`（AA59 payload 前 2 字节）以及 `sync_cmd_L`（走 Teensy 本地 `ud.L_cmd100`，不经 AA59 覆盖）都始终干净 → 错位只发生在 AA59 payload 偏移 `26..37` 的 6 个 int16 字段
