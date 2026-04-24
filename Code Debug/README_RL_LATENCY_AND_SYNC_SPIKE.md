@@ -1,12 +1,12 @@
 # RL Real-Time Latency & Sync Spike Fix Notes
 
 **Scope:** `## [Unreleased] -> ### Fixed` in `Docs/CHANGELOG.md`  
-**Date:** 2026-04-22/23  
+**Date:** 2026-04-22/24  
 **Related files:**  
 - `RPi_Unified/RL_controller_torch.py`  
 - `All_in_one_hip_controller_RL_update/Controller_RL.h`  
 - `All_in_one_hip_controller_RL_update/Controller_RL.cpp`  
-- `GUI_RL_update/GUI.py` (display path behavior)
+- `GUI_RL_update/GUI.py` (display path behavior + POWER OFF double-click fix)
 
 ---
 
@@ -117,3 +117,65 @@
 
 - 本 README 是 `Unreleased/Fixed` 的工程化补充说明。  
 - 更早的功率定义与 GUI/RPi 对齐背景，见：`Code Debug/BUG_ANALYSIS.md`。  
+
+---
+
+## 6. 问题 C：POWER OFF 按钮偶发需要点两次
+
+### 6.1 现象
+
+- GUI 左上 `POWER OFF / POWER ON` 大按钮，**关机时有时需要点 2 次才真正关掉**（第一次点击按钮只是颜色文字变化，力矩没归零；第二次才真把 `sb_max_torque_cfg` 拉到 0）。
+- 问题不是 Qt click 没注册（visual 状态每次都响应），而是**逻辑上点了一次才生效**。
+
+### 6.2 高置信根因
+
+代码里存在一个隐含不变量：  
+> `btn_power.isChecked()`  ⇔  `sb_max_torque_cfg.value() > 0`
+
+但这个不变量 **只在 `_on_power_toggled` 路径里维持**。以下路径会让两者失同步：
+
+- 用户直接在 Parameters 面板里手动编辑 `Max Torque` 数字；  
+- 用户点 `QDoubleSpinBox` 上下箭头把 Max Torque 从 0 调到非 0；  
+- 任何把 torque 值改了、但没过 `_on_power_toggled` 的路径。
+
+一旦失同步（`btn_power` 仍 unchecked / 红色 "POWER OFF"，而 `sb_max_torque_cfg > 0`），用户点一下按钮会：
+
+1. Qt 把 checkable 按钮从 unchecked 翻到 checked → 触发 `_on_power_toggled(True)`；  
+2. `_on_power_toggled(True)` 里 `setValue(val)`，其中 `val = _maxT_before_off`，而当前 spinbox 已经是 15，属于 no-op；  
+3. `_set_power_ui(True)` 把按钮刷成绿 "POWER ON"；
+4. **此时力矩其实一直是 15，没变过**。
+
+用户眼里：我想关，按了一次 → 按钮反而变绿、motor 还在转。再点一次 → `_on_power_toggled(False)` → `setValue(0)` → 绿变红，motor 停。**2 次点击才关掉**。
+
+这个路径和 BLE / AA59 / Pi backlog 都无关，是纯 GUI 内部状态不一致。
+
+### 6.3 已实施修复
+
+`GUI_RL_update/GUI.py`：给 `sb_max_torque_cfg.valueChanged` 新接一个 handler `_sync_power_btn_from_torque(value)`，任何路径改了 spinbox 值都会被它看见：
+
+- `value > 0` 且按钮当前 unchecked → 自动把按钮刷成 "POWER ON" 绿；  
+- `value == 0` 且按钮当前 checked → 自动把按钮刷成 "POWER OFF" 红；  
+- 已同步则立即 return，避免无意义的 stylesheet 重建。
+
+核心 3 行保护措施：
+
+1. 进入前 `want_checked == isChecked()` 快速 return，避免在 `_on_power_toggled` → `setValue()` → `valueChanged` → `_sync_power_btn_from_torque` 再回 `_set_power_ui` 的链条里多绕一圈。  
+2. 调用 `_set_power_ui` 前用 `btn_power.blockSignals(True)` 抑制 `setChecked` 引起的 `toggled` 回调；否则会重新进入 `_on_power_toggled`，把 spinbox 值又刷一次，形成回环。  
+3. 改完立刻 `blockSignals(False)` 恢复，不影响后续用户点击。
+
+代码位置：  
+- 连接点在 `sb_max_torque_cfg` 创建处（`_build_layout` 里的 `make_dspin(15.0, ...)` 之后）。  
+- handler 方法定义紧跟在 `_on_power_toggled` 下面。
+
+### 6.4 预期结果
+
+- 直接编辑 Max Torque 数字或点箭头 → 按钮实时跟随颜色/文字，不变量恢复。  
+- POWER OFF 永远一次点击到位（按钮 checked 状态总是跟实际 torque 状态一致，点击 `toggled` 总是携带真正的意图方向）。  
+- 其他路径（`_on_power_toggled`、连接时 `_set_power_ui(sb_max_torque_cfg > 0)`、掉线时强制关机、主题刷新）都不变，安全。
+
+### 6.5 验证建议
+
+1. GUI 启动后，先不操作，直接 POWER OFF 按钮点一次 → 无反应（已经是红的，value=0）。正常。  
+2. 点按钮变绿 "POWER ON"（torque=15），再点一次 → 红 "POWER OFF"（torque=0）。一次到位。  
+3. 手动在 Max Torque 里敲 `15` 回车 → 按钮**自动变绿**。此时点一次按钮 → 直接红。**不再需要两次**。  
+4. 手动把 Max Torque 从 15 敲到 `0` → 按钮**自动变红**，与不变量一致。

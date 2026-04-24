@@ -1032,6 +1032,9 @@ class MainWindow(QWidget):
 
         self.sb_max_torque_cfg = make_dspin(15.0, 0.0, 30.0, 0.1, 1, max_torque_tip)
         self.sb_max_torque_cfg.setFixedWidth(90)
+        # Keep btn_power aligned with spinbox: otherwise POWER OFF needs 2 clicks
+        # after a direct spinbox edit (first click only re-syncs the button).
+        self.sb_max_torque_cfg.valueChanged.connect(self._sync_power_btn_from_torque)
         mt_row.addWidget(self.sb_max_torque_cfg)
         param_lay.addLayout(mt_row)
 
@@ -3440,6 +3443,19 @@ class MainWindow(QWidget):
             self._maxT_before_off = float(self.sb_max_torque_cfg.value())
             self.sb_max_torque_cfg.setValue(0.0)
             self._set_power_ui(False)
+
+    def _sync_power_btn_from_torque(self, value):
+        # Invariant: btn_power.isChecked() iff sb_max_torque_cfg.value() > 0.
+        # Any path that sets torque without going through _on_power_toggled
+        # (direct spinbox edit, arrow buttons) would otherwise desync the button
+        # and make POWER OFF take two clicks. blockSignals prevents recursion
+        # back into _on_power_toggled.
+        want_checked = value > 0.0
+        if want_checked == self.btn_power.isChecked():
+            return
+        self.btn_power.blockSignals(True)
+        self._set_power_ui(want_checked)
+        self.btn_power.blockSignals(False)
 
     def _auto_cycle_mile(self):
         if not self._mile_values: return
