@@ -12,8 +12,9 @@ set -euo pipefail
 #
 # Optional env vars:
 #   PYTHON_BIN=/usr/local/bin/python3
-#   APP_NAME=HipExoControllerGUI
-#   APP_VERSION=3.3.0
+#   APP_NAME=HipExoControllerGUI_v4.1   # default: from changelog version
+#   APP_DISPLAY_NAME="Hip-Exo Controller v4.1"
+#   APP_VERSION=4.1                     # default: latest release in Docs/CHANGELOG.md
 #   ICON_SOURCE=/path/to/icon.jpeg
 #   ICON_ENABLED=1      # default ON; set 0 to disable
 #   VERSION_ENABLED=1   # default ON; set 0 to disable plist version stamping
@@ -33,13 +34,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 APP_DIR="${REPO_ROOT}/GUI_RL_update"
 ENTRY="${APP_DIR}/GUI.py"
+CHANGELOG_FILE="${REPO_ROOT}/Docs/CHANGELOG.md"
 
 if [[ ! -f "${ENTRY}" ]]; then
   echo "Entry not found: ${ENTRY}"
   exit 1
 fi
 
-APP_NAME="${APP_NAME:-HipExoControllerGUI}"
 ICON_ENABLED="${ICON_ENABLED:-1}"
 VERSION_ENABLED="${VERSION_ENABLED:-1}"
 SIGN_ENABLED="${SIGN_ENABLED:-0}"
@@ -66,10 +67,14 @@ if [[ -z "${PY}" ]]; then
   exit 1
 fi
 
-extract_app_version() {
-  local entry_file="$1"
+extract_changelog_version() {
+  local changelog_file="$1"
   local v
-  v="$(grep -Eo 'v[0-9]+([.][0-9]+)+' "${entry_file}" | head -n1 | sed 's/^v//' || true)"
+  if [[ -f "${changelog_file}" ]]; then
+    v="$(grep -E '^## \[v[0-9]+([.][0-9]+)*\]' "${changelog_file}" | head -n1 | sed -E 's/^## \[v([0-9]+([.][0-9]+)*)\].*$/\1/' || true)"
+  else
+    v=""
+  fi
   if [[ -n "${v}" ]]; then
     echo "${v}"
   else
@@ -77,7 +82,9 @@ extract_app_version() {
   fi
 }
 
-APP_VERSION="${APP_VERSION:-$(extract_app_version "${ENTRY}")}"
+APP_VERSION="${APP_VERSION:-$(extract_changelog_version "${CHANGELOG_FILE}")}"
+APP_NAME="${APP_NAME:-HipExoControllerGUI_v${APP_VERSION}}"
+APP_DISPLAY_NAME="${APP_DISPLAY_NAME:-Hip-Exo Controller v${APP_VERSION}}"
 
 # Keep build env outside external drives to avoid AppleDouble metadata issues.
 VENV_DIR="${VENV_DIR:-${HOME}/.exo_gui_build/hip/venv_mac_py39}"
@@ -95,6 +102,8 @@ RELEASE_DIR="${APP_DIR}/release/mac/${BUILD_TAG}"
 echo "==> Repo: ${REPO_ROOT}"
 echo "==> App dir: ${APP_DIR}"
 echo "==> Python: ${PY}"
+echo "==> App name: ${APP_NAME}"
+echo "==> Display name: ${APP_DISPLAY_NAME}"
 echo "==> App version: ${APP_VERSION}"
 echo "==> Build venv: ${VENV_DIR}"
 echo "==> Work root: ${WORK_ROOT}"
@@ -208,6 +217,7 @@ PYI_ARGS=(
   --distpath "${DIST_DIR}"
   --workpath "${BUILD_DIR}"
   --specpath "${SPEC_DIR}"
+  --add-data "${REPO_ROOT}/Docs/CHANGELOG.md:Docs"
 )
 if [[ ${#ICON_FLAG_ARGS[@]} -gt 0 ]]; then
   PYI_ARGS+=("${ICON_FLAG_ARGS[@]}")
@@ -287,6 +297,8 @@ if [[ "${VERSION_ENABLED}" != "0" ]]; then
     echo "==> Stamping app version in Info.plist"
     set_plist_value "${INFO_PLIST}" "CFBundleShortVersionString" "string" "${APP_VERSION}"
     set_plist_value "${INFO_PLIST}" "CFBundleVersion" "string" "${BUILD_TAG}"
+    set_plist_value "${INFO_PLIST}" "CFBundleDisplayName" "string" "${APP_DISPLAY_NAME}"
+    set_plist_value "${INFO_PLIST}" "CFBundleName" "string" "${APP_DISPLAY_NAME}"
   fi
 fi
 
