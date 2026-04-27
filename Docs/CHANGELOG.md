@@ -5,6 +5,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **版本号来源统一为 `Docs/CHANGELOG.md`（GUI 启动 + macOS 打包）**（`GUI_RL_update/GUI.py`, `scripts/build_mac_JZ.sh`, `README.md`）：
+  - GUI 启动时不再硬编码标题版本，改为读取最新发布节（`## [vX.Y[.Z]] - YYYY-MM-DD`）并显示为 `Hip-Exo Controller vX.Y`
+  - `build_mac_JZ.sh` 的 `APP_VERSION` 默认值改为从 `Docs/CHANGELOG.md` 解析（仍可用环境变量覆盖）
+  - 打包默认软件名改为 `HipExoControllerGUI_v<version>`，`Info.plist` 同步写入 `CFBundleShortVersionString`、`CFBundleDisplayName`、`CFBundleName`
+  - 打包时将 `Docs/CHANGELOG.md` 一并打入 `.app`（PyInstaller `--add-data`），保证发布包运行时也可按同口径解析版本
+  - README 移除硬编码“Current Version: vX.Y”文案，避免与 changelog 双维护
+
+## [v4.1] - 2026-04-27
+
 ### Fixed
 
 - 详细问题说明与证据链见：`Code Debug/README_RL_LATENCY_AND_SYNC_SPIKE.md`

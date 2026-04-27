@@ -24,7 +24,7 @@ import threading
 import queue
 from datetime import datetime
 """
-Hip-Exo GUI v4.1 — Apple HIG Design
+Hip-Exo GUI — Apple HIG Design
 -------------------------------------
 Apple Human Interface Guidelines inspired:
 - SF Pro typography, 8pt grid spacing
@@ -606,11 +606,51 @@ def _make_section_label(text):
     return lbl
 
 
+APP_TITLE_BASE = "Hip-Exo Controller"
+_CHANGELOG_RELEASE_RE = re.compile(r"^\s*##\s*\[(v\d+(?:\.\d+)*)\]\s*(?:-|$)")
+
+
+def _latest_release_version_from_changelog():
+    """
+    Read latest released version from Docs/CHANGELOG.md.
+    Source tree and packaged-app locations are both supported.
+    """
+    candidates = []
+    gui_dir = os.path.abspath(os.path.dirname(__file__))
+    candidates.append(os.path.abspath(os.path.join(gui_dir, "..", "Docs", "CHANGELOG.md")))
+    candidates.append(os.path.abspath(os.path.join(os.getcwd(), "Docs", "CHANGELOG.md")))
+
+    meipass_dir = getattr(sys, "_MEIPASS", None)
+    if meipass_dir:
+        candidates.append(os.path.join(meipass_dir, "Docs", "CHANGELOG.md"))
+
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+    candidates.append(os.path.abspath(os.path.join(exe_dir, "..", "Resources", "Docs", "CHANGELOG.md")))
+
+    seen = set()
+    for path in candidates:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    m = _CHANGELOG_RELEASE_RE.match(line)
+                    if m:
+                        return m.group(1)
+        except Exception:
+            continue
+    return "v0.0.0"
+
+
 # ============== Main Window ==============
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Hip-Exo Controller")
+        self._app_version = _latest_release_version_from_changelog()
+        self.setWindowTitle(f"{APP_TITLE_BASE} {self._app_version}")
         self.resize(1440, 860)
 
         self.ser = None
