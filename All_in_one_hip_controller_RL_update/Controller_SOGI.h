@@ -56,6 +56,10 @@ private:
   float move_on_sec_;     // s
   float move_off_sec_;    // s
 
+  // 双侧对称性自动检测
+  float sym_score_;    // IIR 滤波的 cos(φ_L - φ_R)，∈[-1, +1]
+  bool  is_bilateral_; // true→深蹲/STS(同相)，false→步行(反相)
+
   // 站立角度门控持续计时（用于抑制站立低频速度噪声）
   float stand_hold_elapsed_s_;
 

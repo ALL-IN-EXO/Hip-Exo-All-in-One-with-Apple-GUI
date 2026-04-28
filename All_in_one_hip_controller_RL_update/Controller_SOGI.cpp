@@ -33,6 +33,8 @@ Controller_SOGI::Controller_SOGI() {
   amp_off_       = SOGI_AMP_OFF_DEFAULT;
   move_on_sec_   = SOGI_MOVE_ON_SEC_DEFAULT;
   move_off_sec_  = SOGI_MOVE_OFF_SEC_DEFAULT;
+  sym_score_     = 0.0f;
+  is_bilateral_  = false;
   stand_hold_elapsed_s_ = 0.0f;
   reset();
 }
@@ -45,6 +47,8 @@ void Controller_SOGI::reset() {
   R_.x1 = 0.0f;
   R_.x2 = 0.0f;
   ramp_elapsed_ = 0.0f;
+  sym_score_    = 0.0f;
+  is_bilateral_ = false;
   stand_hold_elapsed_s_ = 0.0f;
   motion_state_ = MOTION_STOPPED;
   moving_candidate_s_ = 0.0f;
@@ -221,6 +225,18 @@ void Controller_SOGI::compute(const CtrlInput& in, CtrlOutput& out) {
   float sinL, ampL, sinR, ampR;
   step_sogi(L_, in.LTAVx, dt, phi_lead_rad_, sinL, ampL);
   step_sogi(R_, in.RTAVx, dt, phi_lead_rad_, sinR, ampR);
+
+  // 双侧对称性检测: cos(φ_L - φ_R) = (x1_L·x1_R + x2_L·x2_R) / (ampL·ampR)
+  // 步行→反相→cos≈-1；深蹲/STS→同相→cos≈+1
+  // 仅在双侧都有足够幅值时更新，避免静止噪声干扰
+  if (ampL > amp_min_ && ampR > amp_min_) {
+    float cos_diff = (L_.x1 * R_.x1 + L_.x2 * R_.x2) / (ampL * ampR + 1e-6f);
+    float alpha = dt / (dt + 1.0f);  // IIR 时间常数 1.0 s
+    sym_score_ += alpha * (cos_diff - sym_score_);
+  }
+  // 迟滞切换：+0.4 判为双侧，-0.1 回到交替
+  if (!is_bilateral_ && sym_score_ >  0.4f) is_bilateral_ = true;
+  if ( is_bilateral_ && sym_score_ < -0.1f) is_bilateral_ = false;
   update_motion_state(ampL, ampR, dt);
   const bool zc_storm_L = update_zc_tracker(zc_L_, L_.x1, dt);
   const bool zc_storm_R = update_zc_tracker(zc_R_, R_.x1, dt);
@@ -260,6 +276,12 @@ void Controller_SOGI::compute(const CtrlInput& in, CtrlOutput& out) {
   if (stand_hold_elapsed_s_ >= SOGI_STAND_HOLD_SEC) {
     tau_L = 0.0f;
     tau_R = 0.0f;
+  }
+
+  // 半波整流：自动检测到双侧同相(深蹲/STS)时只保留正向力矩
+  if (is_bilateral_) {
+    if (tau_L < 0.0f) tau_L = 0.0f;
+    if (tau_R < 0.0f) tau_R = 0.0f;
   }
 
   // 限幅
