@@ -626,22 +626,33 @@ void receive_motor_feedback() {
 
 /******************** BLE 接收 (128 字节帧) ********************/
 void Receive_ble_Data() {
-  static uint8_t hdr[3] = {0};
+  // 逐字节状态机：跨 BLE 分包累积完整帧，不依赖 readBytes 超时
+  static uint8_t hdr[3]                   = {0};
+  static uint8_t payload_buf[BLE_PAYLOAD_LEN];
+  static size_t  payload_count            = 0;
+  static bool    collecting               = false;
 
   while (Serial5.available()) {
-    hdr[0] = hdr[1];
-    hdr[1] = hdr[2];
-    hdr[2] = Serial5.read();
+    uint8_t b = (uint8_t)Serial5.read();
 
-    if (!(hdr[0] == 0xA5 && hdr[1] == 0x5A && hdr[2] == BLE_FRAME_LEN)) {
+    if (!collecting) {
+      hdr[0] = hdr[1];
+      hdr[1] = hdr[2];
+      hdr[2] = b;
+      if (hdr[0] == 0xA5 && hdr[1] == 0x5A && hdr[2] == BLE_FRAME_LEN) {
+        collecting    = true;
+        payload_count = 0;
+      }
       continue;
     }
 
-    size_t n = Serial5.readBytes((char*)data_rs232_rx, BLE_PAYLOAD_LEN);
-    if (n < BLE_PAYLOAD_LEN) {
-      Serial.printf("[BLE] Payload incomplete: got %d / %d bytes\n", (int)n, BLE_PAYLOAD_LEN);
-      return;
-    }
+    payload_buf[payload_count++] = b;
+    if (payload_count < BLE_PAYLOAD_LEN) continue;
+
+    // 完整帧就绪
+    collecting    = false;
+    payload_count = 0;
+    memcpy(data_rs232_rx, payload_buf, BLE_PAYLOAD_LEN);
 
     // LOGTAG 帧检测
     if (data_rs232_rx[0] == 'L' && data_rs232_rx[1] == 'G') {

@@ -88,19 +88,20 @@ private:
 
   void update_motion_state(float ampL, float ampR, float dt);
 
-  // 过零频率防抖：若过零频率异常偏高，判定为虚假过零并临时关断输出
+  // 过零频率防抖：LPF 后速度若仍在短时间内频繁过零，判定为虚假过零并临时关断输出
   struct ZcTracker {
     float prev_v;
-    float since_last_cross_s;
-    float fake_window_elapsed_s;
+    float since_last_cross_s;   // 距上次过零已经过的时间
+    float fake_window_elapsed_s; // 当前统计窗口已用时间
+    float hold_elapsed_s;        // 门控关断剩余保持时间
     uint8_t fake_count_in_window;
     bool initialized;
   };
   ZcTracker zc_L_;
   ZcTracker zc_R_;
-  float zc_fake_hold_s_;
 
   static void reset_zc_tracker(ZcTracker& z);
+  // 返回 true = 门控开（正常），false = 门控关（检测到高频过零）
   static bool update_zc_tracker(ZcTracker& z, float v, float dt);
 
   // 单步 SOGI-FLL 更新，返回 sin(phi+lead) 和 amp

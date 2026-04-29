@@ -1439,6 +1439,12 @@ class MainWindow(QWidget):
         self.sb_sogi_amp_off = make_dspin(18.0, 0.0, 500.0, 0.5, 1, sogi_amp_off_tip)
         self.sb_sogi_move_on = make_dspin(0.15, 0.0, 2.0, 0.01, 2, sogi_move_on_tip)
         self.sb_sogi_move_off = make_dspin(0.20, 0.0, 2.0, 0.01, 2, sogi_move_off_tip)
+        sogi_vel_lpf_tip = (
+            "Velocity low-pass filter cutoff (Hz). 0 = bypass.\n"
+            "Filters IMU noise before SOGI; LPF phase delay is\n"
+            "automatically compensated via phi_lead."
+        )
+        self.sb_sogi_vel_lpf = make_dspin(10.0, 0.0, 100.0, 1.0, 1, sogi_vel_lpf_tip)
         lbl_sogi_A = QLabel("A_gain (Nm)");       lbl_sogi_A.setToolTip(sogi_a_tip)
         lbl_sogi_lead = QLabel("Phi lead (°)");   lbl_sogi_lead.setToolTip(sogi_lead_tip)
         lbl_sogi_amp = QLabel("amp_min (deg/s)"); lbl_sogi_amp.setToolTip(sogi_ampmin_tip)
@@ -1446,6 +1452,7 @@ class MainWindow(QWidget):
         lbl_sogi_amp_off = QLabel("amp_off (deg/s)"); lbl_sogi_amp_off.setToolTip(sogi_amp_off_tip)
         lbl_sogi_move_on = QLabel("move_on (s)"); lbl_sogi_move_on.setToolTip(sogi_move_on_tip)
         lbl_sogi_move_off = QLabel("move_off (s)"); lbl_sogi_move_off.setToolTip(sogi_move_off_tip)
+        lbl_sogi_vel_lpf = QLabel("vel LPF (Hz)"); lbl_sogi_vel_lpf.setToolTip(sogi_vel_lpf_tip)
         sogi_grid.addWidget(lbl_sogi_A,          0, 0)
         sogi_grid.addWidget(self.sb_sogi_A,      0, 1)
         sogi_grid.addWidget(lbl_sogi_lead,       1, 0)
@@ -1460,6 +1467,8 @@ class MainWindow(QWidget):
         sogi_grid.addWidget(self.sb_sogi_move_on,5, 1)
         sogi_grid.addWidget(lbl_sogi_move_off,   6, 0)
         sogi_grid.addWidget(self.sb_sogi_move_off,6, 1)
+        sogi_grid.addWidget(lbl_sogi_vel_lpf,    7, 0)
+        sogi_grid.addWidget(self.sb_sogi_vel_lpf, 7, 1)
         self.algo_stack.addWidget(sogi_panel)
 
         # -- Test panel (sin wave) --
@@ -5664,6 +5673,7 @@ class MainWindow(QWidget):
             put_s16(13, float(self.sb_sogi_amp_off.value()), 10)
             put_s16(15, float(self.sb_sogi_move_on.value()), 1000)
             put_s16(17, float(self.sb_sogi_move_off.value()), 1000)
+            put_s16(19, float(self.sb_sogi_vel_lpf.value()), 10)
 
         header = struct.pack('<BBB', 0xA5, 0x5A, BLE_FRAME_LEN)
         self.ser.write(header + payload)
