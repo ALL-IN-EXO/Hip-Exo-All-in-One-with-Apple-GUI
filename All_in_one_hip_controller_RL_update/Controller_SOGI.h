@@ -56,6 +56,10 @@ private:
   float move_on_sec_;     // s
   float move_off_sec_;    // s
 
+  // === 全局速度滤波参数（用于相位补偿）===
+  float filter_fc_hz_;    // 速度滤波截止频率 (Hz)
+  bool  filter_vel_on_;   // 速度滤波是否启用
+  bool  filter_butter_;   // true=Butterworth(2阶), false=一阶IIR
   // 双侧对称性自动检测
   float sym_score_;    // IIR 滤波的 cos(φ_L - φ_R)，∈[-1, +1]
   bool  is_bilateral_; // true→深蹲/STS(同相)，false→步行(反相)
@@ -71,6 +75,14 @@ private:
   };
   Sogi L_;
   Sogi R_;
+
+  // 逐周期幅值保持（步行模式）：确保周期内增益固定，力矩为纯正弦
+  float amp_peak_L_;   // 当前周期内 ampL 运行最大值
+  float amp_peak_R_;
+  float amp_hold_L_;   // 上一周期峰值（本周期内固定不变）
+  float amp_hold_R_;
+  float sin_prev_L_;   // 用于检测 sinL 正向过零（力矩零点更新，无突变）
+  float sin_prev_R_;
 
   // 冷启动 ramp
   float ramp_elapsed_;   // 秒
@@ -88,12 +100,12 @@ private:
     float prev_v;
     float since_last_cross_s;
     float fake_window_elapsed_s;
+    float hold_elapsed_s;
     uint8_t fake_count_in_window;
     bool initialized;
   };
   ZcTracker zc_L_;
   ZcTracker zc_R_;
-  float zc_fake_hold_s_;
 
   static void reset_zc_tracker(ZcTracker& z);
   static bool update_zc_tracker(ZcTracker& z, float v, float dt);

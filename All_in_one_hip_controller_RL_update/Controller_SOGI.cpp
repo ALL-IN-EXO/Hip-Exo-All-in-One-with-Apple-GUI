@@ -4,7 +4,7 @@
 // === 硬编码常量 (见 Docs/SOGI-FLL-CONTROLLER.md §6) ===
 static constexpr float SOGI_F0_HZ    = 1.0f;    // FLL 初值，自适应
 static constexpr float SOGI_K        = 1.41f;   // √2 阻尼
-static constexpr float SOGI_GAMMA    = 40.0f;   // FLL 学习率
+static constexpr float SOGI_GAMMA    = 2.0f;   // FLL 学习率
 static constexpr float SOGI_F_MIN    = 0.3f;    // 频率夹紧下限 (Hz)
 static constexpr float SOGI_F_MAX    = 3.5f;    // 频率夹紧上限 (Hz)
 static constexpr float SOGI_RAMP_SEC = 0.5f;    // 冷启动斜坡时长
@@ -24,6 +24,7 @@ static constexpr float SOGI_ZC_FAKE_HOLD_SEC     = 0.35f;  // 触发后输出关
 static constexpr float SOGI_STAND_ANGLE_DEG  = 10.0f;   // 站立角度窗 (deg)
 static constexpr float SOGI_STAND_HOLD_SEC   = 0.25f;  // 连续保持时长 (s)
 static constexpr float TWO_PI_F      = 6.28318530718f;
+static constexpr float SOGI_AMP_REF  = 200.0f;  // 参考角速度幅值 (deg/s)，步行模式力矩按此比例缩放
 
 Controller_SOGI::Controller_SOGI() {
   A_gain_        = 0.0f;
@@ -33,9 +34,15 @@ Controller_SOGI::Controller_SOGI() {
   amp_off_       = SOGI_AMP_OFF_DEFAULT;
   move_on_sec_   = SOGI_MOVE_ON_SEC_DEFAULT;
   move_off_sec_  = SOGI_MOVE_OFF_SEC_DEFAULT;
+  filter_fc_hz_  = 5.0f;
+  filter_vel_on_ = false;
+  filter_butter_ = true;
   sym_score_     = 0.0f;
   is_bilateral_  = false;
   stand_hold_elapsed_s_ = 0.0f;
+  amp_peak_L_ = amp_peak_R_ = 0.0f;
+  amp_hold_L_ = amp_hold_R_ = SOGI_AMP_REF;  // 首周期用参考值避免增益为零
+  sin_prev_L_ = sin_prev_R_ = 0.0f;
   reset();
 }
 
@@ -56,7 +63,9 @@ void Controller_SOGI::reset() {
   stop_hold_elapsed_s_ = 0.0f;
   reset_zc_tracker(zc_L_);
   reset_zc_tracker(zc_R_);
-  zc_fake_hold_s_ = 0.0f;
+  amp_peak_L_ = amp_peak_R_ = 0.0f;
+  amp_hold_L_ = amp_hold_R_ = SOGI_AMP_REF;
+  sin_prev_L_ = sin_prev_R_ = 0.0f;
   // ADO 用于显示功率指标；delay 永不启用。
   ado_.reset(0.0f);
 }
@@ -81,6 +90,11 @@ void Controller_SOGI::parse_params(const BleDownlinkData& dl) {
       (dl.sogi_amp_off > 0.0f) ||
       (dl.sogi_move_on_sec > 0.0f) ||
       (dl.sogi_move_off_sec > 0.0f);
+
+  // 全局速度滤波参数（无论 has_ext_sogi_params 都更新）
+  filter_fc_hz_  = dl.filter_fc_hz > 0.0f ? dl.filter_fc_hz : 5.0f;
+  filter_vel_on_ = (dl.filter_flags & 0x02) != 0;  // bit1 = 速度滤波
+  filter_butter_ = (dl.filter_flags & 0x08) != 0;
 
   if (!has_ext_sogi_params) {
     amp_on_ = SOGI_AMP_ON_DEFAULT;
@@ -177,10 +191,12 @@ void Controller_SOGI::reset_zc_tracker(ZcTracker& z) {
   z.prev_v = 0.0f;
   z.since_last_cross_s = 1.0f;
   z.fake_window_elapsed_s = 0.0f;
+  z.hold_elapsed_s = 0.0f;
   z.fake_count_in_window = 0;
   z.initialized = false;
 }
 
+// 返回 true 表示当前处于关断保持期（输出应置零）
 bool Controller_SOGI::update_zc_tracker(ZcTracker& z, float v, float dt) {
   z.since_last_cross_s += dt;
   z.fake_window_elapsed_s += dt;
@@ -188,11 +204,15 @@ bool Controller_SOGI::update_zc_tracker(ZcTracker& z, float v, float dt) {
     z.fake_window_elapsed_s = 0.0f;
     z.fake_count_in_window = 0;
   }
+  if (z.hold_elapsed_s > 0.0f) {
+    z.hold_elapsed_s -= dt;
+    if (z.hold_elapsed_s < 0.0f) z.hold_elapsed_s = 0.0f;
+  }
 
   if (!z.initialized) {
     z.prev_v = v;
     z.initialized = true;
-    return false;
+    return z.hold_elapsed_s > 0.0f;
   }
 
   const bool crossed =
@@ -205,9 +225,12 @@ bool Controller_SOGI::update_zc_tracker(ZcTracker& z, float v, float dt) {
     z.since_last_cross_s = 0.0f;
 
     if (abs_peak >= SOGI_ZC_MIN_VEL_DEG_S) {
-      const float f_cross_hz = 0.5f / dt_cross;  // 相邻过零间隔对应半周期
+      const float f_cross_hz = 0.5f / dt_cross;
       if (f_cross_hz > SOGI_ZC_FREQ_MAX_HZ) {
         if (z.fake_count_in_window < 255) z.fake_count_in_window++;
+        if (z.fake_count_in_window >= SOGI_ZC_FAKE_COUNT_TRIP) {
+          z.hold_elapsed_s = SOGI_ZC_FAKE_HOLD_SEC;
+        }
       } else {
         z.fake_count_in_window = 0;
       }
@@ -215,56 +238,92 @@ bool Controller_SOGI::update_zc_tracker(ZcTracker& z, float v, float dt) {
   }
 
   z.prev_v = v;
-  return z.fake_count_in_window >= SOGI_ZC_FAKE_COUNT_TRIP;
+  return z.hold_elapsed_s > 0.0f;
 }
 
 void Controller_SOGI::compute(const CtrlInput& in, CtrlOutput& out) {
   float dt = in.Ts;
   if (dt <= 0.0f) dt = 0.01f;
 
+  // 速度滤波引入的相位滞后补偿
+  float phi_lead_eff = phi_lead_rad_;
+  if (filter_vel_on_ && filter_fc_hz_ > 0.0f) {
+    const float f_hz = fmaxf(L_.wn, R_.wn) / TWO_PI_F;
+    const float r = f_hz / filter_fc_hz_;
+    float lag;
+    if (filter_butter_) {
+      lag = atan2f(1.41421f * r, 1.0f - r * r);
+    } else {
+      lag = atanf(r);
+    }
+    phi_lead_eff += lag;
+  }
+
   float sinL, ampL, sinR, ampR;
-  step_sogi(L_, in.LTAVx, dt, phi_lead_rad_, sinL, ampL);
-  step_sogi(R_, in.RTAVx, dt, phi_lead_rad_, sinR, ampR);
+  step_sogi(L_, in.LTAVx, dt, phi_lead_eff, sinL, ampL);
+  step_sogi(R_, in.RTAVx, dt, phi_lead_eff, sinR, ampR);
 
   // 双侧对称性检测: cos(φ_L - φ_R) = (x1_L·x1_R + x2_L·x2_R) / (ampL·ampR)
   // 步行→反相→cos≈-1；深蹲/STS→同相→cos≈+1
-  // 仅在双侧都有足够幅值时更新，避免静止噪声干扰
   if (ampL > amp_min_ && ampR > amp_min_) {
     float cos_diff = (L_.x1 * R_.x1 + L_.x2 * R_.x2) / (ampL * ampR + 1e-6f);
-    float alpha = dt / (dt + 1.0f);  // IIR 时间常数 1.0 s
+    float alpha = dt / (dt + 0.5f);  // IIR 时间常数 0.5 s
     sym_score_ += alpha * (cos_diff - sym_score_);
   }
-  // 迟滞切换：+0.4 判为双侧，-0.1 回到交替
   if (!is_bilateral_ && sym_score_ >  0.4f) is_bilateral_ = true;
   if ( is_bilateral_ && sym_score_ < -0.1f) is_bilateral_ = false;
-  update_motion_state(ampL, ampR, dt);
-  const bool zc_storm_L = update_zc_tracker(zc_L_, L_.x1, dt);
-  const bool zc_storm_R = update_zc_tracker(zc_R_, R_.x1, dt);
-  if (zc_storm_L || zc_storm_R) {
-    zc_fake_hold_s_ = SOGI_ZC_FAKE_HOLD_SEC;
-  }
-  if (zc_fake_hold_s_ > 0.0f) {
-    zc_fake_hold_s_ -= dt;
-    if (zc_fake_hold_s_ < 0.0f) zc_fake_hold_s_ = 0.0f;
-  }
 
-  // 冷启动斜坡 (SOGI-FLL 需 1-2 周期锁定)
+  update_motion_state(ampL, ampR, dt);
+  const bool gate_zc_L = !update_zc_tracker(zc_L_, L_.x1, dt);
+  const bool gate_zc_R = !update_zc_tracker(zc_R_, R_.x1, dt);
+
   ramp_elapsed_ += dt;
   float ramp = ramp_elapsed_ / SOGI_RAMP_SEC;
   if (ramp > 1.0f) ramp = 1.0f;
 
   const float gate_motion = (motion_state_ == MOTION_MOVING) ? 1.0f : 0.0f;
-  const float gate_zc = (zc_fake_hold_s_ > 0.0f) ? 0.0f : 1.0f;
+  // 双条件门控：amp_hold 防止噪声抖动，瞬时 amp 兜底快速关断（停止后立即生效）
+  const float gateL = (amp_hold_L_ > amp_min_ && ampL > amp_min_ * 0.5f) ? 1.0f : 0.0f;
+  const float gateR = (amp_hold_R_ > amp_min_ && ampR > amp_min_ * 0.5f) ? 1.0f : 0.0f;
+  const float gzL = gate_zc_L ? 1.0f : 0.0f;
+  const float gzR = gate_zc_R ? 1.0f : 0.0f;
 
-  // 幅值看门狗: 静止时不出力
-  float gateL = (ampL > amp_min_) ? 1.0f : 0.0f;
-  float gateR = (ampR > amp_min_) ? 1.0f : 0.0f;
+  // 步行模式：逐周期幅值保持
+  // 在 sinL/sinR 正向过零时更新 amp_hold（此时力矩=0，增益切换无突变）
+  if (!is_bilateral_) {
+    if (sin_prev_L_ <= 0.0f && sinL > 0.0f) {
+      amp_hold_L_ = (amp_peak_L_ > 0.0f) ? amp_peak_L_ : SOGI_AMP_REF;
+      amp_peak_L_ = 0.0f;
+    }
+    if (sin_prev_R_ <= 0.0f && sinR > 0.0f) {
+      amp_hold_R_ = (amp_peak_R_ > 0.0f) ? amp_peak_R_ : SOGI_AMP_REF;
+      amp_peak_R_ = 0.0f;
+    }
+    if (ampL > amp_peak_L_) amp_peak_L_ = ampL;
+    if (ampR > amp_peak_R_) amp_peak_R_ = ampR;
+  }
+  sin_prev_L_ = sinL;
+  sin_prev_R_ = sinR;
 
-  float tau_L = A_gain_ * ramp * gate_motion * gate_zc * gateL * sinL;
-  float tau_R = A_gain_ * ramp * gate_motion * gate_zc * gateR * sinR;
+  float tau_L, tau_R;
+  if (is_bilateral_) {
+    // 深蹲/STS：升正弦 (1+sin)/2，绕开 gate_motion
+    // 用软幅值门控：amp 从 0→amp_on_ 线性升为 1，随运动平滑启动，无突变
+    float amp_now = fmaxf(ampL, ampR);
+    float soft_gate = fminf(1.0f, amp_now / fmaxf(amp_on_, 1e-3f));
+    float raisedL = (1.0f + sinL) * 0.5f;
+    float raisedR = (1.0f + sinR) * 0.5f;
+    tau_L = A_gain_ * ramp * soft_gate * gzL * raisedL;
+    tau_R = A_gain_ * ramp * soft_gate * gzR * raisedR;
+  } else {
+    // 步行：用上一周期峰值幅值缩放，周期内固定，力矩为纯正弦
+    float scaleL = amp_hold_L_ / SOGI_AMP_REF;
+    float scaleR = amp_hold_R_ / SOGI_AMP_REF;
+    tau_L = A_gain_ * scaleL * ramp * gate_motion * gzL * gateL * sinL;
+    tau_R = A_gain_ * scaleR * ramp * gate_motion * gzR * gateR * sinR;
+  }
 
-  // 角度门控：用于抑制站立时低频速度噪声造成的虚假助力
-  // 仅当双腿同时长时间停留在小角度窗内，才强制置零，避免走路过中立位被误触发。
+  // 角度门控：双腿长时间处于小角度窗时强制置零（抑制站立噪声触发）
   const bool in_stand_angle_window =
       (fabsf(in.LTx_filtered) <= SOGI_STAND_ANGLE_DEG) &&
       (fabsf(in.RTx_filtered) <= SOGI_STAND_ANGLE_DEG);
@@ -278,12 +337,6 @@ void Controller_SOGI::compute(const CtrlInput& in, CtrlOutput& out) {
     tau_R = 0.0f;
   }
 
-  // 半波整流：自动检测到双侧同相(深蹲/STS)时只保留正向力矩
-  if (is_bilateral_) {
-    if (tau_L < 0.0f) tau_L = 0.0f;
-    if (tau_R < 0.0f) tau_R = 0.0f;
-  }
-
   // 限幅
   float max_abs = fabsf(in.max_torque_cfg);
   if (tau_L >  max_abs) tau_L =  max_abs;
@@ -294,7 +347,6 @@ void Controller_SOGI::compute(const CtrlInput& in, CtrlOutput& out) {
   out.tau_L = tau_L;
   out.tau_R = tau_R;
 
-  // 推入 ADO 缓冲（SOGI 无 pre/post delay 之分，tau_src 即最终 tau）
   ado_.push_sample(tau_L, tau_R, in.LTAVx, in.RTAVx);
 }
 

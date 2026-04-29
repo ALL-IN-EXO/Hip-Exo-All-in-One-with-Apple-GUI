@@ -1080,6 +1080,67 @@ class MainWindow(QWidget):
         mt_row.addWidget(self.sb_max_torque_cfg)
         param_lay.addLayout(mt_row)
 
+        # === 统一信号滤波面板 ===
+        _fc_tip = ("Unified filter cutoff (Hz) for all enabled channels.\n"
+                   "LPF = 1st-order IIR; Butterworth = 2nd-order IIR.\n"
+                   "RL torque path is always transparent (unfiltered).")
+        filt_lay = QVBoxLayout()
+        filt_lay.setSpacing(3)
+
+        # Row 1: cutoff spinbox + type dropdown
+        filt_fc_row = QHBoxLayout()
+        lbl_filt_fc = QLabel("Filter (Hz)")
+        lbl_filt_fc.setToolTip(_fc_tip)
+        filt_fc_row.addWidget(lbl_filt_fc)
+        filt_fc_row.addStretch(1)
+        self.sb_filter_fc = make_dspin(5.0, 0.3, 49.9, 0.1, 1, _fc_tip)
+        self.sb_filter_fc.setFixedWidth(70)
+        filt_fc_row.addWidget(self.sb_filter_fc)
+        self.cmb_filter_type = QComboBox()
+        self.cmb_filter_type.addItems(["LPF", "Butterworth"])
+        self._setup_combo(self.cmb_filter_type)
+        self.cmb_filter_type.setCurrentIndex(1)   # default Butterworth
+        self.cmb_filter_type.setFixedWidth(100)
+        filt_fc_row.addWidget(self.cmb_filter_type)
+        filt_lay.addLayout(filt_fc_row)
+
+        # Row 2: per-channel enable checkboxes (sent to Teensy)
+        filt_chk_row = QHBoxLayout()
+        self.chk_filt_ang = QCheckBox("Angle")
+        self.chk_filt_ang.setToolTip("Enable Teensy-side angle filter before algorithm input.")
+        self.chk_filt_vel = QCheckBox("Velocity")
+        self.chk_filt_vel.setToolTip("Enable Teensy-side velocity filter before algorithm input.\nPower calculation always uses raw velocity.")
+        self.chk_filt_tau = QCheckBox("Torque")
+        self.chk_filt_tau.setToolTip("Enable Teensy-side torque filter before motor output (non-RL).")
+        self.chk_filt_tau.setChecked(True)
+        filt_chk_row.addWidget(QLabel("Enable:"))
+        filt_chk_row.addWidget(self.chk_filt_ang)
+        filt_chk_row.addWidget(self.chk_filt_vel)
+        filt_chk_row.addWidget(self.chk_filt_tau)
+        filt_chk_row.addStretch(1)
+        filt_lay.addLayout(filt_chk_row)
+
+        # Row 3: GUI-side plot raw/filtered (no BLE, display only)
+        plot_chk_row = QHBoxLayout()
+        self.chk_plot_raw_ang = QCheckBox("Raw Angle")
+        self.chk_plot_raw_ang.setToolTip("Plot raw (unchecked = GUI-side software filter applied for display).")
+        self.chk_plot_raw_ang.setChecked(True)
+        self.chk_plot_raw_vel = QCheckBox("Raw Velocity")
+        self.chk_plot_raw_vel.setToolTip("Plot raw velocity (unchecked = GUI-side software filter applied for display).")
+        self.chk_plot_raw_vel.setChecked(True)
+        plot_chk_row.addWidget(QLabel("Plot:"))
+        plot_chk_row.addWidget(self.chk_plot_raw_ang)
+        plot_chk_row.addWidget(self.chk_plot_raw_vel)
+        plot_chk_row.addStretch(1)
+        filt_lay.addLayout(plot_chk_row)
+
+        param_lay.addLayout(filt_lay)
+
+        # GUI-side filter state (for plot display)
+        self._gui_ang_filt_L = 0.0
+        self._gui_ang_filt_R = 0.0
+        self._gui_vel_filt_L = 0.0
+        self._gui_vel_filt_R = 0.0
         torque_filter_tip = (
             "Teensy unified filter before motor torque command (non-RL algorithms).\n"
             "Type is fixed to Butterworth IIR (2nd order).\n"
@@ -3707,10 +3768,14 @@ class MainWindow(QWidget):
             L_cmd_disp = float(self._sync_cmd_L)
             R_cmd_disp = float(self._sync_cmd_R)
         else:
-            L_angle_disp = float(self._raw_ang_L)
-            R_angle_disp = float(self._raw_ang_R)
-            L_vel_disp = float(self._raw_vel_L)
-            R_vel_disp = float(self._raw_vel_R)
+            L_angle_disp = (float(self._raw_ang_L) if self.chk_plot_raw_ang.isChecked()
+                            else float(self._gui_ang_filt_L))
+            R_angle_disp = (float(self._raw_ang_R) if self.chk_plot_raw_ang.isChecked()
+                            else float(self._gui_ang_filt_R))
+            L_vel_disp   = (float(self._raw_vel_L) if self.chk_plot_raw_vel.isChecked()
+                            else float(self._gui_vel_filt_L))
+            R_vel_disp   = (float(self._raw_vel_R) if self.chk_plot_raw_vel.isChecked()
+                            else float(self._gui_vel_filt_R))
             L_cmd_disp = float(self._raw_cmd_L)
             R_cmd_disp = float(self._raw_cmd_R)
 
@@ -5763,8 +5828,14 @@ class MainWindow(QWidget):
         flags |= (self._dir_bits & 0x03) << 2
         payload[2] = flags
         put_s16(3, max(0.0, min(30.0, float(self.sb_max_torque_cfg.value()))))
-        # Unified Teensy pre-motor filter cutoff [31..32] (Hz*100).
-        put_s16(31, float(self.sb_torque_filter_fc.value()))
+        # Unified filter cutoff [31..32] (Hz×100) + filter_flags [98]
+        put_s16(31, float(self.sb_filter_fc.value()))
+        fflags = 0
+        if self.chk_filt_ang.isChecked(): fflags |= 0x01
+        if self.chk_filt_vel.isChecked(): fflags |= 0x02
+        if self.chk_filt_tau.isChecked(): fflags |= 0x04
+        if self.cmb_filter_type.currentIndex() == 1: fflags |= 0x08  # Butterworth
+        payload[98] = fflags & 0xFF
 
         algo = self._algo_select
         if algo == ALGO_EG:
@@ -6015,6 +6086,16 @@ class MainWindow(QWidget):
         self._raw_vel_R = float(R_vel)
         self._raw_cmd_L = float(L_tau_d)
         self._raw_cmd_R = float(R_tau_d)
+
+        # GUI-side software filter for display (IIR, same fc as Teensy filter setting)
+        _gui_fc = max(0.3, float(self.sb_filter_fc.value()))
+        _gui_dt = max(0.005, min(0.5, dt))
+        _gui_wc = 6.28318530718 * _gui_fc
+        _gui_a  = _gui_wc * _gui_dt / (1.0 + _gui_wc * _gui_dt)
+        self._gui_ang_filt_L += _gui_a * (L_angle - self._gui_ang_filt_L)
+        self._gui_ang_filt_R += _gui_a * (R_angle - self._gui_ang_filt_R)
+        self._gui_vel_filt_L += _gui_a * (L_vel   - self._gui_vel_filt_L)
+        self._gui_vel_filt_R += _gui_a * (R_vel   - self._gui_vel_filt_R)
 
         # === Parse telemetry extension [98..124] ===
         ext_blob = payload[TELEM_EXT_OFFSET:TELEM_EXT_OFFSET + TELEM_EXT_LEN]

@@ -5,6 +5,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Controller_SOGI.h` 编译错误修复**（`All_in_one_hip_controller_RL_update/Controller_SOGI.h`）：
+  - 补回缺失的三个成员变量 `vel_lpf_fc_`、`vel_filt_L_`、`vel_filt_R_`（`.cpp` 中已使用但 `.h` 被回退丢失）
+  - `ZcTracker` 结构体补回 `hold_elapsed_s` 字段（`.cpp` 的 `update_zc_tracker()` 依赖此字段）
+  - 移除废弃的 `zc_fake_hold_s_` 类成员（新实现已将 hold 时间内置到 `ZcTracker` 中）
+
+### Changed
+
+- **Teensy BLE reassembly 修复**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`）：
+  - `Receive_ble_Data()` 从阻塞式 `Serial5.readBytes()` 改为非阻塞字节累积状态机（`collecting` + `payload_buf`）
+  - 修复 128 字节 BLE 帧分多包到达时 `readBytes()` 超时丢弃的问题，彻底解决 GUI 切算法后 badge 常驻橙色的现象
+
+- **SOGI 速度低通滤波 + 自动相位补偿**（`All_in_one_hip_controller_RL_update/Controller_SOGI.*`, `BleProtocol.h`, `GUI_RL_update/GUI.py`）：
+  - `compute()` 中新增一阶 IIR 速度 LPF，截止频率 `vel_lpf_fc_` 由 GUI 可调（默认 6 Hz）
+  - LPF 引入的相位滞后通过 `atan2(wn, wc)` 精确计算并自动叠加到 `phi_lead`，无需手动补偿
+  - BLE 下行新增 `sogi_vel_lpf_fc`（payload `[19..20]`，×10 编码），GUI SOGI 面板新增 `vel LPF (Hz)` 控件
+
+- **SOGI 过零频率门控重构**（`All_in_one_hip_controller_RL_update/Controller_SOGI.*`）：
+  - `ZcTracker` 新增 `hold_elapsed_s` 字段，hold 时间内置到 tracker 结构体，不再依赖类级别的 `zc_fake_hold_s_`
+  - 过零检测对象改为 LPF 后速度（`velL/velR`），避免对原始速度的高频假过零误触发
+  - 默认参数：过零间隔下限 0.12s（~4 Hz 半周期），0.5s 窗口内 ≥2 次触发，关断保持 0.3s
+
+- **SOGI 深蹲/STS 双侧模式自动检测**（`All_in_one_hip_controller_RL_update/Controller_SOGI.*`）：
+  - 通过 `cos(φ_L - φ_R) = (x1_L·x1_R + x2_L·x2_R) / (ampL·ampR)` 实时计算双腿相位差
+  - IIR 平滑时间常数 0.5s，迟滞阈值 +0.4（→双侧）/ −0.1（→交替）
+  - 深蹲/STS 模式下改用升正弦 `(1 + sin φ) / 2` 输出（代替半波整流），覆盖完整周期、两端平滑无硬截断
+
+- **SOGI 速度幅值自适应增益**（`All_in_one_hip_controller_RL_update/Controller_SOGI.cpp`）：
+  - 步行模式力矩与速度幅值线性正相关：`scale = amp / SOGI_AMP_REF`（默认 80 deg/s），由 `max_torque_cfg` 最终限幅
+  - 深蹲/STS 模式不做幅值自适应，使用固定 `A_gain`
+
+- **SOGI GUI 默认参数更新**（`GUI_RL_update/GUI.py`）：
+  - `A_gain` 5→10 Nm，`phi_lead` 20→0°，`move_on` 0.15→0.00s，`move_off` 0.20→0.10s，`vel LPF` 10→6 Hz
+
+- **三通道统一信号滤波器系统**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`, `BleProtocol.h`, `GUI_RL_update/GUI.py`）：
+  - Teensy 新增 `SignalFilter` 结构体，同时支持一阶 IIR LPF 和二阶 Butterworth，三通道（角度/速度/力矩）各一对实例
+  - 截止频率统一由 GUI 下发（BLE payload `[31..32]`），类型和使能掩码通过 `filter_flags`（payload `[98]`）控制：bit0=角度，bit1=速度，bit2=力矩，bit3=类型（0=LPF，1=Butterworth）
+  - 功率计算始终使用 `imu.LTAVx/RTAVx` 原始值，不受速度滤波影响
+  - GUI 面板替换原有单行"Filter Before Torque"，新增：Cutoff 旋钮 + LPF/Butterworth 下拉 + 三个 Enable checkbox（发送 Teensy）+ Raw Angle / Raw Velocity 两个显示 checkbox（GUI 侧一阶 IIR 软件滤波，不发送）
+
+- **`parse_params` 调试打印**（`All_in_one_hip_controller_RL_update/Controller_SOGI.cpp`）：
+  - `Controller_SOGI::parse_params()` 末尾新增串口打印，每次 GUI 下发 SOGI 参数时输出一行 `[SOGI] A=... lead=... ...`，方便验证 BLE 传参是否成功
+
 ### Changed
 
 - **RL 默认 delay 与 scale 范围调整**（`RPi_Unified/RL_controller_torch.py`, `GUI_RL_update/GUI.py`）：
