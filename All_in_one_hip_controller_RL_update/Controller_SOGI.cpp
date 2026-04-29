@@ -33,6 +33,9 @@ Controller_SOGI::Controller_SOGI() {
   amp_off_       = SOGI_AMP_OFF_DEFAULT;
   move_on_sec_   = SOGI_MOVE_ON_SEC_DEFAULT;
   move_off_sec_  = SOGI_MOVE_OFF_SEC_DEFAULT;
+  vel_lpf_fc_    = 10.0f;
+  vel_filt_L_    = 0.0f;
+  vel_filt_R_    = 0.0f;
   sym_score_     = 0.0f;
   is_bilateral_  = false;
   stand_hold_elapsed_s_ = 0.0f;
@@ -47,6 +50,8 @@ void Controller_SOGI::reset() {
   R_.x1 = 0.0f;
   R_.x2 = 0.0f;
   ramp_elapsed_ = 0.0f;
+  vel_filt_L_   = 0.0f;
+  vel_filt_R_   = 0.0f;
   sym_score_    = 0.0f;
   is_bilateral_ = false;
   stand_hold_elapsed_s_ = 0.0f;
@@ -107,6 +112,10 @@ void Controller_SOGI::parse_params(const BleDownlinkData& dl) {
   move_off_sec_ = dl.sogi_move_off_sec;
   if (move_off_sec_ < 0.0f) move_off_sec_ = 0.0f;
   if (move_off_sec_ > 2.0f) move_off_sec_ = 2.0f;
+
+  vel_lpf_fc_ = dl.sogi_vel_lpf_fc;
+  if (vel_lpf_fc_ < 0.0f)    vel_lpf_fc_ = 0.0f;
+  if (vel_lpf_fc_ > 100.0f)  vel_lpf_fc_ = 100.0f;
 }
 
 void Controller_SOGI::step_sogi(Sogi& s, float omega, float dt,
@@ -222,9 +231,29 @@ void Controller_SOGI::compute(const CtrlInput& in, CtrlOutput& out) {
   float dt = in.Ts;
   if (dt <= 0.0f) dt = 0.01f;
 
+  // 速度低通滤波 + 自动相位补偿
+  // 一阶 LPF 在信号频率 f 处引入相位滞后 arctan(f/fc) = atan2(wn, 2π·fc)
+  // SOGI 已跟踪当前 wn，故可精确计算并通过 phi_lead 抵消，无需手动调整
+  float velL, velR;
+  float phi_comp_L = 0.0f, phi_comp_R = 0.0f;
+  if (vel_lpf_fc_ > 0.1f) {
+    float wc = TWO_PI_F * vel_lpf_fc_;
+    float alpha_v = dt / (dt + 1.0f / wc);
+    vel_filt_L_ += alpha_v * (in.LTAVx - vel_filt_L_);
+    vel_filt_R_ += alpha_v * (in.RTAVx - vel_filt_R_);
+    velL = vel_filt_L_;
+    velR = vel_filt_R_;
+    // 用上一步的 wn 估计相位滞后（wn 变化慢，误差可忽略）
+    phi_comp_L = atan2f(L_.wn, wc);  // = arctan(f_signal / fc)
+    phi_comp_R = atan2f(R_.wn, wc);
+  } else {
+    velL = in.LTAVx;
+    velR = in.RTAVx;
+  }
+
   float sinL, ampL, sinR, ampR;
-  step_sogi(L_, in.LTAVx, dt, phi_lead_rad_, sinL, ampL);
-  step_sogi(R_, in.RTAVx, dt, phi_lead_rad_, sinR, ampR);
+  step_sogi(L_, velL, dt, phi_lead_rad_ + phi_comp_L, sinL, ampL);
+  step_sogi(R_, velR, dt, phi_lead_rad_ + phi_comp_R, sinR, ampR);
 
   // 双侧对称性检测: cos(φ_L - φ_R) = (x1_L·x1_R + x2_L·x2_R) / (ampL·ampR)
   // 步行→反相→cos≈-1；深蹲/STS→同相→cos≈+1

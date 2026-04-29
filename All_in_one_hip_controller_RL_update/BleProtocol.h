@@ -114,7 +114,8 @@
  *     [11..12] sogi_amp_on ×10        int16  (deg/s, STOPPED->MOVING 门限)
  *     [13..14] sogi_amp_off ×10       int16  (deg/s, MOVING->STOPPED 门限)
  *     [15..16] sogi_move_on_sec ×1000 int16  (s, 启动持续时间)
- *     [17..18] sogi_move_off_sec ×1000 int16 (s, 停止持续时间)
+ *     [17..18] sogi_move_off_sec ×1000 int16  (s, 停止持续时间)
+ *     [19..20] sogi_vel_lpf_fc  ×10   int16  (Hz, 0=bypass; 速度低通截止频率, 自动相位补偿)
  * --- RPi 透传区 [58..97] (40 bytes) ---
  * [58..97]   rpi_passthru  GUI→Teensy→RPi (Serial8 转发)
  * --- 预留 [98..124] ---
@@ -321,6 +322,7 @@ struct BleDownlinkData {
   float sogi_amp_off;        // [13..14] deg/s
   float sogi_move_on_sec;    // [15..16] s
   float sogi_move_off_sec;   // [17..18] s
+  float sogi_vel_lpf_fc;    // [19..20] Hz, 0=bypass
 
   // 通用自动延迟控制 (EG/Samsung 适用; RL 用 rpi_passthru 内的位)
   bool    auto_delay_enable;  // payload[28] bit0
@@ -388,6 +390,7 @@ static inline BleDownlinkData ble_parse_downlink(const uint8_t* payload) {
       d.sogi_amp_off       = ble_rd_i16(payload, 13) / 10.0f;
       d.sogi_move_on_sec   = ble_rd_i16(payload, 15) / 1000.0f;
       d.sogi_move_off_sec  = ble_rd_i16(payload, 17) / 1000.0f;
+      d.sogi_vel_lpf_fc    = ble_rd_i16(payload, 19) / 10.0f;
       break;
   }
 

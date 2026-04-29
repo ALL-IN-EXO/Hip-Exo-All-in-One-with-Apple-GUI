@@ -55,6 +55,11 @@ private:
   float amp_off_;         // deg/s
   float move_on_sec_;     // s
   float move_off_sec_;    // s
+  float vel_lpf_fc_;     // 速度 LPF 截止频率 (Hz)，0=bypass
+
+  // 速度 LPF 状态（延迟自动由 phi_lead 补偿）
+  float vel_filt_L_;
+  float vel_filt_R_;
 
   // 双侧对称性自动检测
   float sym_score_;    // IIR 滤波的 cos(φ_L - φ_R)，∈[-1, +1]
