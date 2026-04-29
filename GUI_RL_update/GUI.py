@@ -1432,19 +1432,19 @@ class MainWindow(QWidget):
             "Required duration below amp_off before entering STOPPED (s).\n"
             "Lower value makes torque decay faster after motion stops."
         )
-        self.sb_sogi_A       = make_dspin(5.0, 0.0, 15.0, 0.1, 1, sogi_a_tip)
-        self.sb_sogi_lead    = make_dspin(20.0, -90.0, 90.0, 1.0, 1, sogi_lead_tip)
+        self.sb_sogi_A       = make_dspin(10.0, 0.0, 15.0, 0.1, 1, sogi_a_tip)
+        self.sb_sogi_lead    = make_dspin(0.0, -90.0, 90.0, 1.0, 1, sogi_lead_tip)
         self.sb_sogi_amp_min = make_dspin(20.0, 0.0, 500.0, 1.0, 1, sogi_ampmin_tip)
         self.sb_sogi_amp_on = make_dspin(22.0, 0.0, 500.0, 0.5, 1, sogi_amp_on_tip)
         self.sb_sogi_amp_off = make_dspin(18.0, 0.0, 500.0, 0.5, 1, sogi_amp_off_tip)
-        self.sb_sogi_move_on = make_dspin(0.15, 0.0, 2.0, 0.01, 2, sogi_move_on_tip)
-        self.sb_sogi_move_off = make_dspin(0.20, 0.0, 2.0, 0.01, 2, sogi_move_off_tip)
+        self.sb_sogi_move_on = make_dspin(0.00, 0.0, 2.0, 0.01, 2, sogi_move_on_tip)
+        self.sb_sogi_move_off = make_dspin(0.10, 0.0, 2.0, 0.01, 2, sogi_move_off_tip)
         sogi_vel_lpf_tip = (
             "Velocity low-pass filter cutoff (Hz). 0 = bypass.\n"
             "Filters IMU noise before SOGI; LPF phase delay is\n"
             "automatically compensated via phi_lead."
         )
-        self.sb_sogi_vel_lpf = make_dspin(10.0, 0.0, 100.0, 1.0, 1, sogi_vel_lpf_tip)
+        self.sb_sogi_vel_lpf = make_dspin(6.0, 0.0, 100.0, 1.0, 1, sogi_vel_lpf_tip)
         lbl_sogi_A = QLabel("A_gain (Nm)");       lbl_sogi_A.setToolTip(sogi_a_tip)
         lbl_sogi_lead = QLabel("Phi lead (°)");   lbl_sogi_lead.setToolTip(sogi_lead_tip)
         lbl_sogi_amp = QLabel("amp_min (deg/s)"); lbl_sogi_amp.setToolTip(sogi_ampmin_tip)
