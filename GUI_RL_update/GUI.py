@@ -3673,7 +3673,8 @@ class MainWindow(QWidget):
             self._maxT_before_off = float(self.sb_max_torque_cfg.value())
             self.sb_max_torque_cfg.setValue(0.0)
             self._set_power_ui(False)
-
+        self._tx_params()
+        
     def _sync_power_btn_from_torque(self, value):
         # Invariant: btn_power.isChecked() iff sb_max_torque_cfg.value() > 0.
         # Any path that sets torque without going through _on_power_toggled

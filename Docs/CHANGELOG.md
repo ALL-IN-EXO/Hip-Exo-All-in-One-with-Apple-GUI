@@ -7,12 +7,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Teensy 统一滤波函数调用名修复**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`）：
+  - 将主循环中的 `reset_torque_filter_state()` / `update_torque_filter_if_needed()` 调用改为已存在的 `reset_filter_states()` / `update_filters_if_needed()`
+  - 修复函数未声明导致的编译失败
+
 - **`Controller_SOGI.h` 编译错误修复**（`All_in_one_hip_controller_RL_update/Controller_SOGI.h`）：
   - 补回缺失的三个成员变量 `vel_lpf_fc_`、`vel_filt_L_`、`vel_filt_R_`（`.cpp` 中已使用但 `.h` 被回退丢失）
   - `ZcTracker` 结构体补回 `hold_elapsed_s` 字段（`.cpp` 的 `update_zc_tracker()` 依赖此字段）
   - 移除废弃的 `zc_fake_hold_s_` 类成员（新实现已将 hold 时间内置到 `ZcTracker` 中）
 
 ### Changed
+
+- **Teensy Max Torque 限幅调试打印**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`）：
+  - 在最终安全限幅代码块内新增串口日志 `[MAX_TORQUE]`，每个控制周期打印 `max_torque_cfg` 与 `max_abs_cmd`，用于在线核对上限配置与限幅阈值
 
 - **Teensy BLE reassembly 修复**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`）：
   - `Receive_ble_Data()` 从阻塞式 `Serial5.readBytes()` 改为非阻塞字节累积状态机（`collecting` + `payload_buf`）
