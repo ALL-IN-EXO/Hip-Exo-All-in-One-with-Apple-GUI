@@ -116,59 +116,67 @@ double RLTx_filtered = 0;
 
 float  gait_freq = 0;
 float  max_torque_cfg = 0.0f;
-float  torque_filter_fc_hz = 5.0f;  // 统一电机前滤波截止频率 (Hz)
+float  filter_fc_hz       = 5.0f;   // 统一滤波截止频率 (Hz)，三通道共用
+bool   filter_enable_ang  = false;
+bool   filter_enable_vel  = false;
+bool   filter_enable_tau  = true;   // 力矩滤波默认开启
+bool   filter_type_butter = true;   // true=Butterworth, false=1st-order LPF
 static uint8_t gait_inited = 0;
 
-// === 统一电机前滤波 (non-RL only): 2nd-order Butterworth IIR ===
-struct TorqueBiquadLPF {
-  float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f;
-  float a1 = 0.0f, a2 = 0.0f;
-  float x1 = 0.0f, x2 = 0.0f;
-  float y1 = 0.0f, y2 = 0.0f;
+// === 统一信号滤波器：支持 1st-order LPF 和 2nd-order Butterworth ===
+struct SignalFilter {
+  bool   butter_mode = true;
+  // Butterworth 2nd-order 系数 + 状态
+  float b0=1,b1=0,b2=0, a1=0,a2=0;
+  float x1=0,x2=0, y1=0,y2=0;
+  // 1st-order 状态
+  float fo_alpha=0, fo_y=0;
 
-  void reset_state() {
-    x1 = x2 = y1 = y2 = 0.0f;
-  }
-
-  void setup_lowpass(float fc_hz, float fs_hz) {
-    const float q = 0.70710678f;
-    const float nyq = 0.5f * fs_hz;
-    float fc = fc_hz;
-    if (!(fc > 0.0f)) fc = 5.0f;
-    if (fc < 0.3f) fc = 0.3f;
-    if (fc > (nyq - 0.5f)) fc = nyq - 0.5f;
-
-    const float omega = 2.0f * PI * fc / fs_hz;
-    const float sn = sinf(omega);
-    const float cs = cosf(omega);
-    const float alpha = sn / (2.0f * q);
-
-    float bb0 = (1.0f - cs) * 0.5f;
-    float bb1 = (1.0f - cs);
-    float bb2 = (1.0f - cs) * 0.5f;
-    float aa0 = 1.0f + alpha;
-    float aa1 = -2.0f * cs;
-    float aa2 = 1.0f - alpha;
-    if (fabsf(aa0) < 1e-6f) aa0 = 1.0f;
-
-    b0 = bb0 / aa0;
-    b1 = bb1 / aa0;
-    b2 = bb2 / aa0;
-    a1 = aa1 / aa0;
-    a2 = aa2 / aa0;
+  void setup(float fc_hz, float fs_hz, bool butterworth) {
+    butter_mode = butterworth;
+    reset();
+    if (!(fc_hz > 0.0f)) return;
+    float nyq = 0.5f * fs_hz;
+    if (fc_hz < 0.3f)         fc_hz = 0.3f;
+    if (fc_hz > nyq - 0.5f)   fc_hz = nyq - 0.5f;
+    if (butterworth) {
+      const float q     = 0.70710678f;
+      const float omega = 2.0f * PI * fc_hz / fs_hz;
+      const float sn    = sinf(omega);
+      const float cs    = cosf(omega);
+      const float alpha = sn / (2.0f * q);
+      const float aa0   = 1.0f + alpha;
+      b0 = (1.0f - cs) * 0.5f / aa0;
+      b1 = (1.0f - cs)        / aa0;
+      b2 = (1.0f - cs) * 0.5f / aa0;
+      a1 = -2.0f * cs          / aa0;
+      a2 = (1.0f - alpha)     / aa0;
+    } else {
+      float dt = 1.0f / fs_hz;
+      float wc = 2.0f * PI * fc_hz;
+      fo_alpha = wc * dt / (1.0f + wc * dt);
+    }
   }
 
   float process(float x) {
-    const float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
-    x2 = x1; x1 = x;
-    y2 = y1; y1 = y;
-    return y;
+    if (butter_mode) {
+      float y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+      x2=x1; x1=x; y2=y1; y1=y;
+      return y;
+    } else {
+      fo_y += fo_alpha * (x - fo_y);
+      return fo_y;
+    }
   }
+
+  void reset() { x1=x2=y1=y2=fo_y=0.0f; }
 };
 
-static TorqueBiquadLPF torque_lpf_L;
-static TorqueBiquadLPF torque_lpf_R;
-static float torque_filter_fc_hz_prev = -1.0f;
+static SignalFilter ang_filt_L, ang_filt_R;
+static SignalFilter vel_filt_L, vel_filt_R;
+static SignalFilter tau_filt_L, tau_filt_R;
+static float filter_fc_prev       = -1.0f;
+static bool  filter_type_prev     = true;
 
 // RPi 透传缓冲
 static uint8_t rpi_uplink_buf[40] = {0};
@@ -198,16 +206,25 @@ static inline float clampf(float x, float lo, float hi) {
   return x;
 }
 
-static void update_torque_filter_if_needed() {
-  if (fabsf(torque_filter_fc_hz - torque_filter_fc_hz_prev) < 1e-4f) return;
-  torque_lpf_L.setup_lowpass(torque_filter_fc_hz, 100.0f);
-  torque_lpf_R.setup_lowpass(torque_filter_fc_hz, 100.0f);
-  torque_filter_fc_hz_prev = torque_filter_fc_hz;
+static void update_filters_if_needed() {
+  bool changed = (fabsf(filter_fc_hz - filter_fc_prev) > 1e-3f) ||
+                 (filter_type_butter != filter_type_prev);
+  if (!changed) return;
+  filter_fc_prev   = filter_fc_hz;
+  filter_type_prev = filter_type_butter;
+  const float fs = 100.0f;
+  ang_filt_L.setup(filter_fc_hz, fs, filter_type_butter);
+  ang_filt_R.setup(filter_fc_hz, fs, filter_type_butter);
+  vel_filt_L.setup(filter_fc_hz, fs, filter_type_butter);
+  vel_filt_R.setup(filter_fc_hz, fs, filter_type_butter);
+  tau_filt_L.setup(filter_fc_hz, fs, filter_type_butter);
+  tau_filt_R.setup(filter_fc_hz, fs, filter_type_butter);
 }
 
-static void reset_torque_filter_state() {
-  torque_lpf_L.reset_state();
-  torque_lpf_R.reset_state();
+static void reset_filter_states() {
+  ang_filt_L.reset(); ang_filt_R.reset();
+  vel_filt_L.reset(); vel_filt_R.reset();
+  tau_filt_L.reset(); tau_filt_R.reset();
 }
 
 static uint8_t rpi_cksum8(const uint8_t* p, size_t n) {
@@ -268,7 +285,7 @@ void switch_motor_brand(uint8_t new_brand) {
 
   M1_torque_command = 0.0f;
   M2_torque_command = 0.0f;
-  reset_torque_filter_state();
+  reset_filter_states();
 
   current_brand = new_brand;
   Serial.printf("[MOTOR] Switch done. Brand=%s\n", motor_L->brand_name());
@@ -295,7 +312,7 @@ void switch_algorithm(uint8_t new_algo) {
   motor_R->stop();
   M1_torque_command = 0.0f;
   M2_torque_command = 0.0f;
-  reset_torque_filter_state();
+  reset_filter_states();
 
   Serial.printf("[ALGO] Switching from %s to %s\n",
     active_ctrl->name(), new_ctrl->name());
@@ -355,8 +372,8 @@ void setup() {
     Serial.println(F("SD card init or file create failed!"));
   }
 
-  update_torque_filter_if_needed();
-  reset_torque_filter_state();
+  update_filters_if_needed();
+  reset_filter_states();
 
   Serial.printf("[OK] Algorithm: %s\n", active_ctrl->name());
   t_0 = micros();
@@ -386,7 +403,7 @@ void loop() {
     motor_R->init();
     M1_torque_command = 0.0f;
     M2_torque_command = 0.0f;
-    reset_torque_filter_state();
+    reset_filter_states();
     Serial.println("[MOTOR] Reinitialization done");
   }
 
@@ -439,12 +456,13 @@ void loop() {
     // 4) 步态频率估计
     gait_freq = estimateFreqFromRLTx(RLTx_filtered, current_time);
 
-    // 5) 填充算法输入
+    // 5) 填充算法输入（角度/速度可选滤波；功率计算始终用原始值）
+    update_filters_if_needed();
     CtrlInput cin;
-    cin.LTx = imu.LTx;
-    cin.RTx = imu.RTx;
-    cin.LTAVx = imu.LTAVx;
-    cin.RTAVx = imu.RTAVx;
+    cin.LTx   = filter_enable_ang ? ang_filt_L.process(imu.LTx)   : imu.LTx;
+    cin.RTx   = filter_enable_ang ? ang_filt_R.process(imu.RTx)   : imu.RTx;
+    cin.LTAVx = filter_enable_vel ? vel_filt_L.process(imu.LTAVx) : imu.LTAVx;
+    cin.RTAVx = filter_enable_vel ? vel_filt_R.process(imu.RTAVx) : imu.RTAVx;
     cin.LTx_filtered      = LTx_filtered;
     cin.RTx_filtered      = RTx_filtered;
     cin.LTx_filtered_last = LTx_filtered_last;
@@ -479,17 +497,15 @@ void loop() {
     cout.tau_L *= (cin.l_ctl_dir >= 0) ? 1.0f : -1.0f;
     cout.tau_R *= (cin.r_ctl_dir >= 0) ? 1.0f : -1.0f;
 
-    // 统一电机前滤波（仅 Teensy-native 算法；RL 路径保持 Pi→Teensy→Motor 透明）
-    if (active_algo_id != ALGO_RL) {
-      update_torque_filter_if_needed();
+    // 力矩滤波（仅 Teensy-native 算法；RL 路径保持透明）
+    if (filter_enable_tau && active_algo_id != ALGO_RL) {
       if (!imu_init_ok && active_algo_id != ALGO_TEST) {
-        // 安全门触发时立即清零，避免滤波尾迹。
-        reset_torque_filter_state();
+        tau_filt_L.reset(); tau_filt_R.reset();
         cout.tau_L = 0.0f;
         cout.tau_R = 0.0f;
       } else {
-        cout.tau_L = torque_lpf_L.process(cout.tau_L);
-        cout.tau_R = torque_lpf_R.process(cout.tau_R);
+        cout.tau_L = tau_filt_L.process(cout.tau_L);
+        cout.tau_R = tau_filt_R.process(cout.tau_R);
       }
     }
 
@@ -664,7 +680,11 @@ void Receive_ble_Data() {
 #if GUI_WRITE_ENABLE
     // 通用参数
     max_torque_cfg = clampf(dl.max_torque_cfg, 0.0f, 30.0f);
-    torque_filter_fc_hz = clampf(dl.torque_filter_fc_hz, 0.3f, 20.0f);
+    filter_fc_hz       = clampf(dl.filter_fc_hz, 0.3f, 49.9f);
+    filter_enable_ang  = (dl.filter_flags & 0x01) != 0;
+    filter_enable_vel  = (dl.filter_flags & 0x02) != 0;
+    filter_enable_tau  = (dl.filter_flags & 0x04) != 0;
+    filter_type_butter = (dl.filter_flags & 0x08) != 0;
     int prev_l_dir = l_ctl_dir;
     int prev_r_dir = r_ctl_dir;
     l_ctl_dir = (dl.dir_bits & 0x01) ? 1 : -1;
