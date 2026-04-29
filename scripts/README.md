@@ -19,6 +19,7 @@
 | 脚本 | 功能 | 用法 |
 |------|------|------|
 | `new_feature.sh` | 拉取最新 main → 建分支 → 提交 → 推送（一条龙） | `./scripts/new_feature.sh feature/xxx "commit信息"` |
+| `snapshot_wip.sh` | 不 pull，直接把当前改动搬到新分支并推远端备份（可 `--keep-main-dirty` 恢复同样脏改动到原分支） | `./scripts/snapshot_wip.sh feature/xxx "WIP snapshot" --keep-main-dirty` |
 | `push_current.sh` | 提交当前分支所有改动并推送 | `./scripts/push_current.sh "commit信息"` |
 | `cleanup_branch.sh` | PR merge 后清理（切 main、拉最新、删本地+远端分支） | `./scripts/cleanup_branch.sh [branch-name]` |
 | `status.sh` | 一键查看 Git 状态全貌 | `./scripts/status.sh` |

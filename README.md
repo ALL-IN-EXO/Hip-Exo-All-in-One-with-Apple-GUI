@@ -97,6 +97,43 @@ python RL_controller_torch.py --nn lstm_leg_dcp
 python RL_controller_torch.py --nn lstm_pd
 ```
 
+### Add a New Pi Algorithm (and Make GUI Recognize/Start It)
+
+When adding a new Pi-side controller, keep the RL transport protocol unchanged (`AA59/AA56` payload length/format unchanged) and integrate it as a new `--nn` type.
+
+1. Pi side (`RPi_Unified/`)
+   - Add algorithm class in `RPi_Unified/networks/` (one file per algorithm)
+   - Register it in `RPi_Unified/networks/__init__.py`
+   - Add `--nn <new_type>` support in `RPi_Unified/RL_controller_torch.py`
+   - Add `<new_type>` to `NN_TYPE_CODE` (for GUI mode recognition)
+   - Expose compatible outputs (same interface used by existing RL pipeline):
+     - `hip_torque_L`, `hip_torque_R`
+     - `filtered_hip_torque_L`, `filtered_hip_torque_R`
+     - `L_p`, `L_d`, `R_p`, `R_d`
+     - `generate_assistance(Lpos,Rpos,Lvel,Rvel)`
+
+2. GUI side (`GUI_RL_update/GUI.py`)
+   - Add `nn_type` display mapping in `_update_rl_panel_for_nn_type()` so panel shows `RPi: <AlgoName>`
+   - Add a remote start button in Pi RL row: `Start <AlgoName>`
+   - Allow this type in `_on_pi_rl_start_clicked()`
+   - Include new button in `_set_pi_rl_remote_buttons_enabled()`
+   - Keep remote command template unchanged:  
+     `python RL_controller_torch.py --nn <new_type>`
+
+3. RL runtime defaults in GUI (if algorithm has no explicit internal delay)
+   - `RL Scale (L/R) = 1.00`
+   - `Torque Delay (ms) = 100`
+   - `Filter Before Torque = Butterworth 5.0Hz, order=2, Torque ON`
+   - Other RL UI/settings remain consistent with existing flow
+
+4. Quick launch expectation
+   - `RPi_Unified/run.sh` supports `<new_type>` for SSH/manual bring-up
+   - GUI provides one-click launch (`Start <AlgoName>`) for experiment workflow
+
+Detailed checklist and examples are also in:
+- `RPi_Unified/README.md` (Pi-side integration details)
+- `Docs/PF_IMU_DEPLOYMENT.md` (reference implementation pattern)
+
 ### Deploy Code to RPi / Pull Data
 
 **First-time setup** — create your personal Pi connection profile (gitignored):

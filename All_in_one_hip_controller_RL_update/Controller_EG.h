@@ -45,6 +45,7 @@ public:
 
   // 填充 BLE 上行 RPi 透传槽（40B v3 格式）
   void fill_ble_status(uint8_t* buf40) const;
+  bool legacy_internal_lpf_enabled() const { return legacy_internal_lpf_; }
 
   AutoDelayOptimizer ado_;  // public: .ino 可读取状态
 
@@ -64,6 +65,9 @@ private:
   float ext_gain_;
   float scale_all_;
   float post_delay_ms_base_;  // GUI 下发的后处理延迟基础值 (ms)
+  bool  legacy_delay_scaling_;
+  bool  legacy_gate_use_x_prev_;
+  bool  legacy_internal_lpf_;
 
   // === 内部状态 ===
   double RLTx_delay_[EG_DELAY_BUF];
@@ -75,6 +79,8 @@ private:
 
   float  xL_prev_;
   float  xR_prev_;
+  float  tau_cmd_L_filt_;
+  float  tau_cmd_R_filt_;
 
   // === 后处理延迟缓冲 (auto delay output stage) ===
   float  post_buf_L_[EG_POST_DELAY_BUF];

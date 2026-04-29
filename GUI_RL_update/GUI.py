@@ -693,6 +693,7 @@ class MainWindow(QWidget):
         self._csv_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._csv_start_wall_time = time.time()
         self._last_gait_freq = None
+        self._last_gait_period_ms = None
         self._signal_source_mode = "Auto"   # Auto / Raw / Sync
         self._power_source_mode = "Auto"    # Auto / Physical / Control
         self._signal_source_active = "Raw"
@@ -747,7 +748,7 @@ class MainWindow(QWidget):
         self._telem_sync_valid = False
 
         # RPi status (received via BLE uplink passthrough)
-        self._rpi_nn_type = -1          # -1=unknown, 0=dnn, 1=lstm, 2=lstm_leg_dcp, 3=lstm_pd
+        self._rpi_nn_type = -1          # -1=unknown, 0=dnn, 1=lstm, 2=lstm_leg_dcp, 3=lstm_pd, 4=pf_imu, 5=myo1966, 6=myo2293
         # Teensy-native auto delay enable flags (Samsung / EG)
         self._sam_auto_delay_enable = False
         self._eg_auto_delay_enable  = False
@@ -861,6 +862,7 @@ class MainWindow(QWidget):
         self._set_pi_rl_remote_state("Pi RL Remote: idle", C.text2, force=True)
         self._reload_pi_profiles_ui()
         self._update_rl_filter_state_label()
+        self._update_teensy_prefilter_ui_state()
         self._update_brand_apply_label()
         self._build_plots()
         self._apply_plot_visibility()
@@ -892,7 +894,7 @@ class MainWindow(QWidget):
             'phys_L_pwr_W', 'phys_R_pwr_W',
             'ctrl_L_pwr_W', 'ctrl_R_pwr_W',
             'sync_sample_id', 'sync_from_pi',
-            'gait_freq_Hz',
+            'gait_freq_Hz', 'gait_period_ms',
             't_unwrapped_s', 'wall_time_s', 'wall_elapsed_s',
             'csv_sample_idx', 'csv_session_id',
             'algo_name', 'gui_tag', 'rx_tag_char', 'rx_tag_text',
@@ -1084,9 +1086,9 @@ class MainWindow(QWidget):
             "RL mode keeps Pi->Teensy torque path transparent (no Teensy pre-motor filtering)."
         )
         tf_row = QHBoxLayout()
-        lbl_tf_fc = QLabel("Filter Before Torque (Hz)")
-        lbl_tf_fc.setToolTip(torque_filter_tip)
-        tf_row.addWidget(lbl_tf_fc)
+        self.lbl_tf_fc = QLabel("Filter Before Torque (Hz) [Teensy-local only]")
+        self.lbl_tf_fc.setToolTip(torque_filter_tip)
+        tf_row.addWidget(self.lbl_tf_fc)
         tf_row.addStretch(1)
         self.sb_torque_filter_fc = make_dspin(5.0, 0.3, 20.0, 0.1, 1, torque_filter_tip)
         self.sb_torque_filter_fc.setFixedWidth(90)
@@ -1118,6 +1120,13 @@ class MainWindow(QWidget):
         eg_tip_delay_idx = (
             "Assist_delay_gain phase index (0..99), auto-scaled by gait frequency "
             "(not fixed ms)."
+        )
+        eg_tip_legacy_path = (
+            "Legacy EG A/B mode (old firmware reproduction):\n"
+            "1) delay scaling: only shrink when gait_freq > 0.7Hz + min 5 samples\n"
+            "2) gate input uses x_prev path\n"
+            "3) enable EG internal LPF (0.85/0.15)\n"
+            "When ON, Teensy unified pre-motor filter is bypassed for EG to avoid double filtering."
         )
         self.sb_Flex_Assist_gain  = make_dspin(1.0, -2, 2, 0.01, 2, eg_tip_r_gain)
         self.sb_Ext_Assist_gain   = make_dspin(1.0, -2, 2, 0.01, 2, eg_tip_l_gain)
@@ -1154,6 +1163,10 @@ class MainWindow(QWidget):
         self.sb_eg_post_delay.setToolTip(
             "EG output post-delay (ms). Applied after internal Assist_delay_gain. "
             "Auto Delay ON: optimized by Teensy-local AutoDelayOptimizer (L/R independent).")
+        self.chk_eg_legacy_path = QCheckBox("Legacy EG Path")
+        self.chk_eg_legacy_path.setChecked(False)
+        self.chk_eg_legacy_path.setToolTip(eg_tip_legacy_path)
+        self.chk_eg_legacy_path.stateChanged.connect(self._tx_params)
         self.chk_eg_auto_delay = QCheckBox("Auto Delay")
         self.chk_eg_auto_delay.setChecked(False)
         self.chk_eg_auto_delay.setToolTip(
@@ -1172,9 +1185,10 @@ class MainWindow(QWidget):
         _lbl_pd.setToolTip(self.sb_eg_post_delay.toolTip())
         eg_grid.addWidget(_lbl_pd, _eg_next_row, 0, 1, 2)
         eg_grid.addWidget(self.sb_eg_post_delay, _eg_next_row, 2)
-        eg_grid.addWidget(self.chk_eg_auto_delay, _eg_next_row + 1, 0)
-        eg_grid.addWidget(self.btn_eg_reset, _eg_next_row + 1, 1)
-        eg_grid.addWidget(self.lbl_eg_auto_delay_state, _eg_next_row + 2, 0, 1, 3)
+        eg_grid.addWidget(self.chk_eg_legacy_path, _eg_next_row + 1, 0, 1, 2)
+        eg_grid.addWidget(self.chk_eg_auto_delay, _eg_next_row + 2, 0)
+        eg_grid.addWidget(self.btn_eg_reset, _eg_next_row + 2, 1)
+        eg_grid.addWidget(self.lbl_eg_auto_delay_state, _eg_next_row + 3, 0, 1, 3)
         self.algo_stack.addWidget(eg_panel)
 
         # -- Samsung panel --
@@ -1238,7 +1252,7 @@ class MainWindow(QWidget):
         rl_lay.addWidget(self.lbl_rpi_current_filter, 1, 0, 1, 2)
 
         # Row 2: Scale (staged, not auto-sent)
-        self.sb_rl_scale = make_dspin(1.00, 0.00, 3.00, 0.01, 2,
+        self.sb_rl_scale = make_dspin(1.00, 0.00, 20.00, 0.01, 2,
                                       "RL torque scale (L/R same)")
         self.sb_rl_scale.valueChanged.disconnect(self._tx_params)
         lbl_rl_scale = QLabel("RL Scale (L/R)")
@@ -1282,12 +1296,16 @@ class MainWindow(QWidget):
         rl_lay.addWidget(self.lbl_rl_cutoff, 5, 0)
         rl_lay.addWidget(self.sb_rl_cutoff_hz, 5, 1)
 
-        # Row 6: Filter Enable checkboxes (DNN: Vel+Ref + Torque; LSTM: only Torque)
+        # Row 6: Filter Enable checkboxes (DNN/PF-IMU: Input + Torque; others: Torque only)
         filt_row = QHBoxLayout()
-        self.chk_rl_vr_filter = QCheckBox("Vel+Ref")
+        self.chk_rl_vr_filter = QCheckBox("Input Filter")
         self.chk_rl_torque_filter = QCheckBox("Torque")
         self.chk_rl_auto_delay = QCheckBox("Auto Delay")
-        self.chk_rl_vr_filter.setToolTip("Enable RPi filter for velocity/reference channels.")
+        self.chk_rl_vr_filter.setToolTip(
+            "Enable RPi input-channel filters.\n"
+            "DNN: velocity + reference filters.\n"
+            "PF-IMU: input angle + velocity filters."
+        )
         self.chk_rl_torque_filter.setToolTip("Enable RPi filter on torque output channel.")
         self.chk_rl_auto_delay.setToolTip("Enable RPi auto delay optimization.")
         self.chk_rl_vr_filter.setChecked(True)
@@ -1359,11 +1377,35 @@ class MainWindow(QWidget):
         self.btn_pi_rl_start_pd.clicked.connect(
             lambda: self._on_pi_rl_start_clicked("lstm_pd")
         )
+        self.btn_pi_rl_start_pf = QPushButton("Start PF-IMU")
+        self.btn_pi_rl_start_pf.setToolTip(
+            "Start Pi RL in tmux session using nn=pf_imu."
+        )
+        self.btn_pi_rl_start_pf.clicked.connect(
+            lambda: self._on_pi_rl_start_clicked("pf_imu")
+        )
+        self.btn_pi_rl_start_myo1966 = QPushButton("Start Myo-1966")
+        self.btn_pi_rl_start_myo1966.setToolTip(
+            "Start Pi RL in tmux session using nn=myoassist_1966080."
+        )
+        self.btn_pi_rl_start_myo1966.clicked.connect(
+            lambda: self._on_pi_rl_start_clicked("myoassist_1966080")
+        )
+        self.btn_pi_rl_start_myo2293 = QPushButton("Start Myo-2293")
+        self.btn_pi_rl_start_myo2293.setToolTip(
+            "Start Pi RL in tmux session using nn=myoassist_2293760."
+        )
+        self.btn_pi_rl_start_myo2293.clicked.connect(
+            lambda: self._on_pi_rl_start_clicked("myoassist_2293760")
+        )
         self.btn_pi_rl_stop = QPushButton("Stop Pi RL")
         self.btn_pi_rl_stop.setToolTip("Stop Pi RL tmux session on Raspberry Pi.")
         self.btn_pi_rl_stop.clicked.connect(self._on_pi_rl_stop_clicked)
         rl_remote_row.addWidget(self.btn_pi_rl_start_legdcp)
         rl_remote_row.addWidget(self.btn_pi_rl_start_pd)
+        rl_remote_row.addWidget(self.btn_pi_rl_start_pf)
+        rl_remote_row.addWidget(self.btn_pi_rl_start_myo1966)
+        rl_remote_row.addWidget(self.btn_pi_rl_start_myo2293)
         rl_remote_row.addWidget(self.btn_pi_rl_stop)
         rl_remote_row.addStretch(1)
         lbl_pi_remote = QLabel("Pi RL Remote")
@@ -2046,7 +2088,14 @@ class MainWindow(QWidget):
         self.lbl_status.setText(f"Ports refreshed ({n_ports})")
 
     def _set_pi_rl_remote_buttons_enabled(self, enabled):
-        for btn_name in ("btn_pi_rl_start_legdcp", "btn_pi_rl_start_pd", "btn_pi_rl_stop"):
+        for btn_name in (
+            "btn_pi_rl_start_legdcp",
+            "btn_pi_rl_start_pd",
+            "btn_pi_rl_start_pf",
+            "btn_pi_rl_start_myo1966",
+            "btn_pi_rl_start_myo2293",
+            "btn_pi_rl_stop",
+        ):
             btn = getattr(self, btn_name, None)
             if btn is not None:
                 btn.setEnabled(bool(enabled))
@@ -2731,15 +2780,26 @@ class MainWindow(QWidget):
         if self._pi_rl_cmd_inflight:
             return
         nn_type = str(nn_type).strip()
-        if nn_type not in ("lstm_leg_dcp", "lstm_pd"):
+        if nn_type not in (
+            "lstm_leg_dcp", "lstm_pd", "pf_imu",
+            "myoassist_1966080", "myoassist_2293760"
+        ):
             self._set_pi_rl_remote_state(f"Pi RL Remote: unsupported nn '{nn_type}'", C.red, force=True)
             return
         # Keep staged GUI display aligned with Pi-side runtime defaults even before
         # the first RPi status frame returns.
         if nn_type == "lstm_pd":
+            self.sb_rl_scale.setValue(0.40)
             self._set_rl_delay_spinbox_value(200.0)
         elif nn_type == "lstm_leg_dcp":
+            self.sb_rl_scale.setValue(1.00)
             self._set_rl_delay_spinbox_value(100.0)
+        elif nn_type == "pf_imu":
+            self.sb_rl_scale.setValue(1.00)
+            self._set_rl_delay_spinbox_value(0.0)
+        elif nn_type in ("myoassist_1966080", "myoassist_2293760"):
+            self.sb_rl_scale.setValue(1.00)
+            self._set_rl_delay_spinbox_value(0.0)
         self._update_rl_filter_state_label()
         profile, err = self._load_rpi_ssh_profile()
         if err and ("no pi profile configured" in str(err).lower()):
@@ -2867,7 +2927,14 @@ class MainWindow(QWidget):
                         C.green,
                         force=True,
                     )
-                    nn_tag = "RLONPD" if nn_type == "lstm_pd" else "RLONLDC"
+                    if nn_type == "lstm_pd":
+                        nn_tag = "RLONPD"
+                    elif nn_type == "pf_imu":
+                        nn_tag = "RLONPF"
+                    elif nn_type.startswith("myoassist_"):
+                        nn_tag = "RLONMYO"
+                    else:
+                        nn_tag = "RLONLDC"
                     self._queue_align_event(f"pi_rl_started:{nn_type}", pi_tag=nn_tag)
                     self._pi_rl_remote_last_poll_ts = 0.0
                 else:
@@ -3092,13 +3159,22 @@ class MainWindow(QWidget):
             return
 
         nn = self._rpi_nn_type
-        nn_names = {0: "DNN", 1: "LSTM", 2: "LSTM-LegDcp", 3: "LSTM-PD"}
+        nn_names = {
+            0: "DNN",
+            1: "LSTM",
+            2: "LSTM-LegDcp",
+            3: "LSTM-PD",
+            4: "PF-IMU",
+            5: "MyoAssist-1966",
+            6: "MyoAssist-2293",
+        }
         nn_name = nn_names.get(nn, f"Unknown({nn})")
         self.lbl_rpi_nn_type.setText(f"RPi: {nn_name}")
         self.lbl_rpi_nn_type.setStyleSheet(
             f"color:{C.green}; font-size:13px; font-weight:600; background:transparent;")
 
         is_dnn = (nn == 0)
+        vr_supported = (nn in (0, 4))  # DNN + PF-IMU support runtime input filters
 
         # Filter Type + Cutoff: 所有网络类型都显示 (DNN 和 LSTM 都有可调滤波器)
         self.lbl_rl_filter_type.setVisible(True)
@@ -3106,9 +3182,9 @@ class MainWindow(QWidget):
         self.lbl_rl_cutoff.setVisible(True)
         self.sb_rl_cutoff_hz.setVisible(True)
 
-        # Vel+Ref: 仅 DNN 有意义, LSTM 只有 torque 前滤波
-        self.chk_rl_vr_filter.setVisible(is_dnn)
-        if not is_dnn:
+        # Input Filter: DNN / PF-IMU 有意义，其它网络仅 torque 前滤波
+        self.chk_rl_vr_filter.setVisible(vr_supported)
+        if not vr_supported:
             self.chk_rl_vr_filter.blockSignals(True)
             self.chk_rl_vr_filter.setChecked(False)
             self.chk_rl_vr_filter.blockSignals(False)
@@ -3120,15 +3196,21 @@ class MainWindow(QWidget):
             self.chk_rl_torque_filter.blockSignals(False)
 
         # ---- 按网络类型设置推荐预设 ----
-        # nn=0: DNN     → scale=0.50, delay=200ms, cutoff=5.0Hz, Butterworth, Vel+Ref+Torque ON
+        # nn=0: DNN     → scale=0.50, delay=200ms, cutoff=5.0Hz, Butterworth, Input+Torque ON
         # nn=1: LSTM    → scale=1.00, delay=0ms,   cutoff=5.0Hz, Butterworth, Torque ON
         # nn=2: LegDcp  → scale=1.00, delay=100ms, cutoff=5.0Hz, Butterworth, Torque ON
         # nn=3: LSTM-PD → scale=0.40, delay=200ms, cutoff=5.0Hz, Butterworth, Torque ON
+        # nn=4: PF-IMU         → scale=1.00, delay=0ms,   cutoff=5.0Hz, Butterworth, Torque ON
+        # nn=5: MyoAssist-1966 → scale=1.00, delay=0ms,   cutoff=5.0Hz, Butterworth, Torque ON
+        # nn=6: MyoAssist-2293 → scale=1.00, delay=0ms,   cutoff=5.0Hz, Butterworth, Torque ON
         _presets = {
             0: dict(scale=0.50, delay=200.0, cutoff=5.0,  vr=True,  torque=True),
             1: dict(scale=1.00, delay=0.0,   cutoff=5.0,  vr=False, torque=True),
             2: dict(scale=1.00, delay=100.0, cutoff=5.0,  vr=False, torque=True),
             3: dict(scale=0.40, delay=200.0, cutoff=5.0,  vr=False, torque=True),
+            4: dict(scale=1.00, delay=0.0,   cutoff=5.0,  vr=True,  torque=True),
+            5: dict(scale=1.00, delay=0.0,   cutoff=5.0,  vr=False, torque=True),
+            6: dict(scale=1.00, delay=0.0,   cutoff=5.0,  vr=False, torque=True),
         }
         preset = _presets.get(nn, _presets[1])
         self.sb_rl_scale.setValue(preset['scale'])
@@ -3138,12 +3220,26 @@ class MainWindow(QWidget):
         self.cmb_rl_filter_type.blockSignals(True)
         self.cmb_rl_filter_type.setCurrentIndex(0)
         self.cmb_rl_filter_type.blockSignals(False)
-        if is_dnn:
+        if vr_supported:
             self.chk_rl_vr_filter.setChecked(preset['vr'])
         self.chk_rl_torque_filter.blockSignals(True)
         self.chk_rl_torque_filter.setChecked(preset['torque'])
         self.chk_rl_torque_filter.blockSignals(False)
         self._update_rl_delay_input_mode()
+
+    def _update_teensy_prefilter_ui_state(self, algo_id=None):
+        """Top-level Teensy-only pre-motor filter state (disabled while RL is active)."""
+        if not hasattr(self, "sb_torque_filter_fc"):
+            return
+        if algo_id is None:
+            algo_id = int(getattr(self, "_algo_select", ALGO_EG))
+        is_rl = (int(algo_id) == ALGO_RL)
+        self.sb_torque_filter_fc.setEnabled(not is_rl)
+        if hasattr(self, "lbl_tf_fc"):
+            self.lbl_tf_fc.setText("Filter Before Torque (Hz) [Teensy-local only]")
+            self.lbl_tf_fc.setStyleSheet(
+                f"color:{C.text2 if not is_rl else C.separator}; background:transparent;"
+            )
 
     def _update_rpi_offline_ui(self):
         """RPi 超时断线时更新 UI"""
@@ -3182,7 +3278,7 @@ class MainWindow(QWidget):
             if self._rpi_nn_type == 0:  # DNN
                 current_str = (
                     f"[{src}] {ftype} {self._rpi_cutoff_hz:.1f}Hz order={self._rpi_filter_order} | "
-                    f"Vel={en_v} Ref={en_r} Torque={en_t} | "
+                    f"Input={('ON' if (en_v == 'ON' and en_r == 'ON') else 'OFF')} Torque={en_t} | "
                     f"Scale={self._rpi_scale:.2f} {delay_str} | Auto={auto_en}/{method_rpi}"
                 )
             else:  # LSTM
@@ -3210,13 +3306,13 @@ class MainWindow(QWidget):
             if self.connected and self.ser:
                 state = (
                     f"GUI Sent(seq={self._rl_cfg_tx_seq}): "
-                    f"{filt_name} {cutoff:.1f}Hz, Vel+Ref={vr}, Torque={tq}, "
+                    f"{filt_name} {cutoff:.1f}Hz, Input={vr}, Torque={tq}, "
                     f"Scale={scale:.2f}, Delay={delay:.0f}ms, Auto={ad}/{method_gui}"
                 )
             else:
                 state = (
                     f"GUI Pending: "
-                    f"{filt_name} {cutoff:.1f}Hz, Vel+Ref={vr}, Torque={tq}, "
+                    f"{filt_name} {cutoff:.1f}Hz, Input={vr}, Torque={tq}, "
                     f"Scale={scale:.2f}, Delay={delay:.0f}ms, Auto={ad}/{method_gui}"
                 )
         else:
@@ -3304,6 +3400,7 @@ class MainWindow(QWidget):
         self._algo_select = self._algo_pending
         algo_name = ALGO_NAMES.get(self._algo_select, '?')
         print(f"[GUI] Algorithm CONFIRMED: {algo_name}")
+        self._update_teensy_prefilter_ui_state(self._algo_select)
         # Force fresh status parsing after algorithm switch (avoid stale overlay state).
         self._rpi_status_valid = False
         self._rpi_online = False
@@ -3648,6 +3745,7 @@ class MainWindow(QWidget):
             self, t, L_angle, R_angle, L_tau, R_tau, L_tau_d, R_tau_d,
             L_vel, R_vel, gait_freq, *, log_csv=True, power_override=None):
         self._last_gait_freq = float(gait_freq)
+        self._last_gait_period_ms = (1000.0 / float(gait_freq)) if float(gait_freq) > 0.01 else 0.0
         vL, vR = self._visual_sign_L, self._visual_sign_R
         # Motor L+/R+ should only affect real actuator output, not plot sign.
         # Compensate uplink torque/cmd back to logical sign for display.
@@ -3719,6 +3817,7 @@ class MainWindow(QWidget):
                 str(int(self._sync_sample_id) & 0xFFFF),
                 str(int(1 if self._sync_from_pi else 0)),
                 f'{float(gait_freq):.3f}',
+                f'{(1000.0 / float(gait_freq)):.3f}' if float(gait_freq) > 0.01 else '0.000',
                 f'{float(self._uplink_t_unwrapped_s):.3f}',
                 f'{now_wall:.6f}',
                 f'{(now_wall - float(self._csv_start_wall_time)):.3f}',
@@ -4018,6 +4117,45 @@ class MainWindow(QWidget):
             """)
         if hasattr(self, "btn_pi_rl_start_pd"):
             self.btn_pi_rl_start_pd.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {C.fill};
+                    color: {C.text};
+                    border: none;
+                    border-radius: 8px;
+                    font-weight: 600;
+                    font-size: 12px;
+                    padding: 4px 10px;
+                }}
+                QPushButton:hover {{ background-color: {C.separator}; }}
+            """)
+        if hasattr(self, "btn_pi_rl_start_pf"):
+            self.btn_pi_rl_start_pf.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {C.fill};
+                    color: {C.text};
+                    border: none;
+                    border-radius: 8px;
+                    font-weight: 600;
+                    font-size: 12px;
+                    padding: 4px 10px;
+                }}
+                QPushButton:hover {{ background-color: {C.separator}; }}
+            """)
+        if hasattr(self, "btn_pi_rl_start_myo1966"):
+            self.btn_pi_rl_start_myo1966.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {C.fill};
+                    color: {C.text};
+                    border: none;
+                    border-radius: 8px;
+                    font-weight: 600;
+                    font-size: 12px;
+                    padding: 4px 10px;
+                }}
+                QPushButton:hover {{ background-color: {C.separator}; }}
+            """)
+        if hasattr(self, "btn_pi_rl_start_myo2293"):
+            self.btn_pi_rl_start_myo2293.setStyleSheet(f"""
                 QPushButton {{
                     background-color: {C.fill};
                     color: {C.text};
@@ -4981,6 +5119,7 @@ class MainWindow(QWidget):
         L_pwr = float(L_pwr_csv) if isfinite(L_pwr_csv) else 0.0
         R_pwr = float(R_pwr_csv) if isfinite(R_pwr_csv) else 0.0
         self._last_gait_freq = gait_freq
+        self._last_gait_period_ms = (1000.0 / float(gait_freq)) if float(gait_freq) > 0.01 else 0.0
         self._append_data_point(
             t, L_angle, R_angle, L_tau, R_tau, L_tau_d, R_tau_d, L_vel, R_vel,
             gait_freq, log_csv=False, power_override=(L_pwr, R_pwr))
@@ -5645,6 +5784,9 @@ class MainWindow(QWidget):
             # [28] auto_delay_enable bit0; [29..30] eg_post_delay_ms
             payload[28] = 0x01 if self._eg_auto_delay_enable else 0x00
             put_s16(29, float(self.sb_eg_post_delay.value()), 1)
+            # [33] legacy EG flags (bit0 delay scaling, bit1 gate uses x_prev, bit2 internal LPF)
+            if self.chk_eg_legacy_path.isChecked():
+                payload[33] = 0x07
         elif algo == ALGO_SAMSUNG:
             put_s16(5, float(self.sb_sam_kappa.value()))
             put_s16(7, float(self.sb_sam_delay.value()), 1)
@@ -5818,6 +5960,7 @@ class MainWindow(QWidget):
         gf100 = struct.unpack('<h', payload[20:22])[0]
         gait_freq = gf100 / 100.0
         self._last_gait_freq = gait_freq
+        self._last_gait_period_ms = (1000.0 / gait_freq) if gait_freq > 0.01 else 0.0
         tag_valid = payload[22]
         tag_char  = chr(payload[23]) if payload[23] else ''
         imu_bits = payload[24]
@@ -6135,6 +6278,7 @@ class MainWindow(QWidget):
 
         # Algorithm badge
         algo_name = ALGO_NAMES.get(active_algo, "?")
+        self._update_teensy_prefilter_ui_state(active_algo)
         if active_algo == self._algo_select:
             self.badge_algo.setText(algo_name)
             self.badge_algo.set_color(C.green)
@@ -6148,7 +6292,7 @@ class MainWindow(QWidget):
          L_cmd_disp, R_cmd_disp, L_pwr_disp, R_pwr_disp,
          signal_active, power_active) = self._resolve_live_sources(active_algo)
         self.lbl_status.setText(
-            f"t={t:.2f}s  gait={gait_freq:.2f}Hz  algo={algo_name}"
+            f"t={t:.2f}s  gait={gait_freq:.2f}Hz(T={((1000.0 / gait_freq) if gait_freq > 0.01 else 0.0):.0f}ms)  algo={algo_name}"
             + (f"  tag='{tag_char}'" if tag_valid else "")
             + f"  vel={'IMU' if has_imu_vel else 'DER'}"
             + f"  src={signal_active}/{power_active}")
