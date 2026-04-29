@@ -19,6 +19,9 @@ Controller_EG::Controller_EG() {
   ext_gain_         = 0.5f;
   scale_all_        = 0.2f;
   post_delay_ms_base_ = 0.0f;
+  legacy_delay_scaling_ = false;
+  legacy_gate_use_x_prev_ = false;
+  legacy_internal_lpf_ = false;
 
   reset();
 }
@@ -34,6 +37,8 @@ void Controller_EG::reset() {
   post_buf_idx_ = 0;
   xL_prev_ = 0.0f;
   xR_prev_ = 0.0f;
+  tau_cmd_L_filt_ = 0.0f;
+  tau_cmd_R_filt_ = 0.0f;
   ado_.reset(post_delay_ms_base_);
 }
 
@@ -63,6 +68,9 @@ void Controller_EG::parse_params(const BleDownlinkData& dl) {
   ext_phase_frac_R_  = dl.ext_phase_frac_R;
   ext_gain_          = dl.ext_gain;
   scale_all_         = dl.scale_all;
+  legacy_delay_scaling_ = (dl.eg_legacy_flags & 0x01) != 0;
+  legacy_gate_use_x_prev_ = (dl.eg_legacy_flags & 0x02) != 0;
+  legacy_internal_lpf_ = (dl.eg_legacy_flags & 0x04) != 0;
 
   post_delay_ms_base_ = (float)dl.eg_post_delay_ms;
   if (post_delay_ms_base_ < 0.0f)    post_delay_ms_base_ = 0.0f;
@@ -94,12 +102,21 @@ void Controller_EG::compute(const CtrlInput& in, CtrlOutput& out) {
   // 延迟缓冲
   RLTx_delay_[doi_] = RLTx_filtered;
 
-  // 动态延迟（按步态周期比例）:
-  // Assist_delay_gain_ 是 phase index（0..99），在 BASE_FREQ 下定义，
-  // 通过 BASE_FREQ / gait_freq 自动换算，保持“相位比例”基本一致。
+  // 动态延迟（按步态周期比例）
   const float BASE_FREQ = 0.7f;
-  float f_for_delay = (in.gait_inited && in.gait_freq > 0.05f) ? in.gait_freq : BASE_FREQ;
-  int Assist_delay_dynamic = (int)lrintf(Assist_delay_gain_ * (BASE_FREQ / f_for_delay));
+  const int base_delay_idx = (int)lrintf(Assist_delay_gain_);
+  int Assist_delay_dynamic = base_delay_idx;
+  if (legacy_delay_scaling_) {
+    // Legacy: 仅在 gait_freq > BASE_FREQ 时缩短，且最小 5 samples。
+    if (in.gait_inited && in.gait_freq > BASE_FREQ) {
+      Assist_delay_dynamic = (int)lrintf((float)base_delay_idx * (BASE_FREQ / in.gait_freq));
+      if (Assist_delay_dynamic < 5) Assist_delay_dynamic = 5;
+    }
+  } else {
+    // Current: 全域按 BASE_FREQ / gait_freq 换算（低频会放大延迟）。
+    float f_for_delay = (in.gait_inited && in.gait_freq > 0.05f) ? in.gait_freq : BASE_FREQ;
+    Assist_delay_dynamic = (int)lrintf((float)base_delay_idx * (BASE_FREQ / f_for_delay));
+  }
   if (Assist_delay_dynamic < 0) Assist_delay_dynamic = 0;
   if (Assist_delay_dynamic >= EG_DELAY_BUF) Assist_delay_dynamic = EG_DELAY_BUF - 1;
 
@@ -135,20 +152,36 @@ void Controller_EG::compute(const CtrlInput& in, CtrlOutput& out) {
   if (lead_ms < 5.0f)   lead_ms = 5.0f;
   if (lead_ms > 120.0f) lead_ms = 120.0f;
 
-  const float xL_pred = lead_predict(xL_raw, xL_prev_, lead_ms, Ts);
-  const float xR_pred = lead_predict(xR_raw, xR_prev_, lead_ms, Ts);
+  const float xL_prev_for_predict = xL_prev_;
+  const float xR_prev_for_predict = xR_prev_;
+  const float xL_pred = lead_predict(xL_raw, xL_prev_for_predict, lead_ms, Ts);
+  const float xR_pred = lead_predict(xR_raw, xR_prev_for_predict, lead_ms, Ts);
   xL_prev_ = xL_raw;
   xR_prev_ = xR_raw;
 
   // 门控
-  const float gate_L = smooth_gate_p(xL_pred, gate_k_, gate_p_on_);
-  const float gate_R = smooth_gate_p(xR_pred, gate_k_, gate_p_on_);
+  const float gate_in_L = legacy_gate_use_x_prev_ ? xL_prev_ : xL_pred;
+  const float gate_in_R = legacy_gate_use_x_prev_ ? xR_prev_ : xR_pred;
+  const float gate_L = smooth_gate_p(gate_in_L, gate_k_, gate_p_on_);
+  const float gate_R = smooth_gate_p(gate_in_R, gate_k_, gate_p_on_);
   float tau_gate_L = tau_raw_L * gate_L;
   float tau_gate_R = tau_raw_R * gate_R;
 
-  // 统一的电机前滤波在 .ino 主循环执行；这里保持算法输出原始链路。
-  float S_src_L = tau_gate_L * scale_all_;
-  float S_src_R = tau_gate_R * scale_all_;
+  float S_src_L = 0.0f;
+  float S_src_R = 0.0f;
+  if (legacy_internal_lpf_) {
+    // Legacy EG internal LPF: tau_filt = 0.85*tau_filt + 0.15*tau_gate
+    tau_cmd_L_filt_ = 0.85f * tau_cmd_L_filt_ + 0.15f * tau_gate_L;
+    tau_cmd_R_filt_ = 0.85f * tau_cmd_R_filt_ + 0.15f * tau_gate_R;
+    S_src_L = tau_cmd_L_filt_ * scale_all_;
+    S_src_R = tau_cmd_R_filt_ * scale_all_;
+  } else {
+    // Current chain: no internal LPF, rely on unified pre-motor filter in .ino.
+    tau_cmd_L_filt_ = tau_gate_L;
+    tau_cmd_R_filt_ = tau_gate_R;
+    S_src_L = tau_gate_L * scale_all_;
+    S_src_R = tau_gate_R * scale_all_;
+  }
 
   // === 伸展复制 ===
   const int8_t flex_sign_L = -1;

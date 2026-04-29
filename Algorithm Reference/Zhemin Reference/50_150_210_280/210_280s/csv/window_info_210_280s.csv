@@ -1,0 +1,2 @@
+windowTag,timeStart_s,timeEnd_s,csvPath,numSamples_L,numSamples_R,numCycles_L,numCycles_R
+210_280s,210,280,C:\Users\12617\Documents\MATLAB\PF_DS\PF_VARY SPEED\PI5_lstm_pd-20260424-221451.csv,6829,6829,61,61

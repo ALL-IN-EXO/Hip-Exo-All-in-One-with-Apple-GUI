@@ -79,6 +79,10 @@
  *              bit2-3: dir_bits (L,R)
  * [3..4]     max_torque_cfg int16  最大扭矩×100
  * [31..32]   torque_filter_fc_hz int16  统一电机前滤波截止频率×100 (Hz, all algos)
+ * [33]       eg_legacy_flags uint8      EG legacy A/B 位标志:
+ *              bit0: legacy_delay_scaling (f>0.7 才缩短 + min5 samples)
+ *              bit1: legacy_gate_use_x_prev (gate 输入用 x_prev)
+ *              bit2: legacy_internal_lpf (算法内部一阶 LPF 0.85/0.15)
  * --- 算法专用参数区 [5..57] (53 bytes) ---
  *   EG 参数 (algo=0):
  *     [5..6]   Rescaling_gain ×100    int16
@@ -288,6 +292,7 @@ struct BleDownlinkData {
   uint8_t  dir_bits;        // ctrl_flags bit2-3
   float    max_torque_cfg;  // [3..4] / 100
   float    torque_filter_fc_hz; // [31..32] /100 (统一电机前滤波截止频率)
+  uint8_t  eg_legacy_flags; // [33]
 
   // EG 参数
   float Rescaling_gain;     // [5..6]
@@ -346,6 +351,7 @@ static inline BleDownlinkData ble_parse_downlink(const uint8_t* payload) {
   d.max_torque_cfg = ble_rd_i16(payload, 3) / 100.0f;
   d.torque_filter_fc_hz = ble_rd_i16(payload, 31) / 100.0f;
   if (!(d.torque_filter_fc_hz > 0.0f)) d.torque_filter_fc_hz = 5.0f;
+  d.eg_legacy_flags = payload[33];
 
   // 根据算法类型解析参数区 [5..57]
   switch (d.algo_select) {
