@@ -81,6 +81,11 @@
  * [31..32]   filter_fc_hz        int16  统一滤波截止频率×100 (Hz, 角度/速度/力矩三通道共用)
  * --- 预留/扩展通用参数 [98] ---
  * [98]       filter_flags        uint8  bit0=角度滤波, bit1=速度滤波, bit2=力矩滤波, bit3=类型(0=LPF,1=Butter)
+ * [31..32]   torque_filter_fc_hz int16  统一电机前滤波截止频率×100 (Hz, all algos)
+ * [33]       eg_legacy_flags uint8      EG legacy A/B 位标志:
+ *              bit0: legacy_delay_scaling (f>0.7 才缩短 + min5 samples)
+ *              bit1: legacy_gate_use_x_prev (gate 输入用 x_prev)
+ *              bit2: legacy_internal_lpf (算法内部一阶 LPF 0.85/0.15)
  * --- 算法专用参数区 [5..57] (53 bytes) ---
  *   EG 参数 (algo=0):
  *     [5..6]   Rescaling_gain ×100    int16
@@ -291,6 +296,8 @@ struct BleDownlinkData {
   float    max_torque_cfg;  // [3..4] / 100
   float    filter_fc_hz;        // [31..32] /100 (统一滤波截止频率)
   uint8_t  filter_flags;       // [98] bit0=ang bit1=vel bit2=tau bit3=type
+  float    torque_filter_fc_hz; // [31..32] /100 (统一电机前滤波截止频率)
+  uint8_t  eg_legacy_flags; // [33]
 
   // EG 参数
   float Rescaling_gain;     // [5..6]
@@ -350,6 +357,9 @@ static inline BleDownlinkData ble_parse_downlink(const uint8_t* payload) {
   d.filter_fc_hz = ble_rd_i16(payload, 31) / 100.0f;
   if (!(d.filter_fc_hz > 0.0f)) d.filter_fc_hz = 5.0f;
   d.filter_flags = payload[98];
+  d.torque_filter_fc_hz = ble_rd_i16(payload, 31) / 100.0f;
+  if (!(d.torque_filter_fc_hz > 0.0f)) d.torque_filter_fc_hz = 5.0f;
+  d.eg_legacy_flags = payload[33];
 
   // 根据算法类型解析参数区 [5..57]
   switch (d.algo_select) {

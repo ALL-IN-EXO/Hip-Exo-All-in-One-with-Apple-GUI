@@ -51,12 +51,79 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **RL 默认 delay 与 scale 范围调整**（`RPi_Unified/RL_controller_torch.py`, `GUI_RL_update/GUI.py`）：
+  - `pf_imu`、`myoassist_1966080`、`myoassist_2293760` 三个算法的默认 runtime delay 统一为 `0ms`（Pi 默认 + GUI 预设 + GUI 远程启动预填一致）
+  - `RL Scale (L/R)` 取值范围从 `0~3` 扩展到 `0~20`（GUI 输入范围 + Pi 端解析限幅一致）
+  - Samsung 的 `Kappa` 范围已保持 `0~20`（本次复核确认，无需额外修改）
+
+- **PF-IMU 输入滤波接入 + Teensy-only 滤波 UI 约束**（`RPi_Unified/networks/pf_imu.py`, `RPi_Unified/RL_controller_torch.py`, `GUI_RL_update/GUI.py`）：
+  - `PF-IMU` 新增运行时输入滤波链路（输入角度 + 输入速度），复用 RL 面板 `Filter Type / Filter Cutoff / Input Filter` 配置
+  - `PF-IMU` 在启动阶段即按默认配置应用输入滤波（默认 5Hz, 2nd-order Butterworth，`Input Filter=ON`）
+  - GUI 顶部 `Filter Before Torque (Hz)` 明确标注为 `Teensy-local only`，并在 `RL` 算法激活时自动灰显禁用
+
+- **接入 NJIT MyoAssist 双 checkpoint 到 Pi RL 统一入口**（`RPi_Unified/RL_controller_torch.py`, `RPi_Unified/networks/myoassist.py`, `RPi_Unified/networks/__init__.py`, `RPi_Unified/run.sh`, `GUI_RL_update/GUI.py`, `RPi_Unified/README.md`, `Docs/NJIT_MYOASSIST_DEPLOYMENT.md`, `tools/myoassist_consistency_eval.py`）：
+  - 新增 `--nn myoassist_1966080` 与 `--nn myoassist_2293760`，并分配 `NN_TYPE_CODE=5/6`
+  - GUI RL 面板新增 `Start Myo-1966` / `Start Myo-2293` 一键远程启动按钮与 `RPi nn_type` 显示映射
+  - MyoAssist 运行时默认参数：`scale=1.00`、`delay=0ms`、统一 torque 前滤波继续由主循环管理
+  - 新增 `Docs/NJIT_MYOASSIST_DEPLOYMENT.md`，记录 NJIT 源码算法清单、迁移范围、接口差异、部署路径与验收方法
+  - 新增一致性评估脚本 `tools/myoassist_consistency_eval.py`；在 `PI5_lstm_pd-20260424-221451.csv` 的 `50–150s` 区间对两个 checkpoint 做逐点对比，结果左右腿均为 `corr=1.0 / RMSE=0 / lag=0ms / amp_ratio=1.0`
+
+- **新增 Pi 侧 `PF-IMU` 控制器接入（`--nn pf_imu`）并保持 RL 协议不变**（`RPi_Unified/networks/pf_imu.py`, `RPi_Unified/RL_controller_torch.py`, `GUI_RL_update/GUI.py`, `RPi_Unified/run.sh`, `RPi_Unified/README.md`, `Docs/PF_IMU_DEPLOYMENT.md`）：
+  - Pi 主入口新增 `--nn pf_imu` 分支，沿用现有 RL 收发链路（`AA59` 控制帧 / `AA56` 状态帧格式不变）
+  - GUI 新增 `Start PF-IMU` 远程按钮，并支持 `nn_type=4 -> RPi: PF-IMU` 模式识别显示
+  - PF-IMU 默认 RL 运行时参数：`scale=1.00`、`delay=0ms`、统一 torque filter 继续有效
+  - Pi CSV 新增 PF 运行诊断字段（`pf_compute_ms/p95`, `pf_overrun_count`, `pf_exception_count`, `pf_ess_*`, `pf_conf_*`）
+  - 新增部署文档 `Docs/PF_IMU_DEPLOYMENT.md`，说明性能保护策略、接口兼容原因与后续演进路线
+
+- **新增 PF-IMU 一致性评估工具与结果归档**（`tools/pf_imu_consistency_eval.py`, `Docs/PF_IMU_DEPLOYMENT.md`）：
+  - 用同一 CSV（`PI5_lstm_pd-20260424-221451.csv`）在 `50–150s` 对比 MATLAB 参考逻辑与 RPi 移植逻辑
+  - 评估口径固定为 `delay=0`（仅比较算法裸输出，不走 runtime delay）
+  - 输出 `single` 与 `MC-mean` 两类结果，文档记录 `lag/corr/RMSE/amp_ratio`；MC 均值结果两腿相关性约 `0.94`，lag 为 `0ms`
+
+- **PF-IMU 切换 MATLAB-v12 profile 并复验**（`RPi_Unified/networks/pf_imu.py`, `RPi_Unified/RL_controller_torch.py`, `tools/pf_imu_consistency_eval.py`, `Algorithm Reference/Zhemin Reference/pf_imu_matlab_local_compare.py`, `Algorithm Reference/Zhemin Reference/PF_IMU_MATLAB_LOCAL_COMPARISON.md`, `Docs/PF_IMU_DEPLOYMENT.md`）：
+  - Pi 默认 `pf_imu` 更新为：`900 particles`、`5-point smoothing`、`auto qstar prior ON`
+  - 控制器新增在线 auto-prior 与输入平滑（并暴露 prior 诊断字段）
+  - 用同一数据重跑 50–150s 对比后，`matlab vs local_ref_mcmean` 提升到 `corr≈0.838/0.810 (L/R)`；部署链路受因果 5 点平滑影响出现约 `-20ms` 固定相位差（best-lag 相关性更高）
+  - 详细图表与结论见 `Algorithm Reference/Zhemin Reference/PF_IMU_MATLAB_LOCAL_COMPARISON.md`
+
+- **PF-IMU 新增 5 秒分窗证据并明确“部署难于仿真”结论**（`Algorithm Reference/Zhemin Reference/pf_imu_windowed_5s_analysis.py`, `Algorithm Reference/Zhemin Reference/pf_imu_compare_results_50_150s/*`, `Algorithm Reference/Zhemin Reference/PF_IMU_MATLAB_LOCAL_COMPARISON.md`, `Docs/PF_IMU_DEPLOYMENT.md`）：
+  - 新增 `50–150s` 的 `5s × 20 窗` 分窗分析与网格图（左右腿）
+  - 结果显示部署链路在全部窗口中均劣于参考仿真链路（两腿 `20/20` 窗：`corr` 更低、`RMSE` 更高）
+  - 两腿窗口级最佳滞后均稳定在 `-20ms`，支持“因果实时链路导致固定相位差”的判断
+  - 文档主结论更新为：真实部署受因果、实时预算、随机路径与安全保护链路约束，目标应为统计可控与稳定，而非逐点复刻离线曲线
+
+- **PF-IMU 切换到 MATLAB v17 guided-raw profile，并重跑一致性对比**（`RPi_Unified/networks/pf_imu.py`, `RPi_Unified/RL_controller_torch.py`, `tools/pf_imu_consistency_eval.py`, `Algorithm Reference/Zhemin Reference/PF_IMU_MATLAB_LOCAL_COMPARISON.md`）：
+  - Pi `pf_imu` 默认更新为 v17 口径：RAW 输入、固定先验、`900 particles`、robust likelihood、direction-side penalty、guided injection、confidence-gated torque、rate limit
+  - `pf_imu_consistency_eval.py` 统一到 v17 并补充 `imu_LTx/imu_RTx/imu_Lvel/imu_Rvel` 到输出 CSV
+  - 新增输出：`pf_imu_consistency_50_150s_v17_single.csv`、`pf_imu_consistency_50_150s_v17_mcmean.csv`
+  - v17 内部一致性结果（50–150s）：`local_ref_mcmean vs local_deploy_mcmean` 达到 `corr≈0.999`（L/R），`lag=0ms`
+
+- **补充 PF-IMU v17 对比实现说明文档**（`Algorithm Reference/Zhemin Reference/PF_IMU_V17_COMPARISON_IMPLEMENTATION.md`）：
+  - 记录完整对比流程：输入数据、脚本、执行命令、输出文件、指标口径
+  - 明确给出两层结论：`local ref vs local deploy` 高一致（移植正确），`MATLAB vs local` 仍有系统差异（当前主要是口径/流程差异）
+
 - **版本号来源统一为 `Docs/CHANGELOG.md`（GUI 启动 + macOS 打包）**（`GUI_RL_update/GUI.py`, `scripts/build_mac_JZ.sh`, `README.md`）：
   - GUI 启动时不再硬编码标题版本，改为读取最新发布节（`## [vX.Y[.Z]] - YYYY-MM-DD`）并显示为 `Hip-Exo Controller vX.Y`
   - `build_mac_JZ.sh` 的 `APP_VERSION` 默认值改为从 `Docs/CHANGELOG.md` 解析（仍可用环境变量覆盖）
   - 打包默认软件名改为 `HipExoControllerGUI_v<version>`，`Info.plist` 同步写入 `CFBundleShortVersionString`、`CFBundleDisplayName`、`CFBundleName`
   - 打包时将 `Docs/CHANGELOG.md` 一并打入 `.app`（PyInstaller `--add-data`），保证发布包运行时也可按同口径解析版本
   - README 移除硬编码“Current Version: vX.Y”文案，避免与 changelog 双维护
+
+- **EG Legacy A/B 调试链路 + gait period 上报**（`Controller_EG.*`, `All_in_one_hip_controller_RL_update.ino`, `BleProtocol.h`, `GUI.py`, `Docs/EG_DEBUG.md`）：
+  - 新增 `payload[33] = eg_legacy_flags`（EG 专用）：`bit0=legacy delay scaling`、`bit1=gate uses x_prev`、`bit2=internal LPF`
+  - GUI EG 面板新增 `Legacy EG Path` 开关，开启后一次性下发 `0x07`，用于复刻旧链路做 A/B 验证
+  - EG 控制器新增 legacy 行为：
+    - delay 缩放改为“仅 `gait_freq>0.7Hz` 才缩短 + 最小 5 samples”
+    - gate 输入改为 `x_prev` 路径
+    - 恢复 EG 内部 LPF（`0.85/0.15`）
+  - 当 EG internal LPF 打开时，Teensy 主循环统一 pre-motor LPF 对 EG 自动旁路，避免双滤波
+  - Teensy SD CSV 新增 `gait_freq_Hz`、`gait_period_ms`
+  - GUI CSV 新增 `gait_period_ms`（由上行 `gait_freq_Hz` 同公式换算），状态栏同步显示 `gait=...Hz (T=...ms)`
+
+- **README 补充“新增 Pi 算法接入 GUI”标准清单**（`README.md`）：
+  - 新增 Pi→GUI 接入步骤：`--nn` 注册、`nn_type` 显示映射、`Start <AlgoName>` 远程按钮、enable/disable 统一纳管
+  - 明确“无显式延迟算法”的 RL 运行时默认：`scale=1.00`、`delay=0ms`、`Butterworth 5Hz order=2 Torque ON`
+  - 补充快捷启动要求：`run.sh` 支持 `<new_type>` + GUI 一键远程启动
 
 ## [v4.1] - 2026-04-27
 

@@ -363,6 +363,7 @@ void setup() {
     logger.println(F(
       "Time_ms,teensy_t_cs_u16,teensy_t_s_unwrapped,"
       "imu_LTx,imu_RTx,imu_Lvel,imu_Rvel,"
+      "gait_freq_Hz,gait_period_ms,"
       "L_command_actuator,R_command_actuator,L_torque_meas,R_torque_meas,"
       "L_pwr_W,R_pwr_W,brand,algo,L_pos_deg,R_pos_deg,tag"
     ));
@@ -497,8 +498,20 @@ void loop() {
     cout.tau_L *= (cin.l_ctl_dir >= 0) ? 1.0f : -1.0f;
     cout.tau_R *= (cin.r_ctl_dir >= 0) ? 1.0f : -1.0f;
 
-    // 力矩滤波（仅 Teensy-native 算法；RL 路径保持透明）
-    if (filter_enable_tau && active_algo_id != ALGO_RL) {
+    // 统一电机前滤波（仅 Teensy-native 算法；RL 路径保持 Pi→Teensy→Motor 透明）
+    bool use_unified_prefilter = (active_algo_id != ALGO_RL);
+    if (active_algo_id == ALGO_EG && ctrl_eg.legacy_internal_lpf_enabled()) {
+      // Legacy EG 内部已经包含 0.85/0.15 LPF，为避免双滤波，这里旁路统一滤波。
+      use_unified_prefilter = false;
+    }
+    static bool prev_use_unified_prefilter = true;
+    if (use_unified_prefilter != prev_use_unified_prefilter) {
+      // 切换滤波路径时清一次状态，避免旁路/恢复瞬间的滤波尾迹。
+      reset_torque_filter_state();
+      prev_use_unified_prefilter = use_unified_prefilter;
+    }
+    if (use_unified_prefilter) {
+      update_torque_filter_if_needed();
       if (!imu_init_ok && active_algo_id != ALGO_TEST) {
         tau_filt_L.reset(); tau_filt_R.reset();
         cout.tau_L = 0.0f;
@@ -532,6 +545,7 @@ void loop() {
       float t_s_unwrapped = current_time / 1000000.0f;
       float L_torque_meas = motor_L->get_torque_meas();
       float R_torque_meas = motor_R->get_torque_meas();
+      float gait_period_ms = (gait_freq > 0.01f) ? (1000.0f / gait_freq) : 0.0f;
       float L_pwr_w = L_torque_meas * imu.LTAVx * (PI / 180.0f);
       float R_pwr_w = R_torque_meas * imu.RTAVx * (PI / 180.0f);
 
@@ -542,6 +556,8 @@ void loop() {
       logger.print(imu.RTx, 4);            logger.print(',');
       logger.print(imu.LTAVx, 4);          logger.print(',');
       logger.print(imu.RTAVx, 4);          logger.print(',');
+      logger.print(gait_freq, 4);          logger.print(',');
+      logger.print(gait_period_ms, 2);     logger.print(',');
       logger.print(M2_torque_command, 4);  logger.print(',');
       logger.print(M1_torque_command, 4);  logger.print(',');
       logger.print(L_torque_meas, 4);      logger.print(',');

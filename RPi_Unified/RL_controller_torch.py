@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 RPi_Unified - 统一树莓派 RL 控制器入口
-支持 DNN / LSTMNetwork / LSTMNetworkLegDcp 三种网络
+支持 DNN / LSTMNetwork / LSTMNetworkLegDcp / LSTMNetworkPD / PF-IMU / MyoAssist
 
 用法:
   source ~/venvs/pytorch-env/bin/activate
@@ -10,9 +10,15 @@ RPi_Unified - 统一树莓派 RL 控制器入口
   python RL_controller_torch.py --nn lstm             # LSTM网络
   python RL_controller_torch.py --nn lstm_leg_dcp     # LSTM每腿独立解耦
   python RL_controller_torch.py --nn lstm_pd          # LSTM PD位置误差控制
+  python RL_controller_torch.py --nn pf_imu           # PF-IMU (非神经网络)
+  python RL_controller_torch.py --nn myoassist_1966080  # NJIT MyoAssist ckpt-1966080
+  python RL_controller_torch.py --nn myoassist_2293760  # NJIT MyoAssist ckpt-2293760
 
 可选参数:
-  --nn          神经网络类型: dnn / lstm / lstm_leg_dcp / lstm_pd (默认 dnn)
+  --nn          算法类型:
+                dnn / lstm / lstm_leg_dcp / lstm_pd / pf_imu /
+                myoassist_1966080 / myoassist_2293760
+                (默认 dnn)
   --tag         日志文件名标签 (默认按网络类型自动命名, 如 'dnn', 'lstm_leg_dcp')
 
 示例:
@@ -38,9 +44,15 @@ from collections import deque
 # 'lstm'            → LSTMNetwork (4→256→2)
 # 'lstm_leg_dcp'    → LSTMNetworkLegDcp (每腿独立, 2→256→1)
 # 'lstm_pd'         → LSTMNetworkPD (每腿独立, PD位置误差控制)
+# 'pf_imu'          → PF-IMU 粒子滤波控制器 (每腿独立)
+# 'myoassist_1966080' / 'myoassist_2293760'
+#                   → NJIT MyoAssist (ZIP checkpoint)
 _parser = argparse.ArgumentParser(description='RPi Unified RL Controller')
-_parser.add_argument('--nn', choices=['dnn', 'lstm', 'lstm_leg_dcp', 'lstm_pd'],
-                     default='dnn', help='神经网络类型 (default: dnn)')
+_parser.add_argument('--nn', choices=[
+    'dnn', 'lstm', 'lstm_leg_dcp', 'lstm_pd', 'pf_imu',
+    'myoassist_1966080', 'myoassist_2293760'
+],
+                     default='dnn', help='算法类型 (default: dnn)')
 _parser.add_argument('--tag', type=str, default=None,
                      help='日志文件名标签 (默认按 --nn 类型自动命名)')
 _args, _ = _parser.parse_known_args()
@@ -59,6 +71,10 @@ DNN_MODEL_PATH = './models/dnn/Trained_model3.pt'
 LSTM_MODEL_PATH = './models/lstm/end2end/walkv2_legdecp/max_exo.pt'
 # LSTM PD 模型:
 LSTM_PD_MODEL_PATH = './models/lstm/end2end/walkv2_pd/max_exo.pt'
+# NJIT MyoAssist 模型（ZIP checkpoint）:
+MYOASSIST_MODEL_1966 = 'model_1966080.zip'
+MYOASSIST_MODEL_2293 = 'model_2293760.zip'
+MYOASSIST_TORQUE_MAX_NM = 15.0
 
 CTRL_HZ = 100
 dt_ms = 1000.0 / CTRL_HZ            # 10ms
@@ -87,11 +103,15 @@ BUF_SIZE = int(round(MAX_RUNTIME_DELAY_MS / dt_ms)) + 1
 # Note:
 # - lstm_leg_dcp keeps historical default 100ms
 # - lstm_pd uses 200ms baseline so Grid auto-delay starts around expected timing
+# - pf_imu / myoassist_* default to 0ms (no algorithm-internal delay assumption)
 DEFAULT_RUNTIME_DELAY_MS = {
     'dnn': 0.0,
     'lstm': 0.0,
     'lstm_leg_dcp': 100.0,
     'lstm_pd': 200.0,
+    'pf_imu': 0.0,
+    'myoassist_1966080': 0.0,
+    'myoassist_2293760': 0.0,
 }
 
 # ---- CSV 日志 ----
@@ -313,8 +333,100 @@ def load_network():
         print('load parameters successfully!!')
         return nn_obj
 
+    elif NN_TYPE == 'pf_imu':
+        from networks.pf_imu import PFIMUController
+        pf_profile_name = 'matlab_v17_guided_raw_online'
+        pf_num_particles = 900
+        pf_smooth_win = 1
+        pf_use_auto_prior = False
+        pf_prior_margin = 0.10
+        pf_sigma_a = 0.20
+        pf_sigma_qstar = 0.003
+        pf_pswitch = 0.003
+        print(f"\n{'='*80}")
+        print(f"加载 PF-IMU 控制器 (非神经网络)")
+        print(
+            f"sample_rate={CTRL_HZ}Hz, profile={pf_profile_name}, "
+            f"particles={pf_num_particles}, smooth={pf_smooth_win}, auto_prior={'ON' if pf_use_auto_prior else 'OFF'}"
+        )
+        print(f"内部exo_filter: bypass(identity), 统一torque滤波在主循环配置")
+        print(f"{'='*80}")
+        nn_obj = PFIMUController(
+            sample_rate=float(CTRL_HZ),
+            num_particles=pf_num_particles,
+            tau_max=25.0,
+            sigmaA=pf_sigma_a,
+            sigmaQstar=pf_sigma_qstar,
+            pSwitch=pf_pswitch,
+            etaV=2.0,
+            etaSign=2.0,
+            use_robust_likelihood=True,
+            vel_err_clip_deg_s=120.0,
+            use_direction_side_penalty=True,
+            etaSide=1.5,
+            dqGuideDeadzoneDegS=8.0,
+            use_guided_injection=True,
+            guidedFrac=0.03,
+            qstarGuideSepDeg=2.0,
+            use_assistive_only_damping=False,
+            dqDeadzoneDegS=5.0,
+            use_torque_rate_limit=True,
+            tauRateMax=80.0,
+            smooth_angle_window=pf_smooth_win,
+            smooth_velocity_window=pf_smooth_win,
+            use_auto_qstar_prior=pf_use_auto_prior,
+            prior_margin_ratio=pf_prior_margin,
+            auto_prior_min_samples=200,
+            auto_prior_update_interval_sec=0.50,
+            auto_prior_hist_sec=120.0,
+            compute_warn_ms=3.0,
+        )
+        print('[统一扭矩滤波] PF-IMU internal exo_filter bypassed (handled in main loop).')
+        print('load parameters successfully!!')
+        return nn_obj
+
+    elif NN_TYPE in ('myoassist_1966080', 'myoassist_2293760'):
+        from networks.myoassist import MyoAssistController
+        root_dir = os.path.dirname(os.path.abspath(__file__))
+        ckpt_name = MYOASSIST_MODEL_1966 if NN_TYPE == 'myoassist_1966080' else MYOASSIST_MODEL_2293
+        candidates = [
+            os.path.join(root_dir, 'models', 'njit', ckpt_name),
+            os.path.join(root_dir, '..', 'Algorithm Reference', 'NJIT Reference', ckpt_name),
+            os.path.join(root_dir, ckpt_name),
+            os.path.join(root_dir, 'models', ckpt_name),
+        ]
+        model_path = None
+        for p in candidates:
+            if os.path.isfile(p):
+                model_path = p
+                break
+        if model_path is None:
+            raise FileNotFoundError(
+                f"MyoAssist checkpoint not found for {NN_TYPE}. "
+                f"Tried: {candidates}"
+            )
+
+        print(f"\n{'='*80}")
+        print(f"加载 MyoAssist: {NN_TYPE}")
+        print(f"checkpoint={model_path}")
+        print(f"torque_max={MYOASSIST_TORQUE_MAX_NM:.1f} Nm")
+        print(f"内部exo_filter: bypass(identity), 统一torque滤波在主循环配置")
+        print(f"{'='*80}")
+        nn_obj = MyoAssistController(
+            model_path=model_path,
+            max_torque_nm=MYOASSIST_TORQUE_MAX_NM,
+            symmetric=True,
+        )
+        print('[统一扭矩滤波] MyoAssist internal exo_filter bypassed (handled in main loop).')
+        print('load parameters successfully!!')
+        return nn_obj
+
     else:
-        raise ValueError(f"不支持的 NN_TYPE: {NN_TYPE}，应为 'dnn', 'lstm', 'lstm_leg_dcp' 或 'lstm_pd'")
+        raise ValueError(
+            f"不支持的 NN_TYPE: {NN_TYPE}，应为 "
+            f"'dnn', 'lstm', 'lstm_leg_dcp', 'lstm_pd', 'pf_imu', "
+            f"'myoassist_1966080' 或 'myoassist_2293760'"
+        )
 
 
 def _parse_dnn_filter_config():
@@ -432,6 +544,9 @@ csv_header = [
     'auto_neg_per_s_L', 'auto_neg_per_s_R',
     'auto_best_delay_ms_L', 'auto_best_delay_ms_R',
     'auto_window_s', 'auto_gait_freq_hz',
+    'pf_compute_ms', 'pf_compute_p95_ms', 'pf_overrun_count', 'pf_exception_count',
+    'pf_ess_L', 'pf_ess_R', 'pf_conf_L', 'pf_conf_R',
+    'pf_mode_prob_high_L', 'pf_mode_prob_high_R',
     'tag',
 ]
 
@@ -466,7 +581,15 @@ RPI_AUTO_FLAG_MOTION_VALID_R = 0x04
 RPI_AUTO_FLAG_METHOD_BO      = 0x08
 
 # ---- NN_TYPE 编码 (用于上行状态) ----
-NN_TYPE_CODE = {'dnn': 0, 'lstm': 1, 'lstm_leg_dcp': 2, 'lstm_pd': 3}
+NN_TYPE_CODE = {
+    'dnn': 0,
+    'lstm': 1,
+    'lstm_leg_dcp': 2,
+    'lstm_pd': 3,
+    'pf_imu': 4,
+    'myoassist_1966080': 5,
+    'myoassist_2293760': 6,
+}
 
 # ---- 状态发送间隔 ----
 STATUS_SEND_INTERVAL = 50  # 每50帧发送一次 (0.5s @100Hz)
@@ -807,7 +930,7 @@ def parse_runtime_cfg(payload: bytes):
     if not math.isfinite(scale) or not math.isfinite(delay_ms) or not math.isfinite(cutoff_hz):
         return None
 
-    scale = max(0.0, min(3.0, scale))
+    scale = max(0.0, min(20.0, scale))
     delay_ms = max(0.0, min(MAX_RUNTIME_DELAY_MS, delay_ms))
     cutoff_hz = max(0.5, min(CTRL_HZ * 0.45, cutoff_hz))
     filter_order = max(1, min(6, filter_order))
@@ -855,6 +978,40 @@ def apply_runtime_filter_to_dnn(dnn_obj, filter_code, cutoff_hz, filter_order, e
     print(
         f"[RPi CFG] DNN filter applied: {filter_type} {cutoff_hz:.2f}Hz order={filter_order} "
         f"(torque handled by unified main-loop filter)"
+    )
+    return True
+
+
+def apply_runtime_filter_to_pf_imu(nn_obj, filter_code, cutoff_hz, filter_order, enable_vel, enable_ref):
+    """Rebuild runtime input filters for PF-IMU (angle + velocity channels)."""
+    if NN_TYPE != 'pf_imu':
+        return False
+
+    filter_type = RPI_FILTER_TYPE_MAP.get(filter_code)
+    if filter_type is None:
+        print(f"[RPi CFG] Unknown filter code: {filter_code}")
+        return False
+
+    kwargs = dict(
+        cutoff=float(cutoff_hz),
+        order=int(filter_order),
+        filter_type=filter_type,
+        sample_rate=float(CTRL_HZ),
+    )
+    try:
+        pos_on = bool(enable_ref)
+        vel_on = bool(enable_vel)
+        nn_obj.left_input_pos_filter = create_filter(**kwargs) if pos_on else IdentityFilter()
+        nn_obj.right_input_pos_filter = create_filter(**kwargs) if pos_on else IdentityFilter()
+        nn_obj.left_input_vel_filter = create_filter(**kwargs) if vel_on else IdentityFilter()
+        nn_obj.right_input_vel_filter = create_filter(**kwargs) if vel_on else IdentityFilter()
+    except Exception as exc:
+        print(f"[RPi CFG] PF-IMU input filter rebuild failed: {exc}")
+        return False
+
+    print(
+        f"[RPi CFG] PF-IMU input filter: {filter_type} {cutoff_hz:.2f}Hz order={filter_order} "
+        f"(pos={'ON' if pos_on else 'OFF'}, vel={'ON' if vel_on else 'OFF'})"
     )
     return True
 
@@ -1187,7 +1344,8 @@ def main():
     cur_filter_order = UNIFIED_TORQUE_FILTER_ORDER_DEFAULT
     cur_cutoff_hz = UNIFIED_TORQUE_FILTER_CUTOFF_DEFAULT
     cur_enable_mask = (RPI_FILTER_EN_TORQUE if UNIFIED_TORQUE_FILTER_ENABLE_DEFAULT else 0x00)
-    # DNN 仍保留 vel/ref 运行时滤波开关；LSTM 家族仅 torque 有意义
+    # DNN 默认支持 Vel+Ref(输入) 运行时滤波开关。
+    # PF-IMU v17 raw-online 默认关闭 Vel+Ref（保持 RAW 口径），GUI 可再打开。
     if NN_TYPE == 'dnn':
         cur_enable_mask |= (RPI_FILTER_EN_VEL | RPI_FILTER_EN_REF)
 
@@ -1200,6 +1358,18 @@ def main():
         cur_enable_mask |= RPI_FILTER_EN_TORQUE
     else:
         cur_enable_mask &= ~RPI_FILTER_EN_TORQUE
+
+    # PF-IMU: apply startup input filters so behavior matches default runtime state
+    # even before the first GUI cfg passthrough packet arrives.
+    if NN_TYPE == 'pf_imu':
+        apply_runtime_filter_to_pf_imu(
+            dnn,
+            cur_filter_type_code,
+            cur_cutoff_hz,
+            cur_filter_order,
+            bool(cur_enable_mask & RPI_FILTER_EN_VEL),
+            bool(cur_enable_mask & RPI_FILTER_EN_REF),
+        )
 
     print(f"\n[启动] NN_TYPE={NN_TYPE}, kp={kp}, kd={kd}")
     print(f"[启动] 串口={SER_DEV}, 波特率={BAUDRATE}")
@@ -1297,6 +1467,11 @@ def main():
                     apply_runtime_filter_to_dnn(
                         dnn, cfg['filter_code'], cfg['cutoff_hz'], cfg['filter_order'],
                         cfg['enable_vel'], cfg['enable_ref'], cfg['enable_torque'],
+                    )
+                elif NN_TYPE == 'pf_imu':
+                    apply_runtime_filter_to_pf_imu(
+                        dnn, cfg['filter_code'], cfg['cutoff_hz'], cfg['filter_order'],
+                        cfg['enable_vel'], cfg['enable_ref'],
                     )
                 else:
                     apply_runtime_filter_to_lstm(
@@ -1704,6 +1879,16 @@ def main():
                 'auto_best_delay_ms_R': f'{auto_best_delay_ms_R:.3f}',
                 'auto_window_s': f'{auto_window_s:.3f}',
                 'auto_gait_freq_hz': f'{auto_gait_freq_hz:.4f}',
+                'pf_compute_ms': f'{getattr(dnn, "pf_compute_ms", 0.0):.4f}',
+                'pf_compute_p95_ms': f'{getattr(dnn, "pf_compute_p95_ms", 0.0):.4f}',
+                'pf_overrun_count': str(int(getattr(dnn, "pf_overrun_count", 0))),
+                'pf_exception_count': str(int(getattr(dnn, "pf_exception_count", 0))),
+                'pf_ess_L': f'{getattr(dnn, "pf_ess_L", 0.0):.4f}',
+                'pf_ess_R': f'{getattr(dnn, "pf_ess_R", 0.0):.4f}',
+                'pf_conf_L': f'{getattr(dnn, "pf_conf_L", 0.0):.6f}',
+                'pf_conf_R': f'{getattr(dnn, "pf_conf_R", 0.0):.6f}',
+                'pf_mode_prob_high_L': f'{getattr(dnn, "pf_mode_prob_high_L", 0.0):.6f}',
+                'pf_mode_prob_high_R': f'{getattr(dnn, "pf_mode_prob_high_R", 0.0):.6f}',
                 'tag': tag_to_log,
             }
 
@@ -1715,10 +1900,18 @@ def main():
             # ---- 控制台输出 ----
             _zm_txt = (f' | zmL:{pd_zm_bias_L:6.2f} | zmR:{pd_zm_bias_R:6.2f}'
                        if pd_zm_enabled else '')
+            _pf_txt = ''
+            if NN_TYPE == 'pf_imu':
+                _pf_txt = (
+                    f' | pf:{getattr(dnn, "pf_compute_ms", 0.0):5.2f}ms'
+                    f' p95:{getattr(dnn, "pf_compute_p95_ms", 0.0):5.2f}'
+                    f' essL:{getattr(dnn, "pf_ess_L", 0.0):6.1f}'
+                    f' essR:{getattr(dnn, "pf_ess_R", 0.0):6.1f}'
+                )
             print(f'| time:{now:6.2f}s | Lθ:{Lpos:7.2f}° | Rθ:{Rpos:7.2f}° | '
                   f'Lω:{Lvel:7.2f} | Rω:{Rvel:7.2f} | '
                   f'τL:{L_cmd_final:6.2f} | τR:{R_cmd_final:6.2f} | scale:{runtime_scale:4.2f} | '
-                  f'Rp:{R_p:6.2f} | Rd:{R_d:6.2f}{_zm_txt} ')
+                  f'Rp:{R_p:6.2f} | Rd:{R_d:6.2f}{_zm_txt}{_pf_txt} ')
 
 
 if __name__ == '__main__':

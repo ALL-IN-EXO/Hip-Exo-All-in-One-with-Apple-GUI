@@ -5,8 +5,11 @@
 #   ./run.sh dnn            # run directly with given nn
 #   ./run.sh lstm_leg_dcp
 #   ./run.sh lstm_pd
+#   ./run.sh pf_imu
+#   ./run.sh myoassist_1966080
+#   ./run.sh myoassist_2293760
 
-NN_CHOICES=("dnn" "lstm" "lstm_leg_dcp" "lstm_pd")
+NN_CHOICES=("dnn" "lstm" "lstm_leg_dcp" "lstm_pd" "pf_imu" "myoassist_1966080" "myoassist_2293760")
 
 pick_nn() {
     echo "请选择神经网络类型 (Select neural network type):"

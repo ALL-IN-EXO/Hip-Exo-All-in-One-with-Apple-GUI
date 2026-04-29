@@ -29,7 +29,9 @@ RPi_Unified/
 │   ├── dnn.py                    # DNN class
 │   ├── lstm_network.py           # LSTMNetwork class
 │   ├── lstm_leg_dcp.py           # LSTMNetworkLegDcp class
-│   └── lstm_pd.py                # LSTMNetworkPD class (PD位置误差控制)
+│   ├── lstm_pd.py                # LSTMNetworkPD class (PD位置误差控制)
+│   ├── pf_imu.py                 # PFIMUController class (PF-IMU)
+│   └── myoassist.py              # MyoAssistController class (NJIT ZIP)
 └── output/                       # 运行时 CSV 日志输出
 ```
 
@@ -48,7 +50,7 @@ sudo apt install -y python3 python3-venv python3-pip tmux rsync
 ```
 
 说明：
-- `tmux`：**必需**。GUI 的 `Start LegDcp / Start LSTM-PD / Stop Pi RL` 依赖 `tmux` 托管进程。
+- `tmux`：**必需**。GUI 的 `Start LegDcp / Start LSTM-PD / Start PF-IMU / Start Myo-* / Stop Pi RL` 依赖 `tmux` 托管进程。
 - `rsync`：建议安装。用于本地工具脚本下发代码/回传数据。
 
 ### 2) 打开串口硬件 UART（`/dev/ttyAMA0`）
@@ -118,6 +120,12 @@ cd RPi_Unified
 python RL_controller_torch.py --nn lstm_leg_dcp
 # 或
 python RL_controller_torch.py --nn lstm_pd
+# 或
+python RL_controller_torch.py --nn pf_imu
+# 或
+python RL_controller_torch.py --nn myoassist_1966080
+# 或
+python RL_controller_torch.py --nn myoassist_2293760
 ```
 
 也可用项目自带脚本：
@@ -135,11 +143,13 @@ cd RPi_Unified
 source ~/venvs/pytorch-env/bin/activate
 cd RPi_Unified
 python RL_controller_torch.py
+# 指定算法
+python RL_controller_torch.py --nn pf_imu
 ```
 
 ### GUI 远程启动依赖（Pi 端）
 
-如果使用 GUI 里的 `Start LegDcp / Start LSTM-PD / Stop Pi RL` 远程按钮，
+如果使用 GUI 里的 `Start LegDcp / Start LSTM-PD / Start PF-IMU / Start Myo-* / Stop Pi RL` 远程按钮，
 Pi 端需要安装 `tmux`（GUI 通过 `tmux` 托管 RL 进程）：
 
 ```bash
@@ -238,6 +248,42 @@ python tools/rpi_output_viewer.py ./output/PI5_dnn-20260320-191126.csv
 python tools/rpi_output_viewer.py --torque-source filtered
 ```
 
+---
+
+## 在 Pi 上新增算法时，如何让 GUI 识别并一键启动
+
+下面是标准流程（不改 Teensy Serial8 协议）：
+
+1) 在 `RL_controller_torch.py` 注册新 `--nn` 选项。
+2) 在 `load_network()` 增加算法分支，保证对象暴露以下兼容字段：
+   - `hip_torque_L`, `hip_torque_R`
+   - `filtered_hip_torque_L`, `filtered_hip_torque_R`
+   - `L_p`, `L_d`, `R_p`, `R_d`
+   - `generate_assistance(Lpos,Rpos,Lvel,Rvel)`
+3) 在 `NN_TYPE_CODE` 加一个新编码（1 byte，协议长度不变）。
+4) GUI 侧同步修改（`GUI_RL_update/GUI.py`）：
+   - `_update_rl_panel_for_nn_type()` 增加名称映射（`RPi: <AlgoName>`）
+   - RL 远程启动行新增按钮（`Start <AlgoName>`）
+   - `_on_pi_rl_start_clicked()` 允许该 `nn_type`
+   - `_set_pi_rl_remote_buttons_enabled()` 把新按钮纳入统一 enable/disable
+5) 远程启动走同一命令模板：
+   - `python RL_controller_torch.py --nn <new_type>`
+   - 不需要改 Teensy `AA59/AA56` 包格式
+
+### 默认 GUI 参数建议（无显式算法内 delay 时）
+
+- `RL Scale (L/R)`：`1.00`
+- `Torque Delay (ms)`：`0`（MyoAssist / PF-IMU）
+- `Filter Before Torque`：`Butterworth 5Hz, order=2, Torque ON`
+
+说明：这只是 GUI/RPi 运行时统一链路参数，算法内部是否有自己的相位逻辑由算法实现决定。
+
+### 快捷启动（GUI）
+
+新增算法后，建议同时提供：
+- RPi 端 `run.sh` 选项（便于 SSH 手动调试）
+- GUI 端 `Start <AlgoName>` 按钮（便于实验流程标准化）
+
 依赖:
 
 ```bash
@@ -255,6 +301,9 @@ python RL_controller_torch.py --nn dnn             # DNN前馈网络 (默认)
 python RL_controller_torch.py --nn lstm             # LSTM网络
 python RL_controller_torch.py --nn lstm_leg_dcp     # LSTM每腿独立解耦
 python RL_controller_torch.py --nn lstm_pd          # LSTM PD位置误差控制
+python RL_controller_torch.py --nn pf_imu           # PF-IMU 控制器
+python RL_controller_torch.py --nn myoassist_1966080  # NJIT MyoAssist ckpt 1966080
+python RL_controller_torch.py --nn myoassist_2293760  # NJIT MyoAssist ckpt 2293760
 python RL_controller_torch.py --nn lstm_pd --tag outdoor_walk  # 自定义日志标签
 ```
 
@@ -272,6 +321,30 @@ kp/kd 和模型路径在 `RL_controller_torch.py` 顶部配置区修改。
 | **滤波器** | 5个接口 (input_pos, input_vel, vel, ref, torque) | 仅 exo_filter (torque前) | 仅 exo_filter (torque前) | 仅 exo_filter (torque前) |
 | **torque 计算** | `((qHr*0.1 - qTd)*50 - dqTd_filtered*14.142)*0.008` | `0.1*action*kp + dqTd*kd` | `0.2*action*kp + dqTd*kd` | `(action-qTd)*kp - dqTd*kd` |
 | **kp/kd 推荐值** | kp=50, kd=14.142 | kp=50, kd≈3.536 | kp=50, kd≈3.536 | kp=50, kd≈3.536 |
+
+---
+
+## NJIT MyoAssist 模型文件放置
+
+当前接入的两个 checkpoint：
+
+- `model_1966080.zip`
+- `model_2293760.zip`
+
+推荐放置路径（Pi 与本地一致）：
+
+```text
+RPi_Unified/models/njit/model_1966080.zip
+RPi_Unified/models/njit/model_2293760.zip
+```
+
+若该路径不存在，`RL_controller_torch.py` 还会尝试从：
+
+```text
+Algorithm Reference/NJIT Reference/
+```
+
+自动查找同名 ZIP。
 
 ---
 
