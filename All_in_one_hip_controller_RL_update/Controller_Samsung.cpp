@@ -4,6 +4,7 @@
 Controller_Samsung::Controller_Samsung() {
   kappa_         = 3.0f;
   base_delay_ms_ = 250.0f;
+  legacy_internal_lpf_ = false;
   reset();
 }
 
@@ -21,6 +22,8 @@ void Controller_Samsung::parse_params(const BleDownlinkData& dl) {
   base_delay_ms_ = (float)dl.sam_delay_ms;
   if (base_delay_ms_ < 0.0f)    base_delay_ms_ = 0.0f;
   if (base_delay_ms_ > 1500.0f) base_delay_ms_ = 1500.0f;
+  // bit3: Samsung legacy 内部 LPF 占位开关（当前仅用于链路覆盖/GUI灰态控制）
+  legacy_internal_lpf_ = (dl.eg_legacy_flags & 0x08) != 0;
 
   // 更新 auto delay 配置；rising edge 自动冷启动
   ado_.set_config(dl.auto_delay_enable, base_delay_ms_);

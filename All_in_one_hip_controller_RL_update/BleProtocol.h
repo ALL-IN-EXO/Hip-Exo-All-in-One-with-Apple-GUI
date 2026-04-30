@@ -78,14 +78,21 @@
  *              bit1: motor_reinit
  *              bit2-3: dir_bits (L,R)
  * [3..4]     max_torque_cfg int16  最大扭矩×100
- * [31..32]   filter_fc_hz        int16  统一滤波截止频率×100 (Hz, 角度/速度/力矩三通道共用)
- * --- 预留/扩展通用参数 [98] ---
- * [98]       filter_flags        uint8  bit0=角度滤波, bit1=速度滤波, bit2=力矩滤波, bit3=类型(0=LPF,1=Butter)
- * [31..32]   torque_filter_fc_hz int16  统一电机前滤波截止频率×100 (Hz, all algos)
- * [33]       eg_legacy_flags uint8      EG legacy A/B 位标志:
+ * [31..32]   input_filter_fc_hz    int16  输入滤波 Butterworth 截止频率×100 (Hz)
+ * [34..35]   torque_filter_fc_hz   int16  力矩前滤波 Butterworth 截止频率×100 (Hz)
+ * [33]       legacy_flags          uint8  Legacy 位标志:
  *              bit0: legacy_delay_scaling (f>0.7 才缩短 + min5 samples)
  *              bit1: legacy_gate_use_x_prev (gate 输入用 x_prev)
  *              bit2: legacy_internal_lpf (算法内部一阶 LPF 0.85/0.15)
+ *              bit3: samsung_legacy_internal_lpf (预留占位开关)
+ * --- 预留/扩展通用参数 [98] ---
+ * [98]       filter_flags          uint8
+ *              bit0: 输入滤波使能 (角度+速度一起)
+ *              bit1: 力矩前滤波使能
+ *              bit2: 输入滤波类型 (0=LPF(alpha), 1=Butterworth(fc))
+ *              bit3: 力矩前滤波类型 (0=LPF(alpha), 1=Butterworth(fc))
+ * [99..100]  input_filter_alpha    int16  输入滤波 LPF alpha×1000
+ * [101..102] torque_filter_alpha   int16  力矩前滤波 LPF alpha×1000
  * --- 算法专用参数区 [5..57] (53 bytes) ---
  *   EG 参数 (algo=0):
  *     [5..6]   Rescaling_gain ×100    int16
@@ -294,10 +301,12 @@ struct BleDownlinkData {
   bool     motor_reinit;    // ctrl_flags bit1
   uint8_t  dir_bits;        // ctrl_flags bit2-3
   float    max_torque_cfg;  // [3..4] / 100
-  float    filter_fc_hz;        // [31..32] /100 (统一滤波截止频率)
-  uint8_t  filter_flags;       // [98] bit0=ang bit1=vel bit2=tau bit3=type
-  float    torque_filter_fc_hz; // [31..32] /100 (统一电机前滤波截止频率)
-  uint8_t  eg_legacy_flags; // [33]
+  float    filter_fc_hz;          // [31..32] /100 (输入滤波 Butterworth 截止频率)
+  float    torque_filter_fc_hz;   // [34..35] /100 (力矩前滤波 Butterworth 截止频率)
+  float    input_filter_alpha;    // [99..100] /1000 (输入滤波 LPF alpha)
+  float    torque_filter_alpha;   // [101..102] /1000 (力矩前滤波 LPF alpha)
+  uint8_t  filter_flags;          // [98] bit0=input_en bit1=torque_en bit2=input_butter bit3=torque_butter
+  uint8_t  eg_legacy_flags;       // [33] (含 Samsung legacy 占位 bit3)
 
   // EG 参数
   float Rescaling_gain;     // [5..6]
@@ -356,9 +365,13 @@ static inline BleDownlinkData ble_parse_downlink(const uint8_t* payload) {
   d.max_torque_cfg = ble_rd_i16(payload, 3) / 100.0f;
   d.filter_fc_hz = ble_rd_i16(payload, 31) / 100.0f;
   if (!(d.filter_fc_hz > 0.0f)) d.filter_fc_hz = 5.0f;
+  d.torque_filter_fc_hz = ble_rd_i16(payload, 34) / 100.0f;
+  if (!(d.torque_filter_fc_hz > 0.0f)) d.torque_filter_fc_hz = d.filter_fc_hz;
   d.filter_flags = payload[98];
-  d.torque_filter_fc_hz = ble_rd_i16(payload, 31) / 100.0f;
-  if (!(d.torque_filter_fc_hz > 0.0f)) d.torque_filter_fc_hz = 5.0f;
+  d.input_filter_alpha = ble_rd_i16(payload, 99) / 1000.0f;
+  if (d.input_filter_alpha <= 0.0f || d.input_filter_alpha > 1.0f) d.input_filter_alpha = 0.20f;
+  d.torque_filter_alpha = ble_rd_i16(payload, 101) / 1000.0f;
+  if (d.torque_filter_alpha <= 0.0f || d.torque_filter_alpha > 1.0f) d.torque_filter_alpha = 0.20f;
   d.eg_legacy_flags = payload[33];
 
   // 根据算法类型解析参数区 [5..57]

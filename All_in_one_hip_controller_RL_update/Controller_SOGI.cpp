@@ -93,8 +93,10 @@ void Controller_SOGI::parse_params(const BleDownlinkData& dl) {
 
   // 全局速度滤波参数（无论 has_ext_sogi_params 都更新）
   filter_fc_hz_  = dl.filter_fc_hz > 0.0f ? dl.filter_fc_hz : 5.0f;
-  filter_vel_on_ = (dl.filter_flags & 0x02) != 0;  // bit1 = 速度滤波
-  filter_butter_ = (dl.filter_flags & 0x08) != 0;
+  // 新版 filter_flags:
+  // bit0=input_filter_enable, bit2=input_filter_type_butter
+  filter_vel_on_ = (dl.filter_flags & 0x01) != 0;
+  filter_butter_ = (dl.filter_flags & 0x04) != 0;
 
   if (!has_ext_sogi_params) {
     amp_on_ = SOGI_AMP_ON_DEFAULT;

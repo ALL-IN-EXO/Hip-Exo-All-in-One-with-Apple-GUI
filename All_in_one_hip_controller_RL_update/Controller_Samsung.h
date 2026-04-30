@@ -32,6 +32,7 @@ public:
 
   // 填充 BLE 上行 RPi 透传槽（40B v3 格式）
   void fill_ble_status(uint8_t* buf40) const;
+  bool legacy_internal_lpf_enabled() const { return legacy_internal_lpf_; }
 
   // 供 .ino 读取当前生效 delay（auto on: 取优化值; auto off: 取 GUI 值）
   float get_delay_ms_L() const { return ado_.delay_ms_L; }
@@ -42,6 +43,7 @@ public:
 private:
   float   kappa_;
   float   base_delay_ms_;  // GUI 下发的基础 delay
+  bool    legacy_internal_lpf_;  // 占位开关：后续用于复现 Samsung legacy 内部 LPF
 
   float delay_buf_[SAM_DELAY_BUF];
   int   buf_idx_;
