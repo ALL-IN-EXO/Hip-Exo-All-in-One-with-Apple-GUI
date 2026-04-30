@@ -116,11 +116,16 @@ double RLTx_filtered = 0;
 
 float  gait_freq = 0;
 float  max_torque_cfg = 0.0f;
-float  filter_fc_hz       = 5.0f;   // 统一滤波截止频率 (Hz)，三通道共用
-bool   filter_enable_ang  = false;
-bool   filter_enable_vel  = false;
-bool   filter_enable_tau  = true;   // 力矩滤波默认开启
-bool   filter_type_butter = true;   // true=Butterworth, false=1st-order LPF
+// Teensy 输入滤波（角度+速度，计算链路前置）
+float  input_filter_fc_hz      = 5.0f;
+float  input_filter_alpha      = 0.20f;
+bool   input_filter_enable     = false;
+bool   input_filter_butter     = true;   // true=Butterworth(fc), false=LPF(alpha)
+// Teensy 力矩前滤波（电机前统一滤波）
+float  torque_filter_fc_hz     = 5.0f;
+float  torque_filter_alpha     = 0.20f;
+bool   torque_filter_enable    = true;
+bool   torque_filter_butter    = true;   // true=Butterworth(fc), false=LPF(alpha)
 static uint8_t gait_inited = 0;
 
 // === 统一信号滤波器：支持 1st-order LPF 和 2nd-order Butterworth ===
@@ -130,32 +135,34 @@ struct SignalFilter {
   float b0=1,b1=0,b2=0, a1=0,a2=0;
   float x1=0,x2=0, y1=0,y2=0;
   // 1st-order 状态
-  float fo_alpha=0, fo_y=0;
+  float fo_alpha=0.2f, fo_y=0;
 
-  void setup(float fc_hz, float fs_hz, bool butterworth) {
-    butter_mode = butterworth;
+  void setup_butter(float fc_hz, float fs_hz) {
+    butter_mode = true;
     reset();
     if (!(fc_hz > 0.0f)) return;
     float nyq = 0.5f * fs_hz;
     if (fc_hz < 0.3f)         fc_hz = 0.3f;
     if (fc_hz > nyq - 0.5f)   fc_hz = nyq - 0.5f;
-    if (butterworth) {
-      const float q     = 0.70710678f;
-      const float omega = 2.0f * PI * fc_hz / fs_hz;
-      const float sn    = sinf(omega);
-      const float cs    = cosf(omega);
-      const float alpha = sn / (2.0f * q);
-      const float aa0   = 1.0f + alpha;
-      b0 = (1.0f - cs) * 0.5f / aa0;
-      b1 = (1.0f - cs)        / aa0;
-      b2 = (1.0f - cs) * 0.5f / aa0;
-      a1 = -2.0f * cs          / aa0;
-      a2 = (1.0f - alpha)     / aa0;
-    } else {
-      float dt = 1.0f / fs_hz;
-      float wc = 2.0f * PI * fc_hz;
-      fo_alpha = wc * dt / (1.0f + wc * dt);
-    }
+    const float q     = 0.70710678f;
+    const float omega = 2.0f * PI * fc_hz / fs_hz;
+    const float sn    = sinf(omega);
+    const float cs    = cosf(omega);
+    const float alpha = sn / (2.0f * q);
+    const float aa0   = 1.0f + alpha;
+    b0 = (1.0f - cs) * 0.5f / aa0;
+    b1 = (1.0f - cs)        / aa0;
+    b2 = (1.0f - cs) * 0.5f / aa0;
+    a1 = -2.0f * cs          / aa0;
+    a2 = (1.0f - alpha)     / aa0;
+  }
+
+  void setup_lpf_alpha(float alpha) {
+    butter_mode = false;
+    reset();
+    if (!(alpha > 0.0f)) alpha = 0.01f;
+    if (alpha > 1.0f) alpha = 1.0f;
+    fo_alpha = alpha;
   }
 
   float process(float x) {
@@ -175,8 +182,12 @@ struct SignalFilter {
 static SignalFilter ang_filt_L, ang_filt_R;
 static SignalFilter vel_filt_L, vel_filt_R;
 static SignalFilter tau_filt_L, tau_filt_R;
-static float filter_fc_prev       = -1.0f;
-static bool  filter_type_prev     = true;
+static float input_filter_fc_prev      = -1.0f;
+static float input_filter_alpha_prev   = -1.0f;
+static bool  input_filter_type_prev    = true;
+static float torque_filter_fc_prev     = -1.0f;
+static float torque_filter_alpha_prev  = -1.0f;
+static bool  torque_filter_type_prev   = true;
 
 // RPi 透传缓冲
 static uint8_t rpi_uplink_buf[40] = {0};
@@ -206,24 +217,52 @@ static inline float clampf(float x, float lo, float hi) {
   return x;
 }
 
-static void update_filters_if_needed() {
-  bool changed = (fabsf(filter_fc_hz - filter_fc_prev) > 1e-3f) ||
-                 (filter_type_butter != filter_type_prev);
+static void update_input_filters_if_needed() {
+  bool changed = (fabsf(input_filter_fc_hz - input_filter_fc_prev) > 1e-3f) ||
+                 (fabsf(input_filter_alpha - input_filter_alpha_prev) > 1e-3f) ||
+                 (input_filter_butter != input_filter_type_prev);
   if (!changed) return;
-  filter_fc_prev   = filter_fc_hz;
-  filter_type_prev = filter_type_butter;
+  input_filter_fc_prev = input_filter_fc_hz;
+  input_filter_alpha_prev = input_filter_alpha;
+  input_filter_type_prev = input_filter_butter;
   const float fs = 100.0f;
-  ang_filt_L.setup(filter_fc_hz, fs, filter_type_butter);
-  ang_filt_R.setup(filter_fc_hz, fs, filter_type_butter);
-  vel_filt_L.setup(filter_fc_hz, fs, filter_type_butter);
-  vel_filt_R.setup(filter_fc_hz, fs, filter_type_butter);
-  tau_filt_L.setup(filter_fc_hz, fs, filter_type_butter);
-  tau_filt_R.setup(filter_fc_hz, fs, filter_type_butter);
+  if (input_filter_butter) {
+    ang_filt_L.setup_butter(input_filter_fc_hz, fs);
+    ang_filt_R.setup_butter(input_filter_fc_hz, fs);
+    vel_filt_L.setup_butter(input_filter_fc_hz, fs);
+    vel_filt_R.setup_butter(input_filter_fc_hz, fs);
+  } else {
+    ang_filt_L.setup_lpf_alpha(input_filter_alpha);
+    ang_filt_R.setup_lpf_alpha(input_filter_alpha);
+    vel_filt_L.setup_lpf_alpha(input_filter_alpha);
+    vel_filt_R.setup_lpf_alpha(input_filter_alpha);
+  }
 }
 
-static void reset_filter_states() {
+static void update_torque_filter_if_needed() {
+  bool changed = (fabsf(torque_filter_fc_hz - torque_filter_fc_prev) > 1e-3f) ||
+                 (fabsf(torque_filter_alpha - torque_filter_alpha_prev) > 1e-3f) ||
+                 (torque_filter_butter != torque_filter_type_prev);
+  if (!changed) return;
+  torque_filter_fc_prev = torque_filter_fc_hz;
+  torque_filter_alpha_prev = torque_filter_alpha;
+  torque_filter_type_prev = torque_filter_butter;
+  const float fs = 100.0f;
+  if (torque_filter_butter) {
+    tau_filt_L.setup_butter(torque_filter_fc_hz, fs);
+    tau_filt_R.setup_butter(torque_filter_fc_hz, fs);
+  } else {
+    tau_filt_L.setup_lpf_alpha(torque_filter_alpha);
+    tau_filt_R.setup_lpf_alpha(torque_filter_alpha);
+  }
+}
+
+static void reset_input_filter_states() {
   ang_filt_L.reset(); ang_filt_R.reset();
   vel_filt_L.reset(); vel_filt_R.reset();
+}
+
+static void reset_torque_filter_state() {
   tau_filt_L.reset(); tau_filt_R.reset();
 }
 
@@ -285,7 +324,8 @@ void switch_motor_brand(uint8_t new_brand) {
 
   M1_torque_command = 0.0f;
   M2_torque_command = 0.0f;
-  reset_filter_states();
+  reset_input_filter_states();
+  reset_torque_filter_state();
 
   current_brand = new_brand;
   Serial.printf("[MOTOR] Switch done. Brand=%s\n", motor_L->brand_name());
@@ -312,7 +352,8 @@ void switch_algorithm(uint8_t new_algo) {
   motor_R->stop();
   M1_torque_command = 0.0f;
   M2_torque_command = 0.0f;
-  reset_filter_states();
+  reset_input_filter_states();
+  reset_torque_filter_state();
 
   Serial.printf("[ALGO] Switching from %s to %s\n",
     active_ctrl->name(), new_ctrl->name());
@@ -363,6 +404,7 @@ void setup() {
     logger.println(F(
       "Time_ms,teensy_t_cs_u16,teensy_t_s_unwrapped,"
       "imu_LTx,imu_RTx,imu_Lvel,imu_Rvel,"
+      "filt_LTx,filt_RTx,filt_Lvel,filt_Rvel,"
       "gait_freq_Hz,gait_period_ms,"
       "L_command_actuator,R_command_actuator,L_torque_meas,R_torque_meas,"
       "L_pwr_W,R_pwr_W,brand,algo,L_pos_deg,R_pos_deg,tag"
@@ -373,8 +415,10 @@ void setup() {
     Serial.println(F("SD card init or file create failed!"));
   }
 
-  update_filters_if_needed();
-  reset_filter_states();
+  update_input_filters_if_needed();
+  update_torque_filter_if_needed();
+  reset_input_filter_states();
+  reset_torque_filter_state();
 
   Serial.printf("[OK] Algorithm: %s\n", active_ctrl->name());
   t_0 = micros();
@@ -404,7 +448,8 @@ void loop() {
     motor_R->init();
     M1_torque_command = 0.0f;
     M2_torque_command = 0.0f;
-    reset_filter_states();
+    reset_input_filter_states();
+    reset_torque_filter_state();
     Serial.println("[MOTOR] Reinitialization done");
   }
 
@@ -447,23 +492,46 @@ void loop() {
     // 2) BLE 下发
     Receive_ble_Data();
 
-    // 3) IMU 滤波
+    // 3) 输入滤波路径选择（RL / EG legacy / Samsung legacy 使用原始输入）
+    const bool bypass_input_filter =
+      (active_algo_id == ALGO_RL) ||
+      (active_algo_id == ALGO_EG && ctrl_eg.legacy_internal_lpf_enabled()) ||
+      (active_algo_id == ALGO_SAMSUNG && ctrl_samsung.legacy_internal_lpf_enabled());
+    const bool use_input_filter = input_filter_enable && !bypass_input_filter;
+    static bool prev_use_input_filter = false;
+    if (use_input_filter != prev_use_input_filter) {
+      reset_input_filter_states();
+      prev_use_input_filter = use_input_filter;
+    }
+    update_input_filters_if_needed();
+
+    float LTx_in = imu.LTx;
+    float RTx_in = imu.RTx;
+    float Lvel_in = imu.LTAVx;
+    float Rvel_in = imu.RTAVx;
+    if (use_input_filter) {
+      LTx_in  = ang_filt_L.process(LTx_in);
+      RTx_in  = ang_filt_R.process(RTx_in);
+      Lvel_in = vel_filt_L.process(Lvel_in);
+      Rvel_in = vel_filt_R.process(Rvel_in);
+    }
+
+    // 4) IMU 角度平滑（固定 0.9/0.1，用于 gait freq）
     LTx_filtered_last = LTx_filtered;
-    LTx_filtered      = 0.9f * LTx_filtered_last + 0.1f * imu.LTx;
+    LTx_filtered      = 0.9f * LTx_filtered_last + 0.1f * LTx_in;
     RTx_filtered_last = RTx_filtered;
-    RTx_filtered      = 0.9f * RTx_filtered_last + 0.1f * imu.RTx;
+    RTx_filtered      = 0.9f * RTx_filtered_last + 0.1f * RTx_in;
     RLTx_filtered     = RTx_filtered - LTx_filtered;
 
-    // 4) 步态频率估计
+    // 5) 步态频率估计
     gait_freq = estimateFreqFromRLTx(RLTx_filtered, current_time);
 
-    // 5) 填充算法输入（角度/速度可选滤波；功率计算始终用原始值）
-    update_filters_if_needed();
+    // 6) 填充算法输入
     CtrlInput cin;
-    cin.LTx   = filter_enable_ang ? ang_filt_L.process(imu.LTx)   : imu.LTx;
-    cin.RTx   = filter_enable_ang ? ang_filt_R.process(imu.RTx)   : imu.RTx;
-    cin.LTAVx = filter_enable_vel ? vel_filt_L.process(imu.LTAVx) : imu.LTAVx;
-    cin.RTAVx = filter_enable_vel ? vel_filt_R.process(imu.RTAVx) : imu.RTAVx;
+    cin.LTx   = LTx_in;
+    cin.RTx   = RTx_in;
+    cin.LTAVx = Lvel_in;
+    cin.RTAVx = Rvel_in;
     cin.LTx_filtered      = LTx_filtered;
     cin.RTx_filtered      = RTx_filtered;
     cin.LTx_filtered_last = LTx_filtered_last;
@@ -476,7 +544,7 @@ void loop() {
     cin.r_ctl_dir    = r_ctl_dir;
     cin.current_time_us = current_time;
 
-    // 6) 算法计算
+    // 7) 算法计算
     CtrlOutput cout;
     cout.tau_L = 0.0f;
     cout.tau_R = 0.0f;
@@ -499,19 +567,21 @@ void loop() {
     cout.tau_R *= (cin.r_ctl_dir >= 0) ? 1.0f : -1.0f;
 
     // 统一电机前滤波（仅 Teensy-native 算法；RL 路径保持 Pi→Teensy→Motor 透明）
+    // 说明：EG/Samsung legacy internal LPF 只覆盖“输入滤波”阶段，不覆盖最终 torque prefilter。
     bool use_unified_prefilter = (active_algo_id != ALGO_RL);
-    if (active_algo_id == ALGO_EG && ctrl_eg.legacy_internal_lpf_enabled()) {
-      // Legacy EG 内部已经包含 0.85/0.15 LPF，为避免双滤波，这里旁路统一滤波。
-      use_unified_prefilter = false;
-    }
     static bool prev_use_unified_prefilter = true;
+    static bool prev_torque_filter_enable = true;
     if (use_unified_prefilter != prev_use_unified_prefilter) {
       // 切换滤波路径时清一次状态，避免旁路/恢复瞬间的滤波尾迹。
       reset_filter_states();
       prev_use_unified_prefilter = use_unified_prefilter;
     }
-    if (use_unified_prefilter) {
-      update_filters_if_needed();
+    if (torque_filter_enable != prev_torque_filter_enable) {
+      reset_torque_filter_state();
+      prev_torque_filter_enable = torque_filter_enable;
+    }
+    if (use_unified_prefilter && torque_filter_enable) {
+      update_torque_filter_if_needed();
       if (!imu_init_ok && active_algo_id != ALGO_TEST) {
         tau_filt_L.reset(); tau_filt_R.reset();
         cout.tau_L = 0.0f;
@@ -546,8 +616,9 @@ void loop() {
       float L_torque_meas = motor_L->get_torque_meas();
       float R_torque_meas = motor_R->get_torque_meas();
       float gait_period_ms = (gait_freq > 0.01f) ? (1000.0f / gait_freq) : 0.0f;
-      float L_pwr_w = L_torque_meas * imu.LTAVx * (PI / 180.0f);
-      float R_pwr_w = R_torque_meas * imu.RTAVx * (PI / 180.0f);
+      // Physical-power logging uses commanded torque estimate (same as BLE telem phys_pwr).
+      float L_pwr_w = M2_torque_command * imu.LTAVx * (PI / 180.0f);
+      float R_pwr_w = M1_torque_command * imu.RTAVx * (PI / 180.0f);
 
       logger.print(current_time / 1000UL); logger.print(',');
       logger.print(t_cs_u16);              logger.print(',');
@@ -556,6 +627,10 @@ void loop() {
       logger.print(imu.RTx, 4);            logger.print(',');
       logger.print(imu.LTAVx, 4);          logger.print(',');
       logger.print(imu.RTAVx, 4);          logger.print(',');
+      logger.print(LTx_in, 4);             logger.print(',');
+      logger.print(RTx_in, 4);             logger.print(',');
+      logger.print(Lvel_in, 4);            logger.print(',');
+      logger.print(Rvel_in, 4);            logger.print(',');
       logger.print(gait_freq, 4);          logger.print(',');
       logger.print(gait_period_ms, 2);     logger.print(',');
       logger.print(M2_torque_command, 4);  logger.print(',');
@@ -705,11 +780,14 @@ void Receive_ble_Data() {
 #if GUI_WRITE_ENABLE
     // 通用参数
     max_torque_cfg = clampf(dl.max_torque_cfg, 0.0f, 30.0f);
-    filter_fc_hz       = clampf(dl.filter_fc_hz, 0.3f, 49.9f);
-    filter_enable_ang  = (dl.filter_flags & 0x01) != 0;
-    filter_enable_vel  = (dl.filter_flags & 0x02) != 0;
-    filter_enable_tau  = (dl.filter_flags & 0x04) != 0;
-    filter_type_butter = (dl.filter_flags & 0x08) != 0;
+    input_filter_fc_hz   = clampf(dl.filter_fc_hz, 0.3f, 49.9f);
+    torque_filter_fc_hz  = clampf(dl.torque_filter_fc_hz, 0.3f, 49.9f);
+    input_filter_alpha   = clampf(dl.input_filter_alpha, 0.01f, 1.0f);
+    torque_filter_alpha  = clampf(dl.torque_filter_alpha, 0.01f, 1.0f);
+    input_filter_enable  = (dl.filter_flags & 0x01) != 0;
+    torque_filter_enable = (dl.filter_flags & 0x02) != 0;
+    input_filter_butter  = (dl.filter_flags & 0x04) != 0;
+    torque_filter_butter = (dl.filter_flags & 0x08) != 0;
     int prev_l_dir = l_ctl_dir;
     int prev_r_dir = r_ctl_dir;
     l_ctl_dir = (dl.dir_bits & 0x01) ? 1 : -1;
@@ -830,8 +908,10 @@ void Transmit_ble_Data() {
   const uint8_t TELE_FLAG_SYNC_VALID = 0x08;
   const uint8_t TELE_FLAG_SYNC_FROM_PI = 0x10;
 
-  float phys_pwr_L = motor_L->get_torque_meas() * imu.LTAVx * (PI / 180.0f);
-  float phys_pwr_R = motor_R->get_torque_meas() * imu.RTAVx * (PI / 180.0f);
+  // Live physical power (Teensy): always use output-command torque estimate.
+  // Left command = M2_torque_command, Right command = M1_torque_command.
+  float phys_pwr_L = M2_torque_command * imu.LTAVx * (PI / 180.0f);
+  float phys_pwr_R = M1_torque_command * imu.RTAVx * (PI / 180.0f);
 
   int16_t sync_ang_L100 = ud.L_ang100;
   int16_t sync_ang_R100 = ud.R_ang100;

@@ -695,7 +695,8 @@ class MainWindow(QWidget):
         self._last_gait_freq = None
         self._last_gait_period_ms = None
         self._signal_source_mode = "Auto"   # Auto / Raw / Sync
-        self._power_source_mode = "Auto"    # Auto / Physical / Control
+        # Canonical tokens: Auto / Physical / Control
+        self._power_source_mode = "Auto"
         self._signal_source_active = "Raw"
         self._power_source_active = "Physical"
         self._pwr_band_scale_right = 5.0
@@ -1080,59 +1081,54 @@ class MainWindow(QWidget):
         mt_row.addWidget(self.sb_max_torque_cfg)
         param_lay.addLayout(mt_row)
 
-        # === 统一信号滤波面板 ===
-        _fc_tip = ("Unified filter cutoff (Hz) for all enabled channels.\n"
-                   "LPF = 1st-order IIR; Butterworth = 2nd-order IIR.\n"
-                   "RL torque path is always transparent (unfiltered).")
+        # === Teensy 输入滤波面板 ===
+        _in_fc_tip = (
+            "Teensy input Butterworth cutoff frequency (Hz).\n"
+            "Applied to angle+velocity right after IMU read, before local algorithm calculations.\n"
+            "Bypassed in RL mode and in EG/Samsung legacy internal-LPF mode."
+        )
+        _in_alpha_tip = (
+            "Teensy input LPF alpha (0~1), y[n]=y[n-1]+alpha*(x[n]-y[n-1]).\n"
+            "Smaller alpha = smoother but larger lag; larger alpha = faster but noisier.\n"
+            "Bypassed in RL mode and in EG/Samsung legacy internal-LPF mode."
+        )
         filt_lay = QVBoxLayout()
         filt_lay.setSpacing(3)
 
-        # Row 1: cutoff spinbox + type dropdown
+        # Row 1: Input filter enable + type + parameter (single-line compact layout)
         filt_fc_row = QHBoxLayout()
-        lbl_filt_fc = QLabel("Filter (Hz)")
-        lbl_filt_fc.setToolTip(_fc_tip)
+        lbl_filt_fc = QLabel("Input Filter")
+        lbl_filt_fc.setToolTip(_in_fc_tip + "\n\n" + _in_alpha_tip)
         filt_fc_row.addWidget(lbl_filt_fc)
+        self.chk_input_filter_enable = QCheckBox("Enable")
+        self.chk_input_filter_enable.setChecked(False)
+        self.chk_input_filter_enable.setToolTip(
+            "Enable Teensy input filter on angle+velocity.\n"
+            "Bypassed in RL mode and EG/Samsung legacy internal-LPF mode."
+        )
+        self.chk_input_filter_enable.stateChanged.connect(self._tx_params)
+        filt_fc_row.addWidget(self.chk_input_filter_enable)
         filt_fc_row.addStretch(1)
-        self.sb_filter_fc = make_dspin(5.0, 0.3, 49.9, 0.1, 1, _fc_tip)
-        self.sb_filter_fc.setFixedWidth(70)
-        filt_fc_row.addWidget(self.sb_filter_fc)
         self.cmb_filter_type = QComboBox()
         self.cmb_filter_type.addItems(["LPF", "Butterworth"])
         self._setup_combo(self.cmb_filter_type)
         self.cmb_filter_type.setCurrentIndex(1)   # default Butterworth
-        self.cmb_filter_type.setFixedWidth(100)
+        self.cmb_filter_type.setFixedWidth(110)
+        self.cmb_filter_type.setToolTip("Input filter type: LPF(alpha) or Butterworth(fc).")
+        self.cmb_filter_type.currentIndexChanged.connect(self._on_input_filter_type_changed)
         filt_fc_row.addWidget(self.cmb_filter_type)
+        self.lbl_input_param = QLabel("fc (Hz)")
+        self.lbl_input_param.setToolTip(_in_fc_tip)
+        filt_fc_row.addWidget(self.lbl_input_param)
+        self.sb_filter_fc = make_dspin(5.0, 0.3, 49.9, 0.1, 1, _in_fc_tip)
+        self.sb_filter_fc.setFixedWidth(90)
+        filt_fc_row.addWidget(self.sb_filter_fc)
+        self.sb_input_filter_alpha = make_dspin(0.20, 0.01, 1.00, 0.01, 2, _in_alpha_tip)
+        self.sb_input_filter_alpha.setFixedWidth(90)
+        self.sb_input_filter_alpha.hide()
+        filt_fc_row.addWidget(self.sb_input_filter_alpha)
+        filt_fc_row.addStretch(1)
         filt_lay.addLayout(filt_fc_row)
-
-        # Row 2: per-channel enable checkboxes (sent to Teensy)
-        filt_chk_row = QHBoxLayout()
-        self.chk_filt_ang = QCheckBox("Angle")
-        self.chk_filt_ang.setToolTip("Enable Teensy-side angle filter before algorithm input.")
-        self.chk_filt_vel = QCheckBox("Velocity")
-        self.chk_filt_vel.setToolTip("Enable Teensy-side velocity filter before algorithm input.\nPower calculation always uses raw velocity.")
-        self.chk_filt_tau = QCheckBox("Torque")
-        self.chk_filt_tau.setToolTip("Enable Teensy-side torque filter before motor output (non-RL).")
-        self.chk_filt_tau.setChecked(True)
-        filt_chk_row.addWidget(QLabel("Enable:"))
-        filt_chk_row.addWidget(self.chk_filt_ang)
-        filt_chk_row.addWidget(self.chk_filt_vel)
-        filt_chk_row.addWidget(self.chk_filt_tau)
-        filt_chk_row.addStretch(1)
-        filt_lay.addLayout(filt_chk_row)
-
-        # Row 3: GUI-side plot raw/filtered (no BLE, display only)
-        plot_chk_row = QHBoxLayout()
-        self.chk_plot_raw_ang = QCheckBox("Raw Angle")
-        self.chk_plot_raw_ang.setToolTip("Plot raw (unchecked = GUI-side software filter applied for display).")
-        self.chk_plot_raw_ang.setChecked(True)
-        self.chk_plot_raw_vel = QCheckBox("Raw Velocity")
-        self.chk_plot_raw_vel.setToolTip("Plot raw velocity (unchecked = GUI-side software filter applied for display).")
-        self.chk_plot_raw_vel.setChecked(True)
-        plot_chk_row.addWidget(QLabel("Plot:"))
-        plot_chk_row.addWidget(self.chk_plot_raw_ang)
-        plot_chk_row.addWidget(self.chk_plot_raw_vel)
-        plot_chk_row.addStretch(1)
-        filt_lay.addLayout(plot_chk_row)
 
         param_lay.addLayout(filt_lay)
 
@@ -1141,20 +1137,49 @@ class MainWindow(QWidget):
         self._gui_ang_filt_R = 0.0
         self._gui_vel_filt_L = 0.0
         self._gui_vel_filt_R = 0.0
-        torque_filter_tip = (
-            "Teensy unified filter before motor torque command (non-RL algorithms).\n"
-            "Type is fixed to Butterworth IIR (2nd order).\n"
-            "RL mode keeps Pi->Teensy torque path transparent (no Teensy pre-motor filtering)."
+        torque_filter_tip_fc = (
+            "Teensy pre-motor Butterworth cutoff frequency (Hz).\n"
+            "This is the final global torque filter before motor output (non-RL algorithms)."
         )
-        tf_row = QHBoxLayout()
-        self.lbl_tf_fc = QLabel("Filter Before Torque (Hz) [Teensy-local only]")
-        self.lbl_tf_fc.setToolTip(torque_filter_tip)
-        tf_row.addWidget(self.lbl_tf_fc)
-        tf_row.addStretch(1)
-        self.sb_torque_filter_fc = make_dspin(5.0, 0.3, 20.0, 0.1, 1, torque_filter_tip)
+        torque_filter_tip_alpha = (
+            "Teensy pre-motor LPF alpha (0~1), y[n]=y[n-1]+alpha*(x[n]-y[n-1]).\n"
+            "Smaller alpha = smoother but larger lag; larger alpha = faster but noisier."
+        )
+        tf_head = QHBoxLayout()
+        self.lbl_tf_fc = QLabel("Torque Filter (Teensy)")
+        self.lbl_tf_fc.setToolTip(torque_filter_tip_fc + "\n\n" + torque_filter_tip_alpha)
+        tf_head.addWidget(self.lbl_tf_fc)
+        self.chk_torque_filter_enable = QCheckBox("Enable")
+        self.chk_torque_filter_enable.setChecked(True)
+        self.chk_torque_filter_enable.setToolTip(
+            "Enable final Teensy torque filter before motor output.\n"
+            "RL mode always bypasses Teensy pre-motor filter."
+        )
+        self.chk_torque_filter_enable.stateChanged.connect(self._tx_params)
+        tf_head.addWidget(self.chk_torque_filter_enable)
+        tf_head.addStretch(1)
+        self.cmb_torque_filter_type = QComboBox()
+        self.cmb_torque_filter_type.addItems(["LPF", "Butterworth"])
+        self._setup_combo(self.cmb_torque_filter_type)
+        self.cmb_torque_filter_type.setCurrentIndex(1)
+        self.cmb_torque_filter_type.setFixedWidth(110)
+        self.cmb_torque_filter_type.setToolTip("Torque filter type: LPF(alpha) or Butterworth(fc).")
+        self.cmb_torque_filter_type.currentIndexChanged.connect(self._on_torque_filter_type_changed)
+        tf_head.addWidget(self.cmb_torque_filter_type)
+        self.lbl_torque_param = QLabel("fc (Hz)")
+        self.lbl_torque_param.setToolTip(torque_filter_tip_fc)
+        tf_head.addWidget(self.lbl_torque_param)
+        self.sb_torque_filter_fc = make_dspin(5.0, 0.3, 49.9, 0.1, 1, torque_filter_tip_fc)
         self.sb_torque_filter_fc.setFixedWidth(90)
-        tf_row.addWidget(self.sb_torque_filter_fc)
-        param_lay.addLayout(tf_row)
+        tf_head.addWidget(self.sb_torque_filter_fc)
+        self.sb_torque_filter_alpha = make_dspin(0.20, 0.01, 1.00, 0.01, 2, torque_filter_tip_alpha)
+        self.sb_torque_filter_alpha.setFixedWidth(90)
+        self.sb_torque_filter_alpha.hide()
+        tf_head.addWidget(self.sb_torque_filter_alpha)
+        tf_head.addStretch(1)
+        param_lay.addLayout(tf_head)
+        self._on_input_filter_type_changed(self.cmb_filter_type.currentIndex())
+        self._on_torque_filter_type_changed(self.cmb_torque_filter_type.currentIndex())
 
         # Separator
         sep = QFrame(); sep.setFrameShape(QFrame.HLine)
@@ -1228,6 +1253,8 @@ class MainWindow(QWidget):
         self.chk_eg_legacy_path.setChecked(False)
         self.chk_eg_legacy_path.setToolTip(eg_tip_legacy_path)
         self.chk_eg_legacy_path.stateChanged.connect(self._tx_params)
+        self.chk_eg_legacy_path.stateChanged.connect(
+            lambda _=0: self._update_teensy_prefilter_ui_state(self._algo_select))
         self.chk_eg_auto_delay = QCheckBox("Auto Delay")
         self.chk_eg_auto_delay.setChecked(False)
         self.chk_eg_auto_delay.setToolTip(
@@ -1265,8 +1292,19 @@ class MainWindow(QWidget):
             "Samsung torque delay (ms).\n"
             "Auto Delay ON: optimized by Teensy-local AutoDelayOptimizer (L/R independent)."
         )
+        sam_legacy_tip = (
+            "Samsung legacy internal LPF placeholder switch.\n"
+            "Current stage only reserves protocol/UI bit (no internal Samsung LPF math yet).\n"
+            "When ON, Teensy input filter controls are bypassed/disabled."
+        )
         self.sb_sam_kappa = make_dspin(3.0, 0, 20, 0.1, 1, sam_kappa_tip)
         self.sb_sam_delay = make_dspin(250, 0, 1500, 10, 0, sam_delay_tip)
+        self.chk_sam_legacy_lpf = QCheckBox("Legacy Internal LPF")
+        self.chk_sam_legacy_lpf.setChecked(False)
+        self.chk_sam_legacy_lpf.setToolTip(sam_legacy_tip)
+        self.chk_sam_legacy_lpf.stateChanged.connect(self._tx_params)
+        self.chk_sam_legacy_lpf.stateChanged.connect(
+            lambda _=0: self._update_teensy_prefilter_ui_state(self._algo_select))
         self.chk_sam_auto_delay = QCheckBox("Auto Delay")
         self.chk_sam_auto_delay.setChecked(False)
         self.chk_sam_auto_delay.setToolTip(
@@ -1288,9 +1326,10 @@ class MainWindow(QWidget):
         lbl_sam_delay.setToolTip(sam_delay_tip)
         sam_grid.addWidget(lbl_sam_delay, 1, 0)
         sam_grid.addWidget(self.sb_sam_delay, 1, 1)
-        sam_grid.addWidget(self.chk_sam_auto_delay, 2, 0)
-        sam_grid.addWidget(self.btn_sam_reset, 2, 1)
-        sam_grid.addWidget(self.lbl_sam_auto_delay_state, 3, 0, 1, 2)
+        sam_grid.addWidget(self.chk_sam_legacy_lpf, 2, 0, 1, 2)
+        sam_grid.addWidget(self.chk_sam_auto_delay, 3, 0)
+        sam_grid.addWidget(self.btn_sam_reset, 3, 1)
+        sam_grid.addWidget(self.lbl_sam_auto_delay_state, 4, 0, 1, 2)
         self.algo_stack.addWidget(sam_panel)
 
         # -- RL panel --
@@ -1673,7 +1712,7 @@ class MainWindow(QWidget):
             dot.setStyleSheet(f"background:{color}; border-radius:4px; border:none;")
             row1.addWidget(dot)
             chk = QCheckBox(label)
-            chk.setChecked(True)
+            chk.setChecked(label in ("Angle", "Cmd"))
             chk.setStyleSheet(f"QCheckBox {{ color: {color}; font-weight:600; font-size:12px; }}"
                               f"QCheckBox::indicator:checked {{ background-color:{color}; border-color:{color}; }}")
             chk.stateChanged.connect(self._apply_plot_visibility)
@@ -1790,21 +1829,23 @@ class MainWindow(QWidget):
 
         lbl_pwr_src = QLabel("Power:")
         lbl_pwr_src.setStyleSheet("font-size:12px; background:transparent;")
-        lbl_pwr_src.setToolTip("Select plotted power source (Physical / Control / Auto).")
+        lbl_pwr_src.setToolTip("Select plotted power source (Physical (Teensy) / Control (Pi) / Auto).")
         row2.addWidget(lbl_pwr_src)
         self.cmb_power_source = QComboBox()
-        self.cmb_power_source.addItems(["Auto", "Physical", "Control"])
-        self.cmb_power_source.setCurrentText("Auto")
-        self.cmb_power_source.setFixedWidth(92)
+        self.cmb_power_source.addItem("Auto", "Auto")
+        self.cmb_power_source.addItem("Physical (Teensy)", "Physical")
+        self.cmb_power_source.addItem("Control (Pi)", "Control")
+        self.cmb_power_source.setCurrentIndex(0)
+        self.cmb_power_source.setFixedWidth(146)
         self.cmb_power_source.setFixedHeight(24)
         self.cmb_power_source.setToolTip(
             "Power source.\n"
-            "Auto: RL+Pi uses Control power; otherwise Physical power.\n"
-            "Physical: actuator measured torque * IMU velocity.\n"
-            "Control: control-aligned torque * control-aligned velocity."
+            "Auto: RL+Pi sync uses Control (Pi); otherwise Physical (Teensy).\n"
+            "Physical (Teensy): actuator-side physical power from Teensy telemetry.\n"
+            "Control (Pi): control-aligned power from Pi sync telemetry."
         )
         self._setup_combo(self.cmb_power_source)
-        self.cmb_power_source.currentTextChanged.connect(self._on_power_source_changed)
+        self.cmb_power_source.currentIndexChanged.connect(self._on_power_source_changed)
         row2.addWidget(self.cmb_power_source)
 
         vsep_cap = QFrame(); vsep_cap.setFrameShape(QFrame.VLine)
@@ -3288,18 +3329,85 @@ class MainWindow(QWidget):
         self.chk_rl_torque_filter.blockSignals(False)
         self._update_rl_delay_input_mode()
 
+    def _on_input_filter_type_changed(self, _index):
+        """Toggle Teensy input-filter parameter widget by filter type."""
+        is_butter = (self.cmb_filter_type.currentIndex() == 1)
+        if is_butter:
+            self.lbl_input_param.setText("fc (Hz)")
+            self.sb_filter_fc.show()
+            self.sb_input_filter_alpha.hide()
+        else:
+            self.lbl_input_param.setText("alpha")
+            self.sb_filter_fc.hide()
+            self.sb_input_filter_alpha.show()
+        self._tx_params()
+
+    def _on_torque_filter_type_changed(self, _index):
+        """Toggle Teensy torque-filter parameter widget by filter type."""
+        is_butter = (self.cmb_torque_filter_type.currentIndex() == 1)
+        if is_butter:
+            self.lbl_torque_param.setText("fc (Hz)")
+            self.sb_torque_filter_fc.show()
+            self.sb_torque_filter_alpha.hide()
+        else:
+            self.lbl_torque_param.setText("alpha")
+            self.sb_torque_filter_fc.hide()
+            self.sb_torque_filter_alpha.show()
+        self._tx_params()
+
     def _update_teensy_prefilter_ui_state(self, algo_id=None):
-        """Top-level Teensy-only pre-motor filter state (disabled while RL is active)."""
+        """Update Teensy filter UI availability by runtime path.
+
+        Rules:
+        - RL: input filter + Teensy torque prefilter disabled (Pi path governs runtime).
+        - EG legacy internal LPF ON: input filter disabled.
+        - Samsung legacy internal LPF placeholder ON: input filter disabled.
+        - Non-RL: Teensy torque prefilter enabled.
+        """
         if not hasattr(self, "sb_torque_filter_fc"):
             return
         if algo_id is None:
             algo_id = int(getattr(self, "_algo_select", ALGO_EG))
-        is_rl = (int(algo_id) == ALGO_RL)
-        self.sb_torque_filter_fc.setEnabled(not is_rl)
+        algo_id = int(algo_id)
+        is_rl = (algo_id == ALGO_RL)
+        eg_legacy = bool(getattr(self, "chk_eg_legacy_path", None) and self.chk_eg_legacy_path.isChecked())
+        sam_legacy = bool(getattr(self, "chk_sam_legacy_lpf", None) and self.chk_sam_legacy_lpf.isChecked())
+        input_locked = is_rl or (algo_id == ALGO_EG and eg_legacy) or (algo_id == ALGO_SAMSUNG and sam_legacy)
+        torque_locked = is_rl
+
+        # Input filter group
+        for w in (
+            getattr(self, "chk_input_filter_enable", None),
+            getattr(self, "cmb_filter_type", None),
+            getattr(self, "sb_filter_fc", None),
+            getattr(self, "sb_input_filter_alpha", None),
+            getattr(self, "lbl_input_param", None),
+        ):
+            if w is not None:
+                w.setEnabled(not input_locked)
+        if hasattr(self, "chk_input_filter_enable"):
+            self.chk_input_filter_enable.setToolTip(
+                "Enable Teensy input filter on angle+velocity.\n"
+                + ("Disabled: RL uses Pi path; legacy internal LPF path bypasses this stage."
+                   if input_locked else
+                   "Bypassed in RL mode and EG/Samsung legacy internal-LPF mode.")
+            )
+
+        # Torque prefilter group
+        for w in (
+            getattr(self, "chk_torque_filter_enable", None),
+            getattr(self, "cmb_torque_filter_type", None),
+            getattr(self, "sb_torque_filter_fc", None),
+            getattr(self, "sb_torque_filter_alpha", None),
+            getattr(self, "lbl_torque_param", None),
+        ):
+            if w is not None:
+                w.setEnabled(not torque_locked)
+
         if hasattr(self, "lbl_tf_fc"):
-            self.lbl_tf_fc.setText("Filter Before Torque (Hz) [Teensy-local only]")
+            self.lbl_tf_fc.setText("Torque Filter (Teensy)")
             self.lbl_tf_fc.setStyleSheet(
-                f"color:{C.text2 if not is_rl else C.separator}; background:transparent;"
+                f"color:{C.text2 if not torque_locked else C.separator}; background:transparent;"
             )
 
     def _update_rpi_offline_ui(self):
@@ -3721,8 +3829,26 @@ class MainWindow(QWidget):
     def _on_signal_source_changed(self, text):
         self._signal_source_mode = str(text or "Auto")
 
-    def _on_power_source_changed(self, text):
-        self._power_source_mode = str(text or "Auto")
+    def _on_power_source_changed(self, _value):
+        # Keep canonical mode tokens regardless of localized/display labels.
+        mode = self.cmb_power_source.currentData()
+        if mode not in ("Auto", "Physical", "Control"):
+            txt = str(self.cmb_power_source.currentText() or "")
+            if "teensy" in txt.lower() or txt.lower().startswith("physical"):
+                mode = "Physical"
+            elif "pi" in txt.lower() or txt.lower().startswith("control"):
+                mode = "Control"
+            else:
+                mode = "Auto"
+        self._power_source_mode = str(mode)
+
+    def _power_source_label(self, mode: str) -> str:
+        mode = str(mode or "")
+        if mode == "Physical":
+            return "Physical(Teensy)"
+        if mode == "Control":
+            return "Control(Pi)"
+        return mode
 
     def _resolve_live_sources(self, active_algo: int):
         signal_mode = str(self._signal_source_mode)
@@ -3744,14 +3870,14 @@ class MainWindow(QWidget):
                 signal_active = "Raw"
 
         if power_mode == "Physical":
-            power_active = "Physical" if phys_ok else ("Control" if ctrl_ok else "None")
+            power_active = "Physical" if phys_ok else ("Control" if (ctrl_ok and sync_from_pi) else "None")
         elif power_mode == "Control":
-            power_active = "Control" if ctrl_ok else ("Physical" if phys_ok else "None")
+            power_active = "Control" if (ctrl_ok and sync_from_pi) else ("Physical" if phys_ok else "None")
         else:
-            # Auto power should follow controller-synchronous power first.
-            if active_algo == ALGO_RL and ctrl_ok and sync_from_pi:
-                power_active = "Control"
-            elif ctrl_ok:
+            # Auto power:
+            # - RL + Pi sync valid: prefer Control(Pi)
+            # - otherwise: Physical(Teensy)
+            if active_algo == ALGO_RL and sync_from_pi and ctrl_ok:
                 power_active = "Control"
             elif phys_ok:
                 power_active = "Physical"
@@ -3769,14 +3895,10 @@ class MainWindow(QWidget):
             L_cmd_disp = float(self._sync_cmd_L)
             R_cmd_disp = float(self._sync_cmd_R)
         else:
-            L_angle_disp = (float(self._raw_ang_L) if self.chk_plot_raw_ang.isChecked()
-                            else float(self._gui_ang_filt_L))
-            R_angle_disp = (float(self._raw_ang_R) if self.chk_plot_raw_ang.isChecked()
-                            else float(self._gui_ang_filt_R))
-            L_vel_disp   = (float(self._raw_vel_L) if self.chk_plot_raw_vel.isChecked()
-                            else float(self._gui_vel_filt_L))
-            R_vel_disp   = (float(self._raw_vel_R) if self.chk_plot_raw_vel.isChecked()
-                            else float(self._gui_vel_filt_R))
+            L_angle_disp = float(self._raw_ang_L)
+            R_angle_disp = float(self._raw_ang_R)
+            L_vel_disp = float(self._raw_vel_L)
+            R_vel_disp = float(self._raw_vel_R)
             L_cmd_disp = float(self._raw_cmd_L)
             R_cmd_disp = float(self._raw_cmd_R)
 
@@ -3842,12 +3964,8 @@ class MainWindow(QWidget):
                 L_pwr = 0.0
             if not isfinite(R_pwr):
                 R_pwr = 0.0
-            # Keep power sign consistent with torque/cmd logical display convention.
-            # Motor L+/R+ (dir_bits) may invert actuator sign at Teensy side; GUI already
-            # compensates Cmd/Est torque by mL/mR above, so power must be compensated too.
-            # NOTE: visual VL+/VR+ must NOT affect power sign (torque-only toggle).
-            L_pwr *= float(mL)
-            R_pwr *= float(mR)
+            # IMPORTANT: Motor L+/R+ must not affect GUI power display/logging.
+            # Direction toggles are actuator-output settings only.
 
         self.L_pwr_buf.append(L_pwr)
         self.R_pwr_buf.append(R_pwr)
@@ -5829,14 +5947,35 @@ class MainWindow(QWidget):
         flags |= (self._dir_bits & 0x03) << 2
         payload[2] = flags
         put_s16(3, max(0.0, min(30.0, float(self.sb_max_torque_cfg.value()))))
-        # Unified filter cutoff [31..32] (Hz×100) + filter_flags [98]
+        # Teensy filter settings:
+        # [31..32] input Butterworth fc (Hz*100)
+        # [34..35] torque Butterworth fc (Hz*100)
+        # [98]     filter_flags: bit0=input_en, bit1=torque_en, bit2=input_butter, bit3=torque_butter
+        # [99..100] input LPF alpha (*1000)
+        # [101..102] torque LPF alpha (*1000)
         put_s16(31, float(self.sb_filter_fc.value()))
+        put_s16(34, float(self.sb_torque_filter_fc.value()))
+        put_s16(99, float(self.sb_input_filter_alpha.value()), 1000)
+        put_s16(101, float(self.sb_torque_filter_alpha.value()), 1000)
         fflags = 0
-        if self.chk_filt_ang.isChecked(): fflags |= 0x01
-        if self.chk_filt_vel.isChecked(): fflags |= 0x02
-        if self.chk_filt_tau.isChecked(): fflags |= 0x04
-        if self.cmb_filter_type.currentIndex() == 1: fflags |= 0x08  # Butterworth
+        if self.chk_input_filter_enable.isChecked():
+            fflags |= 0x01
+        if self.chk_torque_filter_enable.isChecked():
+            fflags |= 0x02
+        if self.cmb_filter_type.currentIndex() == 1:
+            fflags |= 0x04
+        if self.cmb_torque_filter_type.currentIndex() == 1:
+            fflags |= 0x08
         payload[98] = fflags & 0xFF
+        # [33] legacy flags:
+        #   bit0..2 EG legacy path composite
+        #   bit3    Samsung legacy internal LPF placeholder
+        legacy_flags = 0
+        if getattr(self, "chk_eg_legacy_path", None) and self.chk_eg_legacy_path.isChecked():
+            legacy_flags |= 0x07
+        if getattr(self, "chk_sam_legacy_lpf", None) and self.chk_sam_legacy_lpf.isChecked():
+            legacy_flags |= 0x08
+        payload[33] = legacy_flags & 0xFF
 
         algo = self._algo_select
         if algo == ALGO_EG:
@@ -5856,9 +5995,6 @@ class MainWindow(QWidget):
             # [28] auto_delay_enable bit0; [29..30] eg_post_delay_ms
             payload[28] = 0x01 if self._eg_auto_delay_enable else 0x00
             put_s16(29, float(self.sb_eg_post_delay.value()), 1)
-            # [33] legacy EG flags (bit0 delay scaling, bit1 gate uses x_prev, bit2 internal LPF)
-            if self.chk_eg_legacy_path.isChecked():
-                payload[33] = 0x07
         elif algo == ALGO_SAMSUNG:
             put_s16(5, float(self.sb_sam_kappa.value()))
             put_s16(7, float(self.sb_sam_delay.value()), 1)
@@ -6377,7 +6513,7 @@ class MainWindow(QWidget):
             f"t={t:.2f}s  gait={gait_freq:.2f}Hz(T={((1000.0 / gait_freq) if gait_freq > 0.01 else 0.0):.0f}ms)  algo={algo_name}"
             + (f"  tag='{tag_char}'" if tag_valid else "")
             + f"  vel={'IMU' if has_imu_vel else 'DER'}"
-            + f"  src={signal_active}/{power_active}")
+            + f"  src={signal_active}/{self._power_source_label(power_active)}")
 
         self._append_data_point(
             t,

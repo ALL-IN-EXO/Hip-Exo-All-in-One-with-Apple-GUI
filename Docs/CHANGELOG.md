@@ -5,8 +5,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [v5.0] - 2026-04-30
+
+
 ### Fixed
 
+- **Teensy 端 Live Power 可能全零导致 GUI `Live --` 的回归修复**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`）：
+  - `phys_pwr` 计算口径统一为“当前下发命令扭矩 × 当前速度”（不再使用 `get_torque_meas()`）
+  - Teensy SD 日志中的 `L_pwr_W/R_pwr_W` 同步为同一口径，避免 GUI Live 与本地日志定义不一致
 - **Teensy 统一滤波函数调用名修复**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`）：
   - 将主循环中的 `reset_torque_filter_state()` / `update_torque_filter_if_needed()` 调用改为已存在的 `reset_filter_states()` / `update_filters_if_needed()`
   - 修复函数未声明导致的编译失败
@@ -16,10 +22,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `ZcTracker` 结构体补回 `hold_elapsed_s` 字段（`.cpp` 的 `update_zc_tracker()` 依赖此字段）
   - 移除废弃的 `zc_fake_hold_s_` 类成员（新实现已将 hold 时间内置到 `ZcTracker` 中）
 
+- **Teensy 主循环滤波函数名不一致修复**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`）：
+  - 主循环调用统一为已定义函数：`reset_torque_filter_state()`、`update_torque_filter_if_needed()`
+  - 消除历史重构后 `reset_filter_states()/update_filters_if_needed()` 命名混用导致的编译风险
+
+- **GUI Power 源语义与方向按钮解耦修复**（`GUI_RL_update/GUI.py`, `Docs/SYSTEM_ARCHITECTURE.md`）：
+  - `Power` 下拉改为显式标注：`Physical (Teensy)` / `Control (Pi)`（内部仍用 canonical token `Physical/Control`）
+  - `Power:Auto` 逻辑收敛为：仅 `RL + sync_from_pi + ctrl_valid` 选 `Control (Pi)`；其余场景选 `Physical (Teensy)`，否则 `None`
+  - `Motor L+/R+` 不再参与 GUI power 的符号补偿；仅影响执行器下发方向，避免污染 `Power Sign` 条带、`Live/Eval` 文本与 GUI CSV 的 `L_pwr_W/R_pwr_W`
+
 ### Changed
 
-- **Teensy Max Torque 限幅调试打印**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`）：
-  - 在最终安全限幅代码块内新增串口日志 `[MAX_TORQUE]`，每个控制周期打印 `max_torque_cfg` 与 `max_abs_cmd`，用于在线核对上限配置与限幅阈值
+- **GUI 开机默认曲线显示调整**（`GUI_RL_update/GUI.py`）：
+  - 启动时仅默认勾选 `Angle` 与 `Cmd`
+  - `Est` / `Vel` / `Pwr` 默认关闭（可手动开启）
+
+- **GUI 参数区紧凑化与 Legacy 交互约束**（`GUI_RL_update/GUI.py`）：
+  - `Input Filter` 改为单行布局：`Enable + Type + (fc/alpha)`，节省纵向空间
+  - `Torque Filter (Teensy)` 改为单行布局：`Enable + Type + (fc/alpha)`，并统一标题文案
+  - 移除参数区 `Plot: Raw Angle / Raw Velocity` 两个显示切换控件（Raw 数据显示保持默认直通）
+  - Legacy 路径（EG/Samsung）激活时，`Input Filter` 继续灰显禁用，避免路径语义冲突
+
+- **RPi README 滤波链路与启动方式文档同步**（`RPi_Unified/README.md`）：
+  - 明确 `run.sh` 的交互/直启入口（`dnn/lstm_leg_dcp/lstm_pd/pf_imu/myoassist_*`）
+  - 明确 RPi 统一 torque 输出滤波默认值：`2阶 IIR Butterworth, 5Hz, ON`
+  - 明确 DNN / PF-IMU 输入滤波位置与开关，及可选滤波器类型：Butterworth / Bessel / Chebyshev II
+
+- **SYSTEM_ARCHITECTURE 数据结构补全（RPi cfg/status + power 字段来源）**（`Docs/SYSTEM_ARCHITECTURE.md`）：
+  - 更新 `§10.4` GUI→RPi 40B cfg 结构（含 `auto_flags` 与保留区）
+  - 更新 `§10.5` RPi→GUI `AA56 v3` 40B 状态结构（每腿 delay/ratio/+P/-P/best_delay）
+  - 新增 `§10.5.1`，明确 `AA56`(Eval 指标) 与 `telemetry_ext`(Physical/Control 实时功率) 的职责边界
 
 - **Teensy BLE reassembly 修复**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`）：
   - `Receive_ble_Data()` 从阻塞式 `Serial5.readBytes()` 改为非阻塞字节累积状态机（`collecting` + `payload_buf`）
@@ -47,11 +79,19 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **SOGI GUI 默认参数更新**（`GUI_RL_update/GUI.py`）：
   - `A_gain` 5→10 Nm，`phi_lead` 20→0°，`move_on` 0.15→0.00s，`move_off` 0.20→0.10s，`vel LPF` 10→6 Hz
 
-- **三通道统一信号滤波器系统**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`, `BleProtocol.h`, `GUI_RL_update/GUI.py`）：
-  - Teensy 新增 `SignalFilter` 结构体，同时支持一阶 IIR LPF 和二阶 Butterworth，三通道（角度/速度/力矩）各一对实例
-  - 截止频率统一由 GUI 下发（BLE payload `[31..32]`），类型和使能掩码通过 `filter_flags`（payload `[98]`）控制：bit0=角度，bit1=速度，bit2=力矩，bit3=类型（0=LPF，1=Butterworth）
-  - 功率计算始终使用 `imu.LTAVx/RTAVx` 原始值，不受速度滤波影响
-  - GUI 面板替换原有单行"Filter Before Torque"，新增：Cutoff 旋钮 + LPF/Butterworth 下拉 + 三个 Enable checkbox（发送 Teensy）+ Raw Angle / Raw Velocity 两个显示 checkbox（GUI 侧一阶 IIR 软件滤波，不发送）
+- **Teensy 可切换滤波框架演进**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`, `BleProtocol.h`, `GUI_RL_update/GUI.py`）：
+  - Teensy 引入 `SignalFilter` 统一封装，支持一阶 IIR LPF 与二阶 Butterworth
+  - GUI 支持运行时下发滤波类型、截止频率/alpha 与使能位
+  - 功率计算仍基于原始 IMU 速度（`imu.LTAVx/RTAVx`），不被输入滤波路径改写
+
+- **Teensy 滤波链路重构为“输入滤波 + 力矩前滤波”双级架构**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`, `All_in_one_hip_controller_RL_update/BleProtocol.h`, `GUI_RL_update/GUI.py`, `Docs/SYSTEM_ARCHITECTURE.md`）：
+  - BLE 下行字段更新：`[31..32]=input_filter_fc_hz`、`[34..35]=torque_filter_fc_hz`、`[98]=filter_flags(bit0..bit3)`、`[99..100]=input_filter_alpha`、`[101..102]=torque_filter_alpha`
+  - GUI Teensy 过滤控件改为两组独立设置：
+    - `Input Filter`（角度/速度，LPF alpha 或 Butterworth fc）
+    - `Torque Filter [Teensy-local only]`（电机前最终滤波，LPF alpha 或 Butterworth fc）
+  - RL 模式下自动灰显 Teensy 输入滤波与力矩前滤波控件；EG/Samsung legacy 内部 LPF 开关开启时灰显输入滤波控件
+  - EG legacy 与 Samsung legacy 对输入滤波生效为旁路；**不再旁路** Teensy 最终 torque prefilter（仅 RL 路径旁路）
+  - Samsung 新增 `Legacy Internal LPF` 占位开关（协议 bit3 与 GUI 按钮先打通，算法内部实现待后续）
 
 - **`parse_params` 调试打印**（`All_in_one_hip_controller_RL_update/Controller_SOGI.cpp`）：
   - `Controller_SOGI::parse_params()` 末尾新增串口打印，每次 GUI 下发 SOGI 参数时输出一行 `[SOGI] A=... lead=... ...`，方便验证 BLE 传参是否成功

@@ -147,6 +147,19 @@ python RL_controller_torch.py
 python RL_controller_torch.py --nn pf_imu
 ```
 
+也可直接使用 `run.sh`：
+
+```bash
+cd RPi_Unified
+./run.sh                # 交互菜单选择算法
+./run.sh dnn            # 直接启动指定算法
+./run.sh lstm_leg_dcp
+./run.sh lstm_pd
+./run.sh pf_imu
+./run.sh myoassist_1966080
+./run.sh myoassist_2293760
+```
+
 ### GUI 远程启动依赖（Pi 端）
 
 如果使用 GUI 里的 `Start LegDcp / Start LSTM-PD / Start PF-IMU / Start Myo-* / Stop Pi RL` 远程按钮，
@@ -350,32 +363,38 @@ Algorithm Reference/NJIT Reference/
 
 ## 滤波器配置
 
-### LSTM 模式
+当前版本采用“统一 torque 输出滤波 + 算法输入滤波（按需）”的双层结构。
 
-只需设置 torque 前的低通滤波器系数：
+### 1) 统一 torque 输出滤波（所有 `--nn` 共用）
 
-```python
-LSTM_FILTER_B = np.array([0.0913, 0.1826, 0.0913])   # 20Hz Butterworth 2阶
-LSTM_FILTER_A = np.array([1.0, -0.9824, 0.3477])
-```
+- 位置：`RL_controller_torch.py` 主循环，顺序固定为 `filter -> delay -> scale -> send`
+- 默认：`2nd-order IIR Butterworth, 5.0 Hz, enable=ON`
+  - 对应常量：
+    - `UNIFIED_TORQUE_FILTER_ENABLE_DEFAULT = True`
+    - `UNIFIED_TORQUE_FILTER_CODE_DEFAULT = 1` (`1=butterworth`)
+    - `UNIFIED_TORQUE_FILTER_ORDER_DEFAULT = 2`
+    - `UNIFIED_TORQUE_FILTER_CUTOFF_DEFAULT = 5.0`
+- 可选滤波器类型（GUI runtime 下发）：
+  - `1: butterworth`
+  - `2: bessel`
+  - `3: chebyshev2`
 
-常用系数 (100Hz 采样率, Butterworth 2阶)：
+### 2) 算法输入滤波（DNN / PF-IMU）
 
-| 截止频率 | b | a |
-|---------|---|---|
-| 3Hz  | [0.0006, 0.0012, 0.0006] | [1.0, -1.9289, 0.9314] |
-| 6Hz  | [0.0055, 0.0111, 0.0055] | [1.0, -1.7786, 0.8008] |
-| 12Hz | [0.0461, 0.0923, 0.0461] | [1.0, -1.3073, 0.4918] |
-| 15Hz | [0.0675, 0.1349, 0.0675] | [1.0, -1.1430, 0.4128] |
-| 20Hz | [0.0913, 0.1826, 0.0913] | [1.0, -0.9824, 0.3477] |
+- 通过 GUI 的 `Input Filter` 开关控制（BLE passthrough `enable_vel/ref`）
+- DNN：
+  - 输入滤波作用在 `velocity + reference`
+  - DNN 内部 torque filter 已强制旁路，最终仍由“统一 torque 输出滤波”处理
+- PF-IMU：
+  - 输入滤波作用在 `input angle + input velocity`
+  - PF-IMU 默认 profile 是 `guided raw online`，纯 CLI 启动时会先保持 RAW 口径；
+    一旦 GUI 下发 `Input Filter=ON`，即按当前参数启用（默认 5Hz / 2阶 / IIR）
 
-### DNN 模式
+### 3) LSTM 家族说明（`lstm / lstm_leg_dcp / lstm_pd / myoassist_*`）
 
-支持三种配置方式，通过 `FILTER_CONFIG_MODE` 选择：
-
-- **`'preset'`** — 使用预定义滤波器名称 (如 `'butter_12hz_2nd'`)，详见 `filter_library.py`
-- **`'custom'`** — 指定滤波器类型+截止频率+阶数，自动计算系数
-- **`'coeffs'`** — 直接给 b/a 系数
+- LSTM 内部 `exo_filter` 在运行时旁路
+- 最终扭矩同样统一走主循环 torque 输出滤波
+- 因此 LSTM 家族与其它算法在“力矩下发前滤波”口径上保持一致
 
 ---
 
