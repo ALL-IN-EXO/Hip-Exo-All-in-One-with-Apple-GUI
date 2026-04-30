@@ -573,7 +573,8 @@ void loop() {
     static bool prev_torque_filter_enable = true;
     if (use_unified_prefilter != prev_use_unified_prefilter) {
       // 切换滤波路径时清一次状态，避免旁路/恢复瞬间的滤波尾迹。
-      reset_filter_states();
+      reset_input_filter_states();
+      reset_torque_filter_state();
       prev_use_unified_prefilter = use_unified_prefilter;
     }
     if (torque_filter_enable != prev_torque_filter_enable) {

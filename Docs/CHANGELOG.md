@@ -25,6 +25,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Teensy 主循环滤波函数名不一致修复**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`）：
   - 主循环调用统一为已定义函数：`reset_torque_filter_state()`、`update_torque_filter_if_needed()`
   - 消除历史重构后 `reset_filter_states()/update_filters_if_needed()` 命名混用导致的编译风险
+  - 补齐 `loop()` 中路径切换分支的残留调用：`reset_filter_states()` → `reset_input_filter_states() + reset_torque_filter_state()`
 
 - **GUI Power 源语义与方向按钮解耦修复**（`GUI_RL_update/GUI.py`, `Docs/SYSTEM_ARCHITECTURE.md`）：
   - `Power` 下拉改为显式标注：`Physical (Teensy)` / `Control (Pi)`（内部仍用 canonical token `Physical/Control`）
