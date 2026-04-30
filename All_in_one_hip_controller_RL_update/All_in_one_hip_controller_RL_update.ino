@@ -573,7 +573,7 @@ void loop() {
     static bool prev_torque_filter_enable = true;
     if (use_unified_prefilter != prev_use_unified_prefilter) {
       // 切换滤波路径时清一次状态，避免旁路/恢复瞬间的滤波尾迹。
-      reset_torque_filter_state();
+      reset_filter_states();
       prev_use_unified_prefilter = use_unified_prefilter;
     }
     if (torque_filter_enable != prev_torque_filter_enable) {
@@ -732,23 +732,32 @@ void receive_motor_feedback() {
 }
 
 /******************** BLE 接收 (128 字节帧) ********************/
+// 非阻塞状态机：跨多次调用积累完整 payload，彻底消除分包丢帧
 void Receive_ble_Data() {
-  static uint8_t hdr[3] = {0};
+  static uint8_t  hdr[3]                    = {0};
+  static uint8_t  payload_buf[BLE_PAYLOAD_LEN];
+  static uint16_t payload_count             = 0;
+  static bool     collecting                = false;
 
   while (Serial5.available()) {
-    hdr[0] = hdr[1];
-    hdr[1] = hdr[2];
-    hdr[2] = Serial5.read();
+    uint8_t b = (uint8_t)Serial5.read();
 
-    if (!(hdr[0] == 0xA5 && hdr[1] == 0x5A && hdr[2] == BLE_FRAME_LEN)) {
+    if (!collecting) {
+      hdr[0] = hdr[1]; hdr[1] = hdr[2]; hdr[2] = b;
+      if (hdr[0] == 0xA5 && hdr[1] == 0x5A && hdr[2] == BLE_FRAME_LEN) {
+        collecting    = true;
+        payload_count = 0;
+      }
       continue;
     }
 
-    size_t n = Serial5.readBytes((char*)data_rs232_rx, BLE_PAYLOAD_LEN);
-    if (n < BLE_PAYLOAD_LEN) {
-      Serial.printf("[BLE] Payload incomplete: got %d / %d bytes\n", (int)n, BLE_PAYLOAD_LEN);
-      return;
-    }
+    payload_buf[payload_count++] = b;
+    if (payload_count < BLE_PAYLOAD_LEN) continue;
+
+    // 完整 payload 到齐
+    collecting    = false;
+    payload_count = 0;
+    memcpy(data_rs232_rx, payload_buf, BLE_PAYLOAD_LEN);
 
     // LOGTAG 帧检测
     if (data_rs232_rx[0] == 'L' && data_rs232_rx[1] == 'G') {
@@ -762,7 +771,7 @@ void Receive_ble_Data() {
       Serial.println(logtag);
       // 同步给 RL 控制器
       memcpy(ctrl_rl.logtag, logtag, 11);
-      return;
+      continue;  // 继续处理缓冲区中剩余字节，不退出函数
     }
 
     // 解析下行数据

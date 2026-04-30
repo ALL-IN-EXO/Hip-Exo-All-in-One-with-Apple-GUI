@@ -13,6 +13,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Teensy 端 Live Power 可能全零导致 GUI `Live --` 的回归修复**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`）：
   - `phys_pwr` 计算口径统一为“当前下发命令扭矩 × 当前速度”（不再使用 `get_torque_meas()`）
   - Teensy SD 日志中的 `L_pwr_W/R_pwr_W` 同步为同一口径，避免 GUI Live 与本地日志定义不一致
+- **Teensy 统一滤波函数调用名修复**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`）：
+  - 将主循环中的 `reset_torque_filter_state()` / `update_torque_filter_if_needed()` 调用改为已存在的 `reset_filter_states()` / `update_filters_if_needed()`
+  - 修复函数未声明导致的编译失败
 
 - **`Controller_SOGI.h` 编译错误修复**（`All_in_one_hip_controller_RL_update/Controller_SOGI.h`）：
   - 补回缺失的三个成员变量 `vel_lpf_fc_`、`vel_filt_L_`、`vel_filt_R_`（`.cpp` 中已使用但 `.h` 被回退丢失）
