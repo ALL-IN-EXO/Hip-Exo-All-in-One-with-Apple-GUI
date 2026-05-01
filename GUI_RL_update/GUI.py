@@ -555,7 +555,15 @@ class PillBadge(QLabel):
         self.setFixedHeight(22)
         self._refresh_style()
 
+    def setText(self, text):
+        txt = str(text)
+        if txt == self.text():
+            return
+        super().setText(txt)
+
     def set_color(self, color):
+        if color == self._color:
+            return
         self._color = color
         self._refresh_style()
 
@@ -767,8 +775,15 @@ class MainWindow(QWidget):
         self._csv_sample_idx = 0
         self._csv_session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self._csv_start_wall_time = time.time()
+        self._csv_row_queue = None
+        self._csv_writer_thread = None
+        self._csv_flush_interval_s = 1.0
         self._last_gait_freq = None
         self._last_gait_period_ms = None
+        self._live_status_last_ts = 0.0
+        self._live_status_min_interval_s = 0.10  # ~10 Hz
+        self._tag_panel_last_ts = 0.0
+        self._tag_panel_min_interval_s = 0.10  # ~10 Hz
         self._signal_source_mode = "Auto"   # Auto / Raw / Sync
         # Canonical tokens: Auto / Physical / Control
         self._power_source_mode = "Auto"
@@ -1000,7 +1015,7 @@ class MainWindow(QWidget):
             'rpi_pos_per_s_L', 'rpi_pos_per_s_R',
             'rpi_neg_per_s_L', 'rpi_neg_per_s_R',
         ])
-        self._csv_last_flush = 0.0
+        self._start_csv_writer()
 
         # Wheel guard: scroll wheel only changes spinbox value when it has focus
         for sb in self.findChildren((QDoubleSpinBox, QSpinBox)):
@@ -4265,6 +4280,25 @@ class MainWindow(QWidget):
             return float(prev_good), False
         return v, True
 
+    @staticmethod
+    def _set_label_text_if_changed(widget, text):
+        if widget is None:
+            return
+        txt = str(text)
+        if widget.text() != txt:
+            widget.setText(txt)
+
+    def _set_live_status_text(self, text, now=None, force=False):
+        if not hasattr(self, "lbl_status"):
+            return
+        if now is None:
+            now = time.time()
+        txt = str(text)
+        if (not force) and (now - self._live_status_last_ts) < self._live_status_min_interval_s:
+            return
+        self._set_label_text_if_changed(self.lbl_status, txt)
+        self._live_status_last_ts = now
+
     def _append_data_point(
             self, t, L_angle, R_angle, L_tau, R_tau, L_tau_d, R_tau_d,
             L_vel, R_vel, gait_freq, *, log_csv=True, power_override=None):
@@ -4317,7 +4351,7 @@ class MainWindow(QWidget):
                 event_txt = " | ".join(self._align_events_pending)
                 self._align_events_pending.clear()
             rx_tag_text = self._last_rx_tag_text if self._last_rx_tag_text else self._last_rx_tag_char
-            self._csv_writer.writerow([
+            self._enqueue_csv_row([
                 f'{float(t):.3f}',
                 f'{float(L_angle):.3f}', f'{float(R_angle):.3f}',
                 str(int(self._uplink_prev_t_cs) & 0xFFFF if self._uplink_prev_t_cs is not None else -1),
@@ -4371,9 +4405,6 @@ class MainWindow(QWidget):
                 f'{float(self._rpi_neg_per_s_R):.4f}',
             ])
             self._csv_sample_idx += 1
-            if now_wall - self._csv_last_flush > 1.0:
-                self._csv_file.flush()
-                self._csv_last_flush = now_wall
 
         self._last_render_values = (
             float(L_angle), float(R_angle),
@@ -4383,6 +4414,67 @@ class MainWindow(QWidget):
         )
         self._render_dirty = True
         return L_pwr, R_pwr
+
+    def _csv_writer_loop(self, csv_file, csv_writer, row_queue, flush_interval_s):
+        pending_rows = 0
+        last_flush = time.time()
+        while True:
+            row = row_queue.get()
+            try:
+                if row is None:
+                    break
+                csv_writer.writerow(row)
+                pending_rows += 1
+                now = time.time()
+                if pending_rows >= 32 or (now - last_flush) >= float(flush_interval_s):
+                    csv_file.flush()
+                    pending_rows = 0
+                    last_flush = now
+            except Exception as exc:
+                _dbg_log(f"[csv writer] write failed: {exc!r}")
+            finally:
+                row_queue.task_done()
+        try:
+            csv_file.flush()
+        except Exception:
+            pass
+
+    def _start_csv_writer(self):
+        if not getattr(self, "_csv_file", None) or not getattr(self, "_csv_writer", None):
+            return
+        self._csv_row_queue = queue.Queue()
+        self._csv_writer_thread = threading.Thread(
+            target=self._csv_writer_loop,
+            args=(
+                self._csv_file,
+                self._csv_writer,
+                self._csv_row_queue,
+                float(self._csv_flush_interval_s),
+            ),
+            name="hip-gui-csv-writer",
+            daemon=True,
+        )
+        self._csv_writer_thread.start()
+
+    def _enqueue_csv_row(self, row):
+        q = getattr(self, "_csv_row_queue", None)
+        if q is None:
+            return False
+        q.put(row)
+        return True
+
+    def _shutdown_csv_writer(self):
+        q = getattr(self, "_csv_row_queue", None)
+        if q is not None:
+            q.put(None)
+            q.join()
+        if self._csv_writer_thread and self._csv_writer_thread.is_alive():
+            self._csv_writer_thread.join(timeout=2.0)
+        self._csv_writer_thread = None
+        self._csv_row_queue = None
+        if hasattr(self, '_csv_file') and self._csv_file and not self._csv_file.closed:
+            self._csv_file.flush()
+            self._csv_file.close()
 
     def _render_interval_s(self):
         return 1.0 / max(1.0, float(self._render_fps_normal))
@@ -4447,22 +4539,23 @@ class MainWindow(QWidget):
         if self._last_render_values is not None:
             (L_angle, R_angle, L_tau_d, R_tau_d,
              L_tau, R_tau, L_pwr_now, R_pwr_now) = self._last_render_values
-            self.lbl_Lang.setText(f"L: {L_angle:.1f} deg")
-            self.lbl_Rang.setText(f"R: {R_angle:.1f} deg")
-            self.lbl_Lcmd.setText(f"L cmd: {L_tau_d:.1f} Nm")
-            self.lbl_Rcmd.setText(f"R cmd: {R_tau_d:.1f} Nm")
-            self.lbl_Ltau.setText(f"L est: {L_tau:.1f} Nm")
-            self.lbl_Rtau.setText(f"R est: {R_tau:.1f} Nm")
-            self.lbl_Lpwr.setText(f"L pwr: {L_pwr_now:.2f} W")
-            self.lbl_Rpwr.setText(f"R pwr: {R_pwr_now:.2f} W")
+            self._set_label_text_if_changed(self.lbl_Lang, f"L: {L_angle:.1f} deg")
+            self._set_label_text_if_changed(self.lbl_Rang, f"R: {R_angle:.1f} deg")
+            self._set_label_text_if_changed(self.lbl_Lcmd, f"L cmd: {L_tau_d:.1f} Nm")
+            self._set_label_text_if_changed(self.lbl_Rcmd, f"R cmd: {R_tau_d:.1f} Nm")
+            self._set_label_text_if_changed(self.lbl_Ltau, f"L est: {L_tau:.1f} Nm")
+            self._set_label_text_if_changed(self.lbl_Rtau, f"R est: {R_tau:.1f} Nm")
+            self._set_label_text_if_changed(self.lbl_Lpwr, f"L pwr: {L_pwr_now:.2f} W")
+            self._set_label_text_if_changed(self.lbl_Rpwr, f"R pwr: {R_pwr_now:.2f} W")
             if hasattr(self, "lbl_motor_page_state"):
                 if self._motor_telem_valid:
-                    self.lbl_motor_page_state.setText(
+                    self._set_label_text_if_changed(
+                        self.lbl_motor_page_state,
                         f"Motor telem OK | L: {self._motor_cur_L_A:+.1f}A {self._motor_rpm_L:+.0f}rpm  "
-                        f"R: {self._motor_cur_R_A:+.1f}A {self._motor_rpm_R:+.0f}rpm"
+                        f"R: {self._motor_cur_R_A:+.1f}A {self._motor_rpm_R:+.0f}rpm",
                     )
                 else:
-                    self.lbl_motor_page_state.setText("Motor telemetry: waiting...")
+                    self._set_label_text_if_changed(self.lbl_motor_page_state, "Motor telemetry: waiting...")
 
         self._render_dirty = False
         self._last_render_ts = now
@@ -5961,9 +6054,9 @@ class MainWindow(QWidget):
         return super().eventFilter(obj, event)
 
     def closeEvent(self, event):
-        if hasattr(self, '_csv_file') and self._csv_file and not self._csv_file.closed:
-            self._csv_file.flush()
-            self._csv_file.close()
+        if hasattr(self, 'timer') and self.timer:
+            self.timer.stop()
+        self._shutdown_csv_writer()
         super().closeEvent(event)
 
     def _apply_plot_visibility(self):
@@ -6188,30 +6281,36 @@ class MainWindow(QWidget):
             y = y1 - 0.005 * dy
         overlay_item.setPos(x, y)
 
-    def _update_tag_panel(self, now=None):
+    def _update_tag_panel(self, now=None, force=False):
         if not hasattr(self, 'lbl_tag_state'):
             return
         if now is None:
             now = time.time()
+        if (not force) and (now - self._tag_panel_last_ts) < self._tag_panel_min_interval_s:
+            return
 
         if self._current_tag:
-            self.lbl_tag_state.setText(f"Tag: {self._current_tag}")
+            self._set_label_text_if_changed(self.lbl_tag_state, f"Tag: {self._current_tag}")
             if self._tag_started_at is not None and now >= self._tag_started_at:
                 dt = now - self._tag_started_at
                 mm = int(dt // 60.0)
                 ss = dt - mm * 60.0
-                self.lbl_tag_timer.setText(f"Timer: {mm:02d}:{ss:04.1f}")
+                self._set_label_text_if_changed(self.lbl_tag_timer, f"Timer: {mm:02d}:{ss:04.1f}")
             else:
-                self.lbl_tag_timer.setText("Timer: 00:00.0")
+                self._set_label_text_if_changed(self.lbl_tag_timer, "Timer: 00:00.0")
         else:
-            self.lbl_tag_state.setText("Tag: (empty)")
-            self.lbl_tag_timer.setText("Timer: --:--.-")
+            self._set_label_text_if_changed(self.lbl_tag_state, "Tag: (empty)")
+            self._set_label_text_if_changed(self.lbl_tag_timer, "Timer: --:--.-")
 
-        self.lbl_tag_rx.setText(f"RX tag: {self._last_rx_tag_char if self._last_rx_tag_char else '-'}")
+        self._set_label_text_if_changed(
+            self.lbl_tag_rx,
+            f"RX tag: {self._last_rx_tag_char if self._last_rx_tag_char else '-'}",
+        )
         if self._last_gait_freq is None:
-            self.lbl_tag_gait.setText("Gait: - Hz")
+            self._set_label_text_if_changed(self.lbl_tag_gait, "Gait: - Hz")
         else:
-            self.lbl_tag_gait.setText(f"Gait: {self._last_gait_freq:.2f} Hz")
+            self._set_label_text_if_changed(self.lbl_tag_gait, f"Gait: {self._last_gait_freq:.2f} Hz")
+        self._tag_panel_last_ts = now
 
     def _build_value_displays(self):
         # Compact status bar below plots: IMU, MaxT, Tag, Timer, RX, Gait — one row
@@ -6512,7 +6611,10 @@ class MainWindow(QWidget):
         if update_current:
             self._current_tag = tag_txt
             self._tag_started_at = time.time() if tag_txt else None
-            self._update_tag_panel(self._tag_started_at if self._tag_started_at else time.time())
+            self._update_tag_panel(
+                self._tag_started_at if self._tag_started_at else time.time(),
+                force=True,
+            )
         return True
 
     def _send_logtag(self):
@@ -6929,8 +7031,8 @@ class MainWindow(QWidget):
                 self._maybe_update_rl_filter_state_label(now=now, force=force_rl_status_refresh)
 
         # === Update UI ===
-        self.lbl_imu.setText(f"IMU: {'OK' if imu_ok_flag else 'FAIL'}")
-        self.lbl_maxt.setText(f"MaxT: {maxT_rx:.1f} Nm")
+        self._set_label_text_if_changed(self.lbl_imu, f"IMU: {'OK' if imu_ok_flag else 'FAIL'}")
+        self._set_label_text_if_changed(self.lbl_maxt, f"MaxT: {maxT_rx:.1f} Nm")
 
         # SD badge
         if sd_ok:
@@ -7013,11 +7115,11 @@ class MainWindow(QWidget):
         else:
             self.badge_brand.set_color(C.fill)
         if brand_id == 2 and temp_L:
-            self.lbl_temp_L.setText(f"L:{temp_L}C")
-            self.lbl_temp_R.setText(f"R:{temp_R}C" if temp_R else "")
+            self._set_label_text_if_changed(self.lbl_temp_L, f"L:{temp_L}C")
+            self._set_label_text_if_changed(self.lbl_temp_R, f"R:{temp_R}C" if temp_R else "")
         else:
-            self.lbl_temp_L.setText("")
-            self.lbl_temp_R.setText("")
+            self._set_label_text_if_changed(self.lbl_temp_L, "")
+            self._set_label_text_if_changed(self.lbl_temp_R, "")
 
         # Algorithm badge
         algo_name = ALGO_NAMES.get(active_algo, "?")
@@ -7035,11 +7137,13 @@ class MainWindow(QWidget):
         (L_angle_disp, R_angle_disp, L_vel_disp, R_vel_disp,
          L_cmd_disp, R_cmd_disp, L_pwr_disp, R_pwr_disp,
          signal_active, power_active) = self._resolve_live_sources(active_algo)
-        self.lbl_status.setText(
+        self._set_live_status_text(
             f"t={t:.2f}s  gait={gait_freq:.2f}Hz(T={((1000.0 / gait_freq) if gait_freq > 0.01 else 0.0):.0f}ms)  algo={algo_name}"
             + (f"  tag='{tag_char}'" if tag_valid else "")
             + f"  vel={'IMU' if has_imu_vel else 'DER'}"
-            + f"  src={signal_active}/{self._power_source_label(power_active)}")
+            + f"  src={signal_active}/{self._power_source_label(power_active)}",
+            now=now,
+        )
 
         self._append_data_point(
             t,

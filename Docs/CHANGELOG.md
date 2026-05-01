@@ -5,6 +5,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **GUI 运行时卡顿进一步优化**（`GUI_RL_update/GUI.py`, `Docs/GUI_PERFORMANCE_OPTMIZATION.md`）：
+  - 实时 telemetry CSV 记录改为后台线程写盘，主线程不再同步 `writerow/flush`
+  - `lbl_status` 与 Tag 面板降到约 10Hz 刷新，并对高频 label/badge 增加“仅变化时更新”
+  - 补充性能文档，明确后续若仍卡顿，优先考虑将串口 RX/解析迁移到 `QThread`
+
 ## [v6.1] - 2026-05-01
 
 ### Fixed
