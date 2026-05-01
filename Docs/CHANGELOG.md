@@ -5,10 +5,84 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [v5.2] - 2026-05-01
+
+> **Phase 1 release**：三 bug（Apply Algorithm 多点、Power OFF/ON 力矩不恢复、RL 参数下发不可见）全部上机复测通过。详细诊断过程见 `Docs/PHASE1_DEBUG_PROGRESS.md`。
+
+### Fixed
+
+- **RPi cfg 下发可视化（Bug 3 取证 + 验证通过）**（`RPi_Unified/RL_controller_torch.py`）：
+  - **背景**：用户报告 GUI 改 RL 参数 → 点 Apply RL Settings → "RPi console 没有任何收到信号的提示"。静态分析发现 RPi 的 cfg 解析路径其实完整正确（magic/version/cmd 全部对得上 GUI 发的字节），但**整条 cfg 应用流程没有任何 `print` 调用**，所以即使 RPi 完美收到、解析、应用，用户也看不到。
+  - 加 `DBG_PHASE1_RPI` 主开关（环境变量 `HIPEXO_DBG=0` 可关）。
+  - `read_packet`：cfg 帧到达即打印 `[RPi DBG read_packet] CFG #N len=... payload_head=...`；bad_len/bad_cksum/unknown_type 也打印分类原因，分别计数 `_DBG_RPI_BAD_LEN/_BAD_CKSUM/_OTHER_FRAMES`。
+  - `parse_runtime_cfg`：accept 时打印 `[RPi DBG parse_cfg] ACCEPT scale=... delay=... cutoff=...`；reject 时按具体失败原因（短 payload、bad magic、bad version/cmd、非 finite floats、cutoff<=0）分别打印，方便定位。
+  - 主循环 cfg 分支：解析后打印 `[RPi DBG cfg APPLIED] NN_TYPE=... -> scale=... delay=... cutoff=...`。
+  - 主循环 1Hz 心跳 `[RPi DBG hb] in_waiting=N imu=A cfg=B other=C bad_len=... bad_cksum=... parse_reject=... no_hdr_bytes=...`：即使没收到 cfg 也能持续看见 Serial8 RX 链路状况。
+  - **Test C 上机复测通过**（2026-05-01）：cfg 包路径全程畅通，只是之前不可见。
+- **`main()` 内给模块级 `_DBG_RPI_LAST_HEARTBEAT_TS` 赋值漏 `global` 声明导致启动 `UnboundLocalError`**（`RPi_Unified/RL_controller_torch.py`）：在 `main()` 顶部加 `global _DBG_RPI_LAST_HEARTBEAT_TS`。
+
+- **BLE 下行链路抗丢帧修复（Bug 1 / Bug 2 同根因，Phase 1 上机实测确认）**：
+  - **背景**：Phase 1 实测发现，GUI 在 ~1ms 内连发两个 128B BLE 帧时（典型场景：`Apply Algorithm` 触发的 LOGTAG + params 双帧），第二帧在 BLE bridge (nRF52840) → Teensy Serial5 链路上**几乎必丢**。
+    - Test 1 失败实测：GUI 发 9 帧 → Teensy 收 5 帧（LOGTAG 4/4，紧跟其后的 algo 0/4）
+    - Test 1 成功实测：用户连点 3 次才能切成功，因为前几次的双帧第二帧总是丢
+    - Test 2 (Power 混乱)：用户疯狂连点 Power ON/OFF (150-200ms 间隔)，约半数帧被丢，造成 GUI 按钮状态与 Teensy `max_torque_cfg` 长期错位
+  - **修复 A** — `GUI_RL_update/GUI.py`：新增 `_throttled_ble_write()` 模块级 helper，强制相邻两次 `self.ser.write()` 间隔 ≥ 50ms。`_tx_params` 和 `_send_logtag_text` 全部改用此 helper。单次操作多 50ms 延迟（用户感知不到），但彻底消灭"双帧第二帧丢失"模式。
+  - **修复 B** — `All_in_one_hip_controller_RL_update.ino`：在 `setup()` 里给 Serial5 加 `addMemoryForRead(buf, 512)`（默认 RX 缓冲只有 64B，单帧 128B 直接超出 budget，主循环抖动 >5.5ms 就丢字节）。同 Serial8 (RPi 链路) 的现成做法。即使 GUI 没修，Teensy 也能容忍 ~45ms 主循环抖动。
+  - **不动控制逻辑**：`switch_algorithm()`、`_on_power_toggled()`、`_tx_params()` 等控制函数本身没问题，只是它们想发的帧之前没全部到达 Teensy。
+  - 详细诊断与原始日志见 `Docs/PHASE1_DEBUG_PROGRESS.md`。
+
+- **Phase 1 调试基础设施**（不影响控制逻辑）：
+  - Teensy: `Controller_RL.h` 新增 `DBG_PHASE1` 宏开关；`.ino` + `Controller_RL.cpp` 在算法切换、BLE 每帧、10Hz 状态、RPi 链路边沿处加 `DBG1(...)` 打印 + 帧/字节计数器（`DBG_PHASE1=0` 编译期消去）。
+  - GUI: `GUI.py` 加模块级 `DBG_PHASE1` 开关（环境变量 `HIPEXO_DBG=0` 可关）+ `_dbg_log()` helper 自动落盘到 `GUI_RL_update/debug_logs/phase1_<时间戳>.log`。打点：`_on_algo_confirm` / `_on_power_toggled` / `_on_apply_rl_clicked` / `_tx_params -> SERIAL` / 上行 `active_algo` 变化 / 上行 ACK。
+  - `.gitignore` 加 `GUI_RL_update/debug_logs/`。
+
+- **Apply Algorithm pending 状态可重试修复**（`GUI_RL_update/GUI.py`）：
+  - 当 GUI 选中算法与 Teensy 实际活动算法不一致时，`Apply Algorithm *` 持续可点击（不再被锁灰）
+  - 解决“首包未生效后必须改参数/切 Power 才能再次 Apply”的问题
+  - `Apply Algorithm` 按钮新增 tooltip，明确提示“切换算法时需要点击两次（request + ACK确认）”
+
+- **TMOTOR 电机遥测 `waiting/0` 修复（请求链路）**（`Motor_Control_Tmotor.*`, `MotorDriver.h`, `All_in_one_hip_controller_RL_update.ino`）：
+  - 新增 TMOTOR `request_status()` 主动请求状态帧（`CAN_PACKET_STATUS`）
+  - 主循环对 `SIG/TMOTOR` 均执行 `request_feedback()`（左右腿都请求）
+  - 遥测有效位判据改为“任一侧有效即上报”，避免单侧 NAN 导致整帧无效
+  - `unpack_servo_telemetry()` 的 CAN ID 匹配改为兼容式（低字节/高字节 drive_id 均可识别），提升不同驱动固件 ID 打包差异下的回读成功率
+
+## [v5.1] - 2026-04-30
+
+### Changed
+
+- **BLE 上行字段压缩（回收 12B 预留位）**（`BleProtocol.h`, `All_in_one_hip_controller_RL_update.ino`, `GUI.py`, `SYSTEM_ARCHITECTURE.md`）：
+  - 去除 `IMU1..4` 角速度上行字段（原 `data_ble[44..51]`），改为 `reserved[8B]`
+  - 将 `imu_ok / sd_ok / tag_ok / brand / algo` 五个状态打包为 `status0`（`data_ble[17]`）
+  - 原单独状态字节 `data_ble[20]/[25]/[28]/[31]` 改为 `reserved`
+  - GUI 上行解包改为读取 `status0` 位域；L/R 角速度仍保留在 `data_ble[40..43]`，控制主链路字段不变
+
+- **GUI 左侧参数下发改为“显式 Apply”**（`GUI_RL_update/GUI.py`）：
+  - 左侧参数控件（含 Teensy 输入/力矩滤波、EG/Samsung/SOGI/Test 参数）不再 `valueChanged/stateChanged` 自动下发；
+    改为仅标记为 pending（`Apply Algorithm *` 变橙可点）。
+  - `Apply Algorithm` 现在同时处理两类变更：算法切换 + 左侧参数变更；
+    若仅参数变更（算法未变），不再重置 RPi 在线状态。
+  - `Apply RL Settings` 仍只在 RL 参数变更时可点（Scale/Delay/Cutoff/Filter/Auto Method）。
+  - `Power` 仍保留即时下发（安全优先）：`OFF => max_torque=0`，`ON => 恢复非零值/默认15`；
+    并在成功发送后刷新“已应用签名”，避免按钮脏状态假阳性。
+
+- **新增电机遥测显示页（Current/RPM）+ CSV 记录**（`GUI_RL_update/GUI.py`, `All_in_one_hip_controller_RL_update/BleProtocol.h`, `All_in_one_hip_controller_RL_update/MotorDriver.h`, `All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`）：
+  - GUI 右侧顶栏新增页面切换按钮：`Main Plots` / `Motor Data`
+  - `Motor Data` 页新增两张实时曲线：左右电机电流（A）与左右电机转速（RPM）
+  - Teensy 在 BLE 上行预留字节中增加紧凑电机遥测量化字段（`0.5A/LSB`, `50rpm/LSB` + valid flags）
+  - GUI 端新增解码与状态显示，并写入 GUI CSV：`motor_cur_L/R_A`, `motor_rpm_L/R`, `motor_*_valid`
+
 ## [v5.0] - 2026-04-30
 
 
 ### Fixed
+
+- **RL 状态回显偶发异常 `45.0Hz` / 旧值残留问题修复**（`Controller_RL.cpp`, `All_in_one_hip_controller_RL_update.ino`, `GUI.py`, `RL_controller_torch.py`）：
+  - Teensy `AA56` 状态帧新增健壮性校验（`magic/version/source/order/enable_mask/cutoff/scale`），异常帧直接丢弃，不再污染 GUI
+  - RL 串口超时 (`>500ms`) 时清空 `rpi_status_valid + rpi_status_buf`，避免 GUI 继续显示过期状态
+  - RL 模式下若本周期无有效 RPi 状态，BLE 上行 `rpi_uplink_buf` 置零（不沿用历史缓存）
+  - GUI 端新增 RPi 状态元信息 sanity guard，拒收异常 cutoff/scale/order/status 元数据
+  - RPi 端 runtime cfg 取消 `30Hz` 硬上限，不再做范围夹紧；仅对非正值/非数值拒绝，避免“上限掩盖链路问题”
 
 - **Teensy 端 Live Power 可能全零导致 GUI `Live --` 的回归修复**（`All_in_one_hip_controller_RL_update/All_in_one_hip_controller_RL_update.ino`）：
   - `phys_pwr` 计算口径统一为“当前下发命令扭矩 × 当前速度”（不再使用 `get_torque_meas()`）

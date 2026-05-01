@@ -34,6 +34,67 @@ Apple Human Interface Guidelines inspired:
 - Vibrancy-style dark/light themes
 """
 
+# ============== [DBG-Phase1] 调试开关 + 自动落盘 ==============
+# 主开关:
+#   - 改这里的常量 (True/False), 或
+#   - 启动时设环境变量 HIPEXO_DBG=0 (关) / HIPEXO_DBG=1 (开, 默认)
+# 打开时:
+#   - stdout 照常打印
+#   - 同时追加写到 GUI_RL_update/debug_logs/phase1_<时间戳>.log
+#     (每次启动新建一个; 直接把这个 .log 发给我做分析)
+# 关闭时: 全部 _dbg_log 调用是 no-op, 没有 print, 没有文件 IO。
+# 控制逻辑不受此开关影响。
+DBG_PHASE1 = (os.environ.get("HIPEXO_DBG", "1") != "0")
+_DBG_LOGFILE = None  # lazy-opened on first _dbg_log call
+
+def _dbg_log(msg: str):
+    if not DBG_PHASE1:
+        return
+    print(msg, flush=True)
+    global _DBG_LOGFILE
+    if _DBG_LOGFILE is None:
+        try:
+            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_logs")
+            os.makedirs(log_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            _DBG_LOGFILE = open(
+                os.path.join(log_dir, f"phase1_{ts}.log"),
+                "a", buffering=1, encoding="utf-8"
+            )
+            _DBG_LOGFILE.write(
+                f"# Phase1 debug log started {datetime.now().isoformat()}\n"
+            )
+        except Exception as _e:
+            print(f"[DBG] cannot open log file: {_e!r}", flush=True)
+            _DBG_LOGFILE = False  # disable further attempts
+    if _DBG_LOGFILE and _DBG_LOGFILE is not False:
+        try:
+            _DBG_LOGFILE.write(
+                f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} {msg}\n"
+            )
+        except Exception:
+            pass
+
+# ============== BLE 写节流 (Phase 1 修复) ==============
+# Phase 1 实测: 当 GUI 在 ~1ms 内连发两个 128B 帧 (例如 Apply Algorithm 触发的
+# LOGTAG + params 双帧), 第二帧在 BLE bridge (nRF52840) → Teensy Serial5 这条
+# 链路上几乎必丢. 测试结果见 Docs/PHASE1_DEBUG_PROGRESS.md §3.
+# 强制 GUI 任意两次 ser.write() 之间 >= BLE_WRITE_MIN_INTERVAL_S (50ms),
+# 单击的两帧自然被拉开间隔, 链路有时间消化, 第二帧不会再丢.
+# 用户感知: 单次操作多 50ms 延迟 (不可察觉).
+BLE_WRITE_MIN_INTERVAL_S = 0.050
+_LAST_BLE_WRITE_TS = 0.0
+
+def _throttled_ble_write(ser, data):
+    """节流写: 保证相邻两次 BLE write 之间 >= BLE_WRITE_MIN_INTERVAL_S."""
+    global _LAST_BLE_WRITE_TS
+    now = time.monotonic()
+    elapsed = now - _LAST_BLE_WRITE_TS
+    if elapsed < BLE_WRITE_MIN_INTERVAL_S:
+        time.sleep(BLE_WRITE_MIN_INTERVAL_S - elapsed)
+    ser.write(data)
+    _LAST_BLE_WRITE_TS = time.monotonic()
+
 # ============== Frame Constants ==============
 BLE_FRAME_LEN   = 128
 BLE_HEADER      = bytes([0xA5, 0x5A, BLE_FRAME_LEN])
@@ -72,6 +133,13 @@ TELEM_EXT_FLAG_PHYS_VALID = 0x02
 TELEM_EXT_FLAG_CTRL_VALID = 0x04
 TELEM_EXT_FLAG_SYNC_VALID = 0x08
 TELEM_EXT_FLAG_SYNC_FROM_PI = 0x10
+
+# Compact motor telemetry quantization (Teensy uplink reserved bytes)
+MOTOR_CUR_SCALE_A = 0.5   # int8 * 0.5A
+MOTOR_RPM_SCALE = 50.0    # int8 * 50rpm
+
+PLOT_PAGE_MAIN = 0
+PLOT_PAGE_MOTOR = 1
 
 # Filter type codes (keep in sync with RL_controller_torch.py)
 RL_FILTER_TYPES = [
@@ -680,6 +748,13 @@ class MainWindow(QWidget):
         self._current_brand = 0
         self._algo_select = ALGO_EG
         self._algo_pending = ALGO_EG
+        self._algo_active_rx = None
+        self._algo_apply_waiting_ack = False
+        self._algo_apply_sent_ts = 0.0
+        self._algo_dirty = False
+        self._rl_dirty = False
+        self._algo_last_applied_sig = None
+        self._rl_last_applied_sig = None
         self._current_tag = ""
         self._last_rx_tag_char = ""
         self._tag_started_at = None
@@ -723,6 +798,7 @@ class MainWindow(QWidget):
         self._power_overlay_right_sig = None
         self._power_overlay_left_last_ts = 0.0
         self._power_overlay_right_last_ts = 0.0
+        self._plot_page = PLOT_PAGE_MAIN
 
         # Latest raw/sync/control telemetry snapshot (for CSV + diagnostics)
         self._raw_ang_L = 0.0
@@ -747,6 +823,13 @@ class MainWindow(QWidget):
         self._telem_phys_valid = False
         self._telem_ctrl_valid = False
         self._telem_sync_valid = False
+        self._motor_cur_L_A = 0.0
+        self._motor_cur_R_A = 0.0
+        self._motor_rpm_L = 0.0
+        self._motor_rpm_R = 0.0
+        self._motor_telem_valid = False
+        self._motor_cur_valid = False
+        self._motor_rpm_valid = False
 
         # RPi status (received via BLE uplink passthrough)
         self._rpi_nn_type = -1          # -1=unknown, 0=dnn, 1=lstm, 2=lstm_leg_dcp, 3=lstm_pd, 4=pf_imu, 5=myo1966, 6=myo2293
@@ -858,6 +941,7 @@ class MainWindow(QWidget):
         self._cards = []
         self._segmented_ctrls = []
         self._combo_boxes = []
+        self._ui_ready = False
 
         self._build_layout()
         self._set_pi_rl_remote_state("Pi RL Remote: idle", C.text2, force=True)
@@ -865,13 +949,19 @@ class MainWindow(QWidget):
         self._update_rl_filter_state_label()
         self._update_teensy_prefilter_ui_state()
         self._update_brand_apply_label()
+        self._update_apply_buttons_state()
         self._build_plots()
         self._apply_plot_visibility()
         self._build_value_displays()
+        self._set_plot_page(PLOT_PAGE_MAIN)
 
         self._maxT_before_off = 15.0
         self.sb_max_torque_cfg.setValue(0.0)
         self._set_power_ui(False)
+        self._algo_last_applied_sig = self._get_algo_cfg_signature()
+        self._rl_last_applied_sig = self._get_rl_cfg_signature()
+        self._ui_ready = True
+        self._update_apply_buttons_state()
 
         log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
         os.makedirs(log_dir, exist_ok=True)
@@ -894,6 +984,9 @@ class MainWindow(QWidget):
             'sync_L_cmd_Nm', 'sync_R_cmd_Nm',
             'phys_L_pwr_W', 'phys_R_pwr_W',
             'ctrl_L_pwr_W', 'ctrl_R_pwr_W',
+            'motor_cur_L_A', 'motor_cur_R_A',
+            'motor_rpm_L', 'motor_rpm_R',
+            'motor_telem_valid', 'motor_cur_valid', 'motor_rpm_valid',
             'sync_sample_id', 'sync_from_pi',
             'gait_freq_Hz', 'gait_period_ms',
             't_unwrapped_s', 'wall_time_s', 'wall_elapsed_s',
@@ -934,6 +1027,10 @@ class MainWindow(QWidget):
         self.R_vel_buf   = deque([0.0]*n, maxlen=n)
         self.L_pwr_buf   = deque([0.0]*n, maxlen=n)
         self.R_pwr_buf   = deque([0.0]*n, maxlen=n)
+        self.motor_cur_L_buf = deque([0.0]*n, maxlen=n)
+        self.motor_cur_R_buf = deque([0.0]*n, maxlen=n)
+        self.motor_rpm_L_buf = deque([0.0]*n, maxlen=n)
+        self.motor_rpm_R_buf = deque([0.0]*n, maxlen=n)
 
     # ================================================================ UI BUILD
     def _build_layout(self):
@@ -963,6 +1060,22 @@ class MainWindow(QWidget):
         plots = QVBoxLayout()
         plots.setSpacing(12)
         main.addLayout(plots, 1)
+        self.right_root_layout = plots
+        self.plot_pages = QStackedWidget()
+        plots.addWidget(self.plot_pages, 1)
+
+        self.plot_page_main = QWidget()
+        self.plot_page_main_lay = QVBoxLayout(self.plot_page_main)
+        self.plot_page_main_lay.setContentsMargins(0, 0, 0, 0)
+        self.plot_page_main_lay.setSpacing(12)
+        self.plot_pages.addWidget(self.plot_page_main)
+
+        self.plot_page_motor = QWidget()
+        self.plot_page_motor_lay = QVBoxLayout(self.plot_page_motor)
+        self.plot_page_motor_lay.setContentsMargins(0, 0, 0, 0)
+        self.plot_page_motor_lay.setSpacing(12)
+        self.plot_pages.addWidget(self.plot_page_motor)
+        self.plot_pages.setCurrentIndex(PLOT_PAGE_MAIN)
 
         # ---- Connection Card ----
         conn_card = CardFrame()
@@ -1039,6 +1152,11 @@ class MainWindow(QWidget):
         self.btn_algo_confirm = QPushButton("Apply Algorithm")
         self.btn_algo_confirm.setCursor(Qt.PointingHandCursor)
         self.btn_algo_confirm.setFixedHeight(36)
+        self.btn_algo_confirm.setToolTip(
+            "Apply staged algorithm/parameter changes.\n"
+            "When switching algorithm, click twice:\n"
+            "1) send switch request  2) confirm after status ACK."
+        )
         self.btn_algo_confirm.clicked.connect(self._on_algo_confirm)
         algo_lay.addWidget(self.btn_algo_confirm)
 
@@ -1065,12 +1183,15 @@ class MainWindow(QWidget):
         mt_row.addWidget(lbl_max_torque)
         mt_row.addStretch(1)
 
-        def make_dspin(val=0.0, mn=-20, mx=20, step=0.01, dec=2, tip=""):
+        def make_dspin(val=0.0, mn=-20, mx=20, step=0.01, dec=2, tip="", on_change=None):
             sb = QDoubleSpinBox()
             sb.setDecimals(dec); sb.setSingleStep(step)
             sb.setRange(mn, mx); sb.setValue(val)
             sb.setToolTip(tip)
-            sb.valueChanged.connect(self._tx_params)
+            if on_change is None:
+                on_change = self._on_algo_staged_control_changed
+            if on_change is not None:
+                sb.valueChanged.connect(on_change)
             return sb
 
         self.sb_max_torque_cfg = make_dspin(15.0, 0.0, 30.0, 0.1, 1, max_torque_tip)
@@ -1106,7 +1227,7 @@ class MainWindow(QWidget):
             "Enable Teensy input filter on angle+velocity.\n"
             "Bypassed in RL mode and EG/Samsung legacy internal-LPF mode."
         )
-        self.chk_input_filter_enable.stateChanged.connect(self._tx_params)
+        self.chk_input_filter_enable.stateChanged.connect(self._on_algo_staged_control_changed)
         filt_fc_row.addWidget(self.chk_input_filter_enable)
         filt_fc_row.addStretch(1)
         self.cmb_filter_type = QComboBox()
@@ -1155,7 +1276,7 @@ class MainWindow(QWidget):
             "Enable final Teensy torque filter before motor output.\n"
             "RL mode always bypasses Teensy pre-motor filter."
         )
-        self.chk_torque_filter_enable.stateChanged.connect(self._tx_params)
+        self.chk_torque_filter_enable.stateChanged.connect(self._on_algo_staged_control_changed)
         tf_head.addWidget(self.chk_torque_filter_enable)
         tf_head.addStretch(1)
         self.cmb_torque_filter_type = QComboBox()
@@ -1225,7 +1346,7 @@ class MainWindow(QWidget):
         self.sb_Assist_delay_gain = QSpinBox()
         self.sb_Assist_delay_gain.setRange(0, 99); self.sb_Assist_delay_gain.setValue(40)
         self.sb_Assist_delay_gain.setToolTip(eg_tip_delay_idx)
-        self.sb_Assist_delay_gain.valueChanged.connect(self._tx_params)
+        self.sb_Assist_delay_gain.valueChanged.connect(self._on_algo_staged_control_changed)
 
         eg_labels = ["R Gain", "L Gain", "gate_k", "gate_p_on",
                      "scale_all", "ext_frac_L", "ext_frac_R", "ext_gain", "Delay idx(phase)"]
@@ -1252,7 +1373,7 @@ class MainWindow(QWidget):
         self.chk_eg_legacy_path = QCheckBox("Legacy EG Path")
         self.chk_eg_legacy_path.setChecked(False)
         self.chk_eg_legacy_path.setToolTip(eg_tip_legacy_path)
-        self.chk_eg_legacy_path.stateChanged.connect(self._tx_params)
+        self.chk_eg_legacy_path.stateChanged.connect(self._on_algo_staged_control_changed)
         self.chk_eg_legacy_path.stateChanged.connect(
             lambda _=0: self._update_teensy_prefilter_ui_state(self._algo_select))
         self.chk_eg_auto_delay = QCheckBox("Auto Delay")
@@ -1302,7 +1423,7 @@ class MainWindow(QWidget):
         self.chk_sam_legacy_lpf = QCheckBox("Legacy Internal LPF")
         self.chk_sam_legacy_lpf.setChecked(False)
         self.chk_sam_legacy_lpf.setToolTip(sam_legacy_tip)
-        self.chk_sam_legacy_lpf.stateChanged.connect(self._tx_params)
+        self.chk_sam_legacy_lpf.stateChanged.connect(self._on_algo_staged_control_changed)
         self.chk_sam_legacy_lpf.stateChanged.connect(
             lambda _=0: self._update_teensy_prefilter_ui_state(self._algo_select))
         self.chk_sam_auto_delay = QCheckBox("Auto Delay")
@@ -1353,8 +1474,8 @@ class MainWindow(QWidget):
 
         # Row 2: Scale (staged, not auto-sent)
         self.sb_rl_scale = make_dspin(1.00, 0.00, 20.00, 0.01, 2,
-                                      "RL torque scale (L/R same)")
-        self.sb_rl_scale.valueChanged.disconnect(self._tx_params)
+                                      "RL torque scale (L/R same)",
+                                      on_change=self._on_rl_staged_control_changed)
         lbl_rl_scale = QLabel("RL Scale (L/R)")
         lbl_rl_scale.setToolTip(self.sb_rl_scale.toolTip())
         rl_lay.addWidget(lbl_rl_scale, 2, 0)
@@ -1362,8 +1483,8 @@ class MainWindow(QWidget):
 
         # Row 3: Delay (step=10ms, staged)
         self.sb_rl_torque_delay = make_dspin(0.0, 0.0, 1000.0, 10.0, 0,
-                                             "RL torque delay absolute (ms), 0~1000")
-        self.sb_rl_torque_delay.valueChanged.disconnect(self._tx_params)
+                                             "RL torque delay absolute (ms), 0~1000",
+                                             on_change=self._on_rl_staged_control_changed)
         self.lbl_rl_torque_delay_auto = QLabel("L=--.- ms | R=--.- ms")
         self.lbl_rl_torque_delay_auto.setStyleSheet(
             f"color:{C.text2}; font-size:13px; background:transparent;"
@@ -1381,6 +1502,7 @@ class MainWindow(QWidget):
         self.cmb_rl_filter_type = QComboBox()
         self.cmb_rl_filter_type.addItems([x[0] for x in RL_FILTER_TYPES])
         self._setup_combo(self.cmb_rl_filter_type)
+        self.cmb_rl_filter_type.currentIndexChanged.connect(self._on_rl_staged_control_changed)
         self.cmb_rl_filter_type.setToolTip("RL runtime filter type on RPi.")
         self.lbl_rl_filter_type = QLabel("Filter Type")
         self.lbl_rl_filter_type.setToolTip(self.cmb_rl_filter_type.toolTip())
@@ -1389,8 +1511,8 @@ class MainWindow(QWidget):
 
         # Row 5: Filter Cutoff (default 5Hz, staged)
         self.sb_rl_cutoff_hz = make_dspin(5.0, 0.5, 30.0, 0.5, 1,
-                                          "RL runtime filter cutoff (Hz)")
-        self.sb_rl_cutoff_hz.valueChanged.disconnect(self._tx_params)
+                                          "RL runtime filter cutoff (Hz)",
+                                          on_change=self._on_rl_staged_control_changed)
         self.lbl_rl_cutoff = QLabel("Filter Cutoff (Hz)")
         self.lbl_rl_cutoff.setToolTip(self.sb_rl_cutoff_hz.toolTip())
         rl_lay.addWidget(self.lbl_rl_cutoff, 5, 0)
@@ -1412,8 +1534,11 @@ class MainWindow(QWidget):
         self.chk_rl_torque_filter.setChecked(True)
         self.chk_rl_auto_delay.setChecked(False)
         self.chk_rl_vr_filter.stateChanged.connect(self._update_rl_filter_state_label)
+        self.chk_rl_vr_filter.stateChanged.connect(self._on_rl_staged_control_changed)
         self.chk_rl_torque_filter.stateChanged.connect(self._update_rl_filter_state_label)
+        self.chk_rl_torque_filter.stateChanged.connect(self._on_rl_staged_control_changed)
         self.chk_rl_auto_delay.stateChanged.connect(self._on_rl_auto_delay_toggled)
+        self.chk_rl_auto_delay.stateChanged.connect(self._on_rl_staged_control_changed)
         filt_row.addWidget(self.chk_rl_vr_filter)
         filt_row.addWidget(self.chk_rl_torque_filter)
         filt_row.addWidget(self.chk_rl_auto_delay)
@@ -1432,6 +1557,7 @@ class MainWindow(QWidget):
             "Auto Delay optimizer on RPi: Grid(local scan) or Bayes(1D GP BO)."
         )
         self.cmb_rl_auto_method.currentIndexChanged.connect(self._update_rl_filter_state_label)
+        self.cmb_rl_auto_method.currentIndexChanged.connect(self._on_rl_staged_control_changed)
         lbl_rl_auto_method = QLabel("Auto Method")
         lbl_rl_auto_method.setToolTip(self.cmb_rl_auto_method.toolTip())
         rl_lay.addWidget(lbl_rl_auto_method, 7, 0)
@@ -1772,6 +1898,13 @@ class MainWindow(QWidget):
         row1.addWidget(self.sw_auto_scroll)
         row1.addStretch(1)
 
+        self.btn_plot_page = QPushButton("Motor Data")
+        self.btn_plot_page.setCursor(Qt.PointingHandCursor)
+        self.btn_plot_page.setFixedHeight(24)
+        self.btn_plot_page.setToolTip("Switch right panel between Main Plots and Motor telemetry page.")
+        self.btn_plot_page.clicked.connect(self._toggle_plot_page)
+        row1.addWidget(self.btn_plot_page)
+
         plot_card_vlay.addLayout(row1)
 
         # --- Row 2: Direction controls + Capture buttons ---
@@ -1979,6 +2112,7 @@ class MainWindow(QWidget):
 
         # Display card goes to right side (plots area), added later in _build_plots
         self._plot_card = plot_card
+        self.right_root_layout.insertWidget(0, self._plot_card)
 
         # ---- Hardware Card ----
         hw_card = CardFrame()
@@ -2120,7 +2254,7 @@ class MainWindow(QWidget):
         """)
         left.addWidget(self.lbl_status)
 
-        self.plot_layout = plots
+        self.plot_layout = self.plot_page_main_lay
 
     # ================================================================ Port / Combo helpers
     def _setup_combo(self, combo: QComboBox):
@@ -3160,15 +3294,143 @@ class MainWindow(QWidget):
         pt[20] = auto_flags & 0xFF
         return pt
 
+    def _get_algo_cfg_signature(self):
+        return (
+            round(float(self.sb_max_torque_cfg.value()), 3),
+            int(self.chk_input_filter_enable.isChecked()),
+            int(self.cmb_filter_type.currentIndex()),
+            round(float(self.sb_filter_fc.value()), 3),
+            round(float(self.sb_input_filter_alpha.value()), 3),
+            int(self.chk_torque_filter_enable.isChecked()),
+            int(self.cmb_torque_filter_type.currentIndex()),
+            round(float(self.sb_torque_filter_fc.value()), 3),
+            round(float(self.sb_torque_filter_alpha.value()), 3),
+            round(float(self.sb_Flex_Assist_gain.value()), 4),
+            round(float(self.sb_Ext_Assist_gain.value()), 4),
+            round(float(self.sb_gate_k.value()), 4),
+            round(float(self.sb_gate_p_on.value()), 4),
+            round(float(self.sb_scale_all.value()), 4),
+            round(float(self.sb_ext_phase_frac_L.value()), 4),
+            round(float(self.sb_ext_phase_frac_R.value()), 4),
+            round(float(self.sb_ext_gain.value()), 4),
+            int(self.sb_Assist_delay_gain.value()),
+            round(float(self.sb_eg_post_delay.value()), 2),
+            int(self.chk_eg_legacy_path.isChecked()),
+            int(self.chk_eg_auto_delay.isChecked()),
+            round(float(self.sb_sam_kappa.value()), 4),
+            round(float(self.sb_sam_delay.value()), 2),
+            int(self.chk_sam_legacy_lpf.isChecked()),
+            int(self.chk_sam_auto_delay.isChecked()),
+            round(float(self.sb_sogi_A.value()), 4),
+            round(float(self.sb_sogi_lead.value()), 4),
+            round(float(self.sb_sogi_amp_min.value()), 4),
+            round(float(self.sb_sogi_amp_on.value()), 4),
+            round(float(self.sb_sogi_amp_off.value()), 4),
+            round(float(self.sb_sogi_move_on.value()), 4),
+            round(float(self.sb_sogi_move_off.value()), 4),
+            round(float(self.sb_test_amplitude.value()), 4),
+            int(self.cmb_test_waveform.currentIndex()),
+            round(float(self.sb_test_freq.value()), 4),
+        )
+
+    def _get_rl_cfg_signature(self):
+        return (
+            round(float(self.sb_rl_scale.value()), 4),
+            round(float(self.sb_rl_torque_delay.value()), 3),
+            round(float(self.sb_rl_cutoff_hz.value()), 3),
+            int(self.cmb_rl_filter_type.currentIndex()),
+            int(self.chk_rl_vr_filter.isChecked()),
+            int(self.chk_rl_torque_filter.isChecked()),
+            int(self.chk_rl_auto_delay.isChecked()),
+            int(self.cmb_rl_auto_method.currentIndex()) if hasattr(self, "cmb_rl_auto_method") else 0,
+        )
+
+    def _set_apply_button_style(self, btn, dirty: bool, text_clean: str, text_dirty: str):
+        if btn is None:
+            return
+        if dirty:
+            btn.setEnabled(True)
+            btn.setText(text_dirty)
+            btn.setStyleSheet(
+                f"background-color:{C.orange}; color:black; font-weight:700; "
+                f"border-radius:8px; padding:8px 16px; font-size:13px;"
+            )
+        else:
+            btn.setEnabled(False)
+            btn.setText(text_clean)
+            btn.setStyleSheet(
+                f"background-color:{C.fill}; color:{C.text2}; font-weight:600; "
+                f"border-radius:8px; padding:8px 16px; font-size:13px;"
+            )
+
+    def _update_apply_buttons_state(self):
+        if not getattr(self, "_ui_ready", False):
+            return
+        cur_algo_sig = self._get_algo_cfg_signature()
+        if self._algo_last_applied_sig is None:
+            self._algo_last_applied_sig = cur_algo_sig
+        algo_param_dirty = (cur_algo_sig != self._algo_last_applied_sig)
+        # Robust sync check: desired (pending) != runtime(active from Teensy)
+        # Keep Apply enabled until the desired algo is acknowledged in uplink.
+        algo_sync_mismatch = (
+            self._algo_active_rx is not None
+            and int(self._algo_active_rx) != int(self._algo_pending)
+        )
+        algo_waiting_ack = bool(getattr(self, "_algo_apply_waiting_ack", False))
+        # Algorithm apply: when selected algorithm differs OR staged left-panel params changed.
+        self._algo_dirty = (
+            (self._algo_pending != self._algo_select)
+            or algo_param_dirty
+            or algo_sync_mismatch
+            or algo_waiting_ack
+        )
+        self._set_apply_button_style(
+            getattr(self, "btn_algo_confirm", None),
+            self._algo_dirty,
+            "Apply Algorithm",
+            "Apply Algorithm *",
+        )
+
+        # RL apply: only meaningful in RL mode and when staged values differ from last applied snapshot.
+        cur_sig = self._get_rl_cfg_signature()
+        if self._rl_last_applied_sig is None:
+            self._rl_last_applied_sig = cur_sig
+        self._rl_dirty = (cur_sig != self._rl_last_applied_sig)
+        rl_btn_dirty = (self._algo_select == ALGO_RL) and self._rl_dirty
+        self._set_apply_button_style(
+            getattr(self, "btn_apply_rl", None),
+            rl_btn_dirty,
+            "Apply RL Settings",
+            "Apply RL Settings *",
+        )
+
+    def _on_rl_staged_control_changed(self, *_args):
+        if not getattr(self, "_ui_ready", False):
+            return
+        self._update_rl_filter_state_label()
+        self._update_apply_buttons_state()
+
+    def _on_algo_staged_control_changed(self, *_args):
+        if not getattr(self, "_ui_ready", False):
+            return
+        self._update_apply_buttons_state()
+
     def _on_apply_rl_clicked(self):
         """Apply RL button: send staged RL params to RPi via BLE passthrough."""
-        if not (self.connected and self.ser):
+        # [DBG-Phase1] 入口快照
+        _dbg_log(
+            f"[_on_apply_rl_clicked ENTER] rl_dirty={self._rl_dirty} "
+            f"connected={self.connected} algo_select={self._algo_select} "
+            f"rl_sig={self._get_rl_cfg_signature()}"
+        )
+        if (not (self.connected and self.ser)) or (not self._rl_dirty):
+            _dbg_log("[_on_apply_rl_clicked] EARLY RETURN (not connected or not dirty)")
             return
         self._queue_align_event("rl_apply", pi_tag="RLAPPLY")
         self._tx_params()
+        self._rl_last_applied_sig = self._get_rl_cfg_signature()
         self._update_rl_filter_state_label()
-        # Re-affirm motor direction after RPi params are sent
-        QTimer.singleShot(150, self._tx_params)
+        self._update_apply_buttons_state()
 
     def _on_rl_auto_delay_toggled(self, _state):
         self._update_rl_delay_input_mode()
@@ -3183,7 +3445,7 @@ class MainWindow(QWidget):
             self.sb_sam_delay.setToolTip("Auto Delay ON: Teensy optimizing delay_ms (L/R independent).")
         else:
             self.sb_sam_delay.setToolTip("")
-        self._tx_params()
+        self._on_algo_staged_control_changed()
 
     def _on_sam_reset_clicked(self):
         """Reset Samsung Auto Delay: send falling+rising edge on auto_delay_enable to cold-start ADO."""
@@ -3207,7 +3469,7 @@ class MainWindow(QWidget):
             self.sb_eg_post_delay.setToolTip(
                 "EG output post-delay (ms). Applied after internal Assist_delay_gain.")
             self.sb_Assist_delay_gain.setToolTip("")
-        self._tx_params()
+        self._on_algo_staged_control_changed()
 
     def _on_eg_reset_clicked(self):
         """Reset EG Auto Delay: send falling+rising edge on auto_delay_enable to cold-start ADO."""
@@ -3254,6 +3516,7 @@ class MainWindow(QWidget):
         else:
             self.sb_rl_torque_delay.setToolTip("RL torque delay absolute (ms), 0~1000")
             self.rl_delay_stack.setCurrentIndex(0)
+        self._update_apply_buttons_state()
 
     def _update_rl_panel_for_nn_type(self):
         """根据 RPi 报告的 nn_type 调整 RL 面板控件可见性"""
@@ -3328,6 +3591,8 @@ class MainWindow(QWidget):
         self.chk_rl_torque_filter.setChecked(preset['torque'])
         self.chk_rl_torque_filter.blockSignals(False)
         self._update_rl_delay_input_mode()
+        self._rl_last_applied_sig = self._get_rl_cfg_signature()
+        self._update_apply_buttons_state()
 
     def _on_input_filter_type_changed(self, _index):
         """Toggle Teensy input-filter parameter widget by filter type."""
@@ -3340,7 +3605,7 @@ class MainWindow(QWidget):
             self.lbl_input_param.setText("alpha")
             self.sb_filter_fc.hide()
             self.sb_input_filter_alpha.show()
-        self._tx_params()
+        self._on_algo_staged_control_changed()
 
     def _on_torque_filter_type_changed(self, _index):
         """Toggle Teensy torque-filter parameter widget by filter type."""
@@ -3353,7 +3618,7 @@ class MainWindow(QWidget):
             self.lbl_torque_param.setText("alpha")
             self.sb_torque_filter_fc.hide()
             self.sb_torque_filter_alpha.show()
-        self._tx_params()
+        self._on_algo_staged_control_changed()
 
     def _update_teensy_prefilter_ui_state(self, algo_id=None):
         """Update Teensy filter UI availability by runtime path.
@@ -3554,7 +3819,7 @@ class MainWindow(QWidget):
         is_sin = (index == 1)
         self.lbl_test_freq.setVisible(is_sin)
         self.sb_test_freq.setVisible(is_sin)
-        self._tx_params()
+        self._on_algo_staged_control_changed()
 
     # ================================================================ Algorithm
     def _on_algo_selected(self, index):
@@ -3564,19 +3829,34 @@ class MainWindow(QWidget):
             self._algo_pending = ALGO_EG
         self.algo_stack.setCurrentIndex(index)
         self._update_rl_filter_state_label()
+        self._update_apply_buttons_state()
 
     def _on_algo_confirm(self):
+        # [DBG-Phase1] 入口快照: 看清楚点 Apply Algorithm 那一刻的状态
+        _dbg_log(
+            f"[_on_algo_confirm ENTER] select={self._algo_select} "
+            f"pending={self._algo_pending} dirty={self._algo_dirty} "
+            f"waiting_ack={getattr(self, '_algo_apply_waiting_ack', False)} "
+            f"active_rx={self._algo_active_rx} connected={self.connected} "
+            f"power_on={self.btn_power.isChecked()} "
+            f"sb_maxT={float(self.sb_max_torque_cfg.value()):.2f}"
+        )
+        if not self._algo_dirty:
+            _dbg_log("[_on_algo_confirm] EARLY RETURN (not dirty) -- click had no effect")
+            return
+        algo_changed = (self._algo_select != self._algo_pending)
         self._algo_select = self._algo_pending
         algo_name = ALGO_NAMES.get(self._algo_select, '?')
         print(f"[GUI] Algorithm CONFIRMED: {algo_name}")
         self._update_teensy_prefilter_ui_state(self._algo_select)
-        # Force fresh status parsing after algorithm switch (avoid stale overlay state).
-        self._rpi_status_valid = False
-        self._rpi_online = False
-        self._rpi_last_rx_time = 0.0
-        self._rpi_status_version = 0
-        self._rpi_nn_type = -1
-        self._prev_rpi_nn_type = -1
+        # Force fresh status parsing only when algorithm really switches.
+        if algo_changed:
+            self._rpi_status_valid = False
+            self._rpi_online = False
+            self._rpi_last_rx_time = 0.0
+            self._rpi_status_version = 0
+            self._rpi_nn_type = -1
+            self._prev_rpi_nn_type = -1
         algo_tag_map = {
             "EG": "ALG_EG",
             "Samsung": "ALG_SAM",
@@ -3584,15 +3864,23 @@ class MainWindow(QWidget):
             "SOGI": "ALG_SOGI",
             "Test": "ALG_TEST",
         }
-        self._queue_align_event(f"algo_apply:{algo_name}", pi_tag=algo_tag_map.get(algo_name))
-        self._update_rl_filter_state_label()
+        if algo_changed:
+            self._queue_align_event(f"algo_apply:{algo_name}", pi_tag=algo_tag_map.get(algo_name))
+        else:
+            self._queue_align_event(f"param_apply:{algo_name}")
+        sent = False
         if self.connected and self.ser:
-            # Send a short burst to survive occasional BLE/UART frame loss.
-            for k in range(4):
-                QTimer.singleShot(35 * k, self._tx_params)
-            # Re-affirm motor direction after firmware processes algo change
-            # (firmware may re-initialize direction state on algo switch)
-            QTimer.singleShot(35 * 4 + 100, self._tx_params)
+            self._tx_params()
+            sent = True
+        if sent:
+            if algo_changed:
+                self._algo_apply_waiting_ack = True
+                self._algo_apply_sent_ts = time.time()
+            else:
+                self._algo_apply_waiting_ack = False
+            self._algo_last_applied_sig = self._get_algo_cfg_signature()
+        self._update_rl_filter_state_label()
+        self._update_apply_buttons_state()
 
     # ================================================================ Callbacks
     def _on_brand_changed(self, index):
@@ -3773,15 +4061,37 @@ class MainWindow(QWidget):
             """)
 
     def _on_power_toggled(self, checked):
+        # [DBG-Phase1] 入口快照: 看 Power 切换点击那一刻的关键状态
+        _dbg_log(
+            f"[_on_power_toggled ENTER] checked={checked} "
+            f"sb_now={float(self.sb_max_torque_cfg.value()):.2f} "
+            f"_maxT_before_off={self._maxT_before_off:.2f} "
+            f"connected={self.connected} algo_select={self._algo_select}"
+        )
         if checked:
             val = self._maxT_before_off if self._maxT_before_off > 0.0 else 15.0
+            self.sb_max_torque_cfg.blockSignals(True)
             self.sb_max_torque_cfg.setValue(val)
+            self.sb_max_torque_cfg.blockSignals(False)
             self._set_power_ui(True)
         else:
             self._maxT_before_off = float(self.sb_max_torque_cfg.value())
+            self.sb_max_torque_cfg.blockSignals(True)
             self.sb_max_torque_cfg.setValue(0.0)
+            self.sb_max_torque_cfg.blockSignals(False)
             self._set_power_ui(False)
+        self._sync_power_btn_from_torque(float(self.sb_max_torque_cfg.value()))
+        sent = bool(self.connected and self.ser)
         self._tx_params()
+        if sent:
+            self._algo_last_applied_sig = self._get_algo_cfg_signature()
+        self._update_apply_buttons_state()
+        # [DBG-Phase1] 出口快照: 看 _tx_params 后的最终值
+        _dbg_log(
+            f"[_on_power_toggled EXIT]  sb_after={float(self.sb_max_torque_cfg.value()):.2f} "
+            f"_maxT_before_off={self._maxT_before_off:.2f} "
+            f"btn_checked={self.btn_power.isChecked()} sent={sent}"
+        )
         
     def _sync_power_btn_from_torque(self, value):
         # Invariant: btn_power.isChecked() iff sb_max_torque_cfg.value() > 0.
@@ -3825,6 +4135,32 @@ class MainWindow(QWidget):
         self._render_dirty = True
         self._last_render_values = None
         self._last_render_ts = 0.0
+
+    def _set_plot_page(self, page_index):
+        idx = int(page_index)
+        if idx not in (PLOT_PAGE_MAIN, PLOT_PAGE_MOTOR):
+            idx = PLOT_PAGE_MAIN
+        self._plot_page = idx
+        if hasattr(self, "plot_pages"):
+            self.plot_pages.setCurrentIndex(idx)
+        if hasattr(self, "btn_plot_page"):
+            if idx == PLOT_PAGE_MAIN:
+                self.btn_plot_page.setText("Motor Data")
+                self.btn_plot_page.setStyleSheet("font-size:11px; padding:2px 8px; font-weight:600;")
+            else:
+                self.btn_plot_page.setText("Main Plots")
+                self.btn_plot_page.setStyleSheet(
+                    f"font-size:11px; padding:2px 8px; font-weight:600; "
+                    f"background-color:{C.orange}; color:black; border-radius:8px;"
+                )
+        self._render_dirty = True
+        self._maybe_render_plot(force=True)
+
+    def _toggle_plot_page(self):
+        if self._plot_page == PLOT_PAGE_MAIN:
+            self._set_plot_page(PLOT_PAGE_MOTOR)
+        else:
+            self._set_plot_page(PLOT_PAGE_MAIN)
 
     def _on_signal_source_changed(self, text):
         self._signal_source_mode = str(text or "Auto")
@@ -3969,6 +4305,10 @@ class MainWindow(QWidget):
 
         self.L_pwr_buf.append(L_pwr)
         self.R_pwr_buf.append(R_pwr)
+        self.motor_cur_L_buf.append(float(self._motor_cur_L_A))
+        self.motor_cur_R_buf.append(float(self._motor_cur_R_A))
+        self.motor_rpm_L_buf.append(float(self._motor_rpm_L))
+        self.motor_rpm_R_buf.append(float(self._motor_rpm_R))
 
         if log_csv and hasattr(self, '_csv_writer'):
             now_wall = time.time()
@@ -3998,6 +4338,11 @@ class MainWindow(QWidget):
                 f'{float(self._sync_cmd_L):.4f}', f'{float(self._sync_cmd_R):.4f}',
                 f'{float(self._phys_pwr_L):.4f}', f'{float(self._phys_pwr_R):.4f}',
                 f'{float(self._ctrl_pwr_L):.4f}', f'{float(self._ctrl_pwr_R):.4f}',
+                f'{float(self._motor_cur_L_A):.4f}', f'{float(self._motor_cur_R_A):.4f}',
+                f'{float(self._motor_rpm_L):.3f}', f'{float(self._motor_rpm_R):.3f}',
+                str(int(1 if self._motor_telem_valid else 0)),
+                str(int(1 if self._motor_cur_valid else 0)),
+                str(int(1 if self._motor_rpm_valid else 0)),
                 str(int(self._sync_sample_id) & 0xFFFF),
                 str(int(1 if self._sync_from_pi else 0)),
                 f'{float(gait_freq):.3f}',
@@ -4069,6 +4414,10 @@ class MainWindow(QWidget):
         L_tau_d = list(self.L_tau_d_buf)
         L_vel = list(self.L_vel_buf)
         L_pwr = list(self.L_pwr_buf)
+        mcurL = list(self.motor_cur_L_buf)
+        mcurR = list(self.motor_cur_R_buf)
+        mrpmL = list(self.motor_rpm_L_buf)
+        mrpmR = list(self.motor_rpm_R_buf)
 
         self.L_angle_line.setData(tl, R_IMU)
         self.L_tau_line.setData(tl, R_tau)
@@ -4080,6 +4429,10 @@ class MainWindow(QWidget):
         self.R_tau_d_line.setData(tl, L_tau_d)
         self.R_vel_line.setData(tl, L_vel)
         self.R_pwr_line.setData(tl, L_pwr)
+        self.motor_cur_L_line.setData(tl, mcurL)
+        self.motor_cur_R_line.setData(tl, mcurR)
+        self.motor_rpm_L_line.setData(tl, mrpmL)
+        self.motor_rpm_R_line.setData(tl, mrpmR)
         self._update_power_strip(tl, R_pwr, 'right')
         self._update_power_strip(tl, L_pwr, 'left')
 
@@ -4088,6 +4441,8 @@ class MainWindow(QWidget):
             x1 = tl[-1]
             self.plot_left.getViewBox().setXRange(x0, x1, padding=0.02)
             self.plot_right.getViewBox().setXRange(x0, x1, padding=0.02)
+            self.motor_plot_current.getViewBox().setXRange(x0, x1, padding=0.02)
+            self.motor_plot_rpm.getViewBox().setXRange(x0, x1, padding=0.02)
 
         if self._last_render_values is not None:
             (L_angle, R_angle, L_tau_d, R_tau_d,
@@ -4100,6 +4455,14 @@ class MainWindow(QWidget):
             self.lbl_Rtau.setText(f"R est: {R_tau:.1f} Nm")
             self.lbl_Lpwr.setText(f"L pwr: {L_pwr_now:.2f} W")
             self.lbl_Rpwr.setText(f"R pwr: {R_pwr_now:.2f} W")
+            if hasattr(self, "lbl_motor_page_state"):
+                if self._motor_telem_valid:
+                    self.lbl_motor_page_state.setText(
+                        f"Motor telem OK | L: {self._motor_cur_L_A:+.1f}A {self._motor_rpm_L:+.0f}rpm  "
+                        f"R: {self._motor_cur_R_A:+.1f}A {self._motor_rpm_R:+.0f}rpm"
+                    )
+                else:
+                    self.lbl_motor_page_state.setText("Motor telemetry: waiting...")
 
         self._render_dirty = False
         self._last_render_ts = now
@@ -4108,7 +4471,9 @@ class MainWindow(QWidget):
         self.win_size = val
         for attr in ['t_buffer', 'L_IMU_buf', 'R_IMU_buf', 'L_tau_buf', 'R_tau_buf',
                      'L_tau_d_buf', 'R_tau_d_buf', 'L_vel_buf', 'R_vel_buf',
-                     'L_pwr_buf', 'R_pwr_buf']:
+                     'L_pwr_buf', 'R_pwr_buf',
+                     'motor_cur_L_buf', 'motor_cur_R_buf',
+                     'motor_rpm_L_buf', 'motor_rpm_R_buf']:
             old = getattr(self, attr)
             setattr(self, attr, deque(old, maxlen=val))
         self._render_dirty = True
@@ -4197,6 +4562,20 @@ class MainWindow(QWidget):
         self.pwr_strip_right_fill_neg.setBrush(pg.mkBrush(red_fill))
         self.pwr_strip_left_fill_neg.setBrush(pg.mkBrush(red_fill))
 
+        # Motor telemetry page plots
+        for pw in [getattr(self, 'motor_plot_current', None), getattr(self, 'motor_plot_rpm', None)]:
+            if pw is None:
+                continue
+            pw.setBackground(C.plot_bg)
+            pw.getPlotItem().getAxis('bottom').setPen(C.plot_fg)
+            pw.getPlotItem().getAxis('bottom').setTextPen(C.plot_fg)
+            pw.getPlotItem().getAxis('left').setPen(C.plot_fg)
+            pw.getPlotItem().getAxis('left').setTextPen(C.plot_fg)
+            pw.getPlotItem().titleLabel.setText(pw.getPlotItem().titleLabel.text, color=C.plot_fg)
+        if hasattr(self, 'lbl_motor_page_state'):
+            self.lbl_motor_page_state.setStyleSheet(
+                f"font-size:12px; color:{C.text2}; background:transparent; padding:2px 4px;")
+
         # Toggle colors
         self.sw_auto_scroll._on_color = C.blue
         self.sw_auto_scroll._off_color = C.fill
@@ -4206,6 +4585,7 @@ class MainWindow(QWidget):
         self.sw_persist.update()
         self.sw_theme._off_color = C.fill
         self.sw_theme.update()
+        self._set_plot_page(self._plot_page)
 
         # Ensure combo popup palette follows theme on all platforms.
         for combo in self._combo_boxes:
@@ -5076,6 +5456,13 @@ class MainWindow(QWidget):
         self._replay_last_wall_time = time.time()
         self._replay_status_last_ts = 0.0
         self._clear_buffers()
+        self._motor_cur_L_A = 0.0
+        self._motor_cur_R_A = 0.0
+        self._motor_rpm_L = 0.0
+        self._motor_rpm_R = 0.0
+        self._motor_telem_valid = False
+        self._motor_cur_valid = False
+        self._motor_rpm_valid = False
         self._set_replay_controls_active(True)
         self._set_replay_finished(False)
         self.btn_replay_pause.blockSignals(True)
@@ -5310,9 +5697,6 @@ class MainWindow(QWidget):
 
     # ================================================================ Plots
     def _build_plots(self):
-        # Add Display card to right side (above plots)
-        self.plot_layout.addWidget(self._plot_card)
-
         pen_angle = pg.mkPen('#34c759', width=2)
         pen_cmd   = pg.mkPen('#007aff', width=2)
         pen_est   = pg.mkPen('#ff3b30', width=2)
@@ -5506,6 +5890,44 @@ class MainWindow(QWidget):
         self.pwr_strip_left.addItem(self.pwr_strip_left_overlay)
         self.pwr_strip_left.setYRange(-5.0, 5.0, padding=0.02)
         self.plot_layout.addWidget(self.pwr_strip_left, 0)
+
+        # ---- Motor telemetry page (Current / RPM) ----
+        self.motor_plot_current = pg.PlotWidget(background=C.plot_bg)
+        self.motor_plot_current.setTitle("Motor Current (A)", color=C.plot_fg, size='13pt')
+        self.motor_plot_current.showGrid(x=True, y=True, alpha=0.15)
+        self.motor_plot_current.getAxis('left').setLabel('Current', units='A', color=C.plot_fg)
+        self.motor_plot_current.getAxis('left').setPen(C.plot_fg)
+        self.motor_plot_current.getAxis('left').setTextPen(C.plot_fg)
+        self.motor_plot_current.getAxis('bottom').setLabel('Time', units='s', color=C.text2)
+        self.motor_plot_current.getAxis('bottom').setPen(C.plot_fg)
+        self.motor_plot_current.getAxis('bottom').setTextPen(C.plot_fg)
+        self.motor_plot_current.addLegend(offset=(8, 8))
+        self.motor_cur_L_line = self.motor_plot_current.plot(
+            name="L Current", pen=pg.mkPen('#34c759', width=2))
+        self.motor_cur_R_line = self.motor_plot_current.plot(
+            name="R Current", pen=pg.mkPen('#007aff', width=2))
+        self.plot_page_motor_lay.addWidget(self.motor_plot_current, 1)
+
+        self.motor_plot_rpm = pg.PlotWidget(background=C.plot_bg)
+        self.motor_plot_rpm.setTitle("Motor Speed (RPM)", color=C.plot_fg, size='13pt')
+        self.motor_plot_rpm.showGrid(x=True, y=True, alpha=0.15)
+        self.motor_plot_rpm.getAxis('left').setLabel('Speed', units='rpm', color=C.plot_fg)
+        self.motor_plot_rpm.getAxis('left').setPen(C.plot_fg)
+        self.motor_plot_rpm.getAxis('left').setTextPen(C.plot_fg)
+        self.motor_plot_rpm.getAxis('bottom').setLabel('Time', units='s', color=C.text2)
+        self.motor_plot_rpm.getAxis('bottom').setPen(C.plot_fg)
+        self.motor_plot_rpm.getAxis('bottom').setTextPen(C.plot_fg)
+        self.motor_plot_rpm.addLegend(offset=(8, 8))
+        self.motor_rpm_L_line = self.motor_plot_rpm.plot(
+            name="L RPM", pen=pg.mkPen('#ff9f0a', width=2))
+        self.motor_rpm_R_line = self.motor_plot_rpm.plot(
+            name="R RPM", pen=pg.mkPen('#bf5af2', width=2))
+        self.plot_page_motor_lay.addWidget(self.motor_plot_rpm, 1)
+
+        self.lbl_motor_page_state = QLabel("Motor telemetry: waiting...")
+        self.lbl_motor_page_state.setStyleSheet(
+            f"font-size:12px; color:{C.text2}; background:transparent; padding:2px 4px;")
+        self.plot_page_motor_lay.addWidget(self.lbl_motor_page_state)
         self._update_power_strip_titles(force=True)
         self._configure_plot_items_performance()
 
@@ -5516,6 +5938,8 @@ class MainWindow(QWidget):
             self.R_angle_line, self.R_tau_d_line, self.R_tau_line, self.R_vel_line, self.R_pwr_line,
             self.pwr_strip_right_zero, self.pwr_strip_right_pos, self.pwr_strip_right_neg,
             self.pwr_strip_left_zero, self.pwr_strip_left_pos, self.pwr_strip_left_neg,
+            self.motor_cur_L_line, self.motor_cur_R_line,
+            self.motor_rpm_L_line, self.motor_rpm_R_line,
         ]
         for item in plot_items:
             if item is None:
@@ -5842,6 +6266,8 @@ class MainWindow(QWidget):
         self._rpi_last_rx_time = 0.0
         self._rpi_nn_type = -1
         self._rpi_status_version = 0
+        self._algo_active_rx = None
+        self._algo_apply_waiting_ack = False
         self._rpi_auto_delay_enable = False
         self._rpi_auto_method_bo = False
         self._rpi_auto_motion_valid = False
@@ -5861,6 +6287,13 @@ class MainWindow(QWidget):
         self._rpi_best_delay_ms_R = 0.0
         self._rpi_delay_ms_L = 0.0
         self._rpi_delay_ms_R = 0.0
+        self._motor_cur_L_A = 0.0
+        self._motor_cur_R_A = 0.0
+        self._motor_rpm_L = 0.0
+        self._motor_rpm_R = 0.0
+        self._motor_telem_valid = False
+        self._motor_cur_valid = False
+        self._motor_rpm_valid = False
         self._sam_auto_delay_enable = False
         self._eg_auto_delay_enable = False
         if hasattr(self, 'lbl_rpi_nn_type'):
@@ -5874,6 +6307,9 @@ class MainWindow(QWidget):
         self.btn_connect.setText("Connected")
         self._set_power_ui(self.sb_max_torque_cfg.value() > 0.0)
         self._tx_params()
+        self._algo_last_applied_sig = self._get_algo_cfg_signature()
+        self._rl_last_applied_sig = self._get_rl_cfg_signature()
+        self._update_apply_buttons_state()
         self._queue_align_event(f"serial_connected:{port}", pi_tag="SERCON")
 
     def _connect_clicked(self):
@@ -5946,7 +6382,15 @@ class MainWindow(QWidget):
         if self._motor_init_request: flags |= 0x02
         flags |= (self._dir_bits & 0x03) << 2
         payload[2] = flags
-        put_s16(3, max(0.0, min(30.0, float(self.sb_max_torque_cfg.value()))))
+        # Power-UI hard invariant:
+        #   POWER OFF => always send 0Nm max torque, regardless of spinbox shadow value.
+        #   POWER ON  => send spinbox torque (fallback to 15Nm if UI is inconsistent).
+        max_torque_to_send = float(self.sb_max_torque_cfg.value())
+        if not self.btn_power.isChecked():
+            max_torque_to_send = 0.0
+        elif max_torque_to_send <= 0.0:
+            max_torque_to_send = self._maxT_before_off if self._maxT_before_off > 0.0 else 15.0
+        put_s16(3, max(0.0, min(30.0, max_torque_to_send)))
         # Teensy filter settings:
         # [31..32] input Butterworth fc (Hz*100)
         # [34..35] torque Butterworth fc (Hz*100)
@@ -6016,7 +6460,26 @@ class MainWindow(QWidget):
             put_s16(17, float(self.sb_sogi_move_off.value()), 1000)
 
         header = struct.pack('<BBB', 0xA5, 0x5A, BLE_FRAME_LEN)
-        self.ser.write(header + payload)
+        # [DBG-Phase1] 真实打到串口前打印一次, 看 byte0(algo) / byte3-4(maxT) / 是否有 rpi 数据
+        if DBG_PHASE1:
+            try:
+                _maxT_bytes = int(payload[3]) | (int(payload[4]) << 8)
+                if _maxT_bytes >= 0x8000:
+                    _maxT_bytes -= 0x10000
+                _rpi_blob = bytes(payload[58:98])
+                _rpi_nonzero = any(_b != 0 for _b in _rpi_blob)
+                _rpi_head = _rpi_blob[:4].hex() if _rpi_nonzero else "----"
+                _dbg_log(
+                    f"[_tx_params -> SERIAL] algo_byte={int(payload[0])} "
+                    f"brand={int(payload[1])} flags=0x{int(payload[2]):02X} "
+                    f"maxT_raw={_maxT_bytes} ({_maxT_bytes/100.0:.2f}Nm) "
+                    f"power_on={self.btn_power.isChecked()} "
+                    f"rpi_data={int(_rpi_nonzero)} rpi_head={_rpi_head} "
+                    f"sb={float(self.sb_max_torque_cfg.value()):.2f}"
+                )
+            except Exception as _e:
+                _dbg_log(f"[_tx_params] (debug print failed: {_e!r})")
+        _throttled_ble_write(self.ser, header + payload)
         if algo == ALGO_RL:
             self._rl_cfg_tx_seq += 1
             self._rl_last_tx_ts = time.time()
@@ -6045,7 +6508,7 @@ class MainWindow(QWidget):
         if len(tag):
             payload[3:3+len(tag)] = tag
         header = struct.pack('<BBB', 0xA5, 0x5A, BLE_FRAME_LEN)
-        self.ser.write(header + payload)
+        _throttled_ble_write(self.ser, header + payload)
         if update_current:
             self._current_tag = tag_txt
             self._tag_started_at = time.time() if tag_txt else None
@@ -6095,6 +6558,8 @@ class MainWindow(QWidget):
             self._queue_align_event("serial_lost")
             self.connected = False
             self._conn_healthy = False
+            self._algo_active_rx = None
+            self._algo_apply_waiting_ack = False
             self._rx_buf.clear()
             if self.ser is not None:
                 try:
@@ -6161,21 +6626,57 @@ class MainWindow(QWidget):
         self._uplink_prev_t_cs = t_cs_u16
         self._uplink_t_unwrapped_s = ((self._uplink_wrap_count * 65536) + t_cs_u16) / 100.0
 
-        imu_ok_flag = payload[14]
+        status0 = int(payload[14]) & 0xFF
+        imu_ok_flag = (status0 & 0x01)
         mt100 = struct.unpack('<h', payload[15:17])[0]
         maxT_rx = mt100 / 100.0
-        sd_ok = payload[17]
+        sd_ok = (status0 >> 1) & 0x01
         gf100 = struct.unpack('<h', payload[20:22])[0]
         gait_freq = gf100 / 100.0
         self._last_gait_freq = gait_freq
         self._last_gait_period_ms = (1000.0 / gait_freq) if gait_freq > 0.01 else 0.0
-        tag_valid = payload[22]
+        tag_valid = (status0 >> 2) & 0x01
         tag_char  = chr(payload[23]) if payload[23] else ''
         imu_bits = payload[24]
-        brand_id = payload[25]
+        brand_id = (status0 >> 3) & 0x03
         temp_L   = payload[26] if payload[26] else None
         temp_R   = payload[27] if payload[27] else None
-        active_algo = payload[28]
+        active_algo = (status0 >> 5) & 0x07
+        # [DBG-Phase1] Teensy 上报的 active_algo 一旦变化就打印, 包含本地 select/pending,
+        # 用于判断 "GUI 觉得没切" 是 Teensy 真没切 还是 仅仅 ACK 路径漏掉
+        if DBG_PHASE1:
+            _prev_rx = getattr(self, "_dbg_prev_active_algo_rx", None)
+            if _prev_rx != int(active_algo):
+                _prev_str = "init" if _prev_rx is None else str(_prev_rx)
+                _dbg_log(
+                    f"[uplink] active_algo CHANGED rx={_prev_str}->{int(active_algo)} "
+                    f"select={self._algo_select} pending={self._algo_pending} "
+                    f"waiting_ack={self._algo_apply_waiting_ack} maxT_rx={maxT_rx:.2f}"
+                )
+                self._dbg_prev_active_algo_rx = int(active_algo)
+        self._algo_active_rx = int(active_algo)
+        # Algorithm ACK path: once Teensy runtime reports the desired algo,
+        # clear pending-wait state so Apply button returns to clean.
+        if self._algo_apply_waiting_ack and int(active_algo) == int(self._algo_pending):
+            _dbg_log(
+                f"[uplink ACK] active_algo={int(active_algo)} matches pending; "
+                f"clearing waiting_ack"
+            )
+            self._algo_apply_waiting_ack = False
+            self._algo_select = self._algo_pending
+            self._algo_last_applied_sig = self._get_algo_cfg_signature()
+        motor_cur_L_q = struct.unpack('<b', payload[18:19])[0]
+        motor_cur_R_q = struct.unpack('<b', payload[19:20])[0]
+        motor_rpm_L_q = struct.unpack('<b', payload[55:56])[0]
+        motor_rpm_R_q = struct.unpack('<b', payload[56:57])[0]
+        motor_flags = int(payload[57]) & 0xFF
+        self._motor_telem_valid = bool(motor_flags & 0x01)
+        self._motor_cur_valid = bool(motor_flags & 0x02)
+        self._motor_rpm_valid = bool(motor_flags & 0x04)
+        self._motor_cur_L_A = float(motor_cur_L_q) * MOTOR_CUR_SCALE_A if self._motor_cur_valid else 0.0
+        self._motor_cur_R_A = float(motor_cur_R_q) * MOTOR_CUR_SCALE_A if self._motor_cur_valid else 0.0
+        self._motor_rpm_L = float(motor_rpm_L_q) * MOTOR_RPM_SCALE if self._motor_rpm_valid else 0.0
+        self._motor_rpm_R = float(motor_rpm_R_q) * MOTOR_RPM_SCALE if self._motor_rpm_valid else 0.0
         self._last_rx_tag_char = tag_char if (tag_valid and tag_char) else ""
         self._last_rx_tag_text = self._last_rx_tag_char
         if (not self._current_tag) and tag_valid and tag_char:
@@ -6187,15 +6688,11 @@ class MainWindow(QWidget):
         tx3 = struct.unpack('<h', payload[33:35])[0] / 100.0
         tx4 = struct.unpack('<h', payload[35:37])[0] / 100.0
 
-        # IMU angular velocities packed by Teensy firmware (payload[37..48]).
-        vel_blob = payload[37:49]
+        # IMU angular velocities packed by Teensy firmware (payload[37..40]).
+        vel_blob = payload[37:41]
         has_imu_vel = any(b != 0 for b in vel_blob)
         ltavx = struct.unpack('<h', payload[37:39])[0] / 10.0
         rtavx = struct.unpack('<h', payload[39:41])[0] / 10.0
-        vtx1 = struct.unpack('<h', payload[41:43])[0] / 10.0
-        vtx2 = struct.unpack('<h', payload[43:45])[0] / 10.0
-        vtx3 = struct.unpack('<h', payload[45:47])[0] / 10.0
-        vtx4 = struct.unpack('<h', payload[47:49])[0] / 10.0
         imu_batt_raw = [
             int(payload[49]), int(payload[50]), int(payload[51]),
             int(payload[52]), int(payload[53]), int(payload[54]),
@@ -6283,16 +6780,43 @@ class MainWindow(QWidget):
                 rpi_blob[1] == RPI_PT_MAGIC1 and
                 rpi_blob[2] >= RPI_STATUS_VERSION_LEGACY):
             version = rpi_blob[2]
-            self._rpi_status_version = version
-            self._rpi_nn_type = rpi_blob[3]
-            self._rpi_filter_source = rpi_blob[4]
-            self._rpi_filter_type_code = rpi_blob[5]
-            self._rpi_filter_order = rpi_blob[6]
-            self._rpi_enable_mask = rpi_blob[7]
-            self._rpi_cutoff_hz = struct.unpack_from('<f', rpi_blob, 8)[0]
-            self._rpi_scale = struct.unpack_from('<f', rpi_blob, 12)[0]
+            nn_type = rpi_blob[3]
+            filter_source = rpi_blob[4]
+            filter_type_code = rpi_blob[5]
+            filter_order = rpi_blob[6]
+            enable_mask = rpi_blob[7]
+            cutoff_hz = struct.unpack_from('<f', rpi_blob, 8)[0]
+            scale = struct.unpack_from('<f', rpi_blob, 12)[0]
 
-            if version >= RPI_STATUS_VERSION_PER_LEG and len(rpi_blob) >= 40:
+            # Meta sanity guard: reject corrupted status blobs (avoid false 45Hz/garbage display).
+            # Teensy-native ADO status uses nn_type=0xFE and leaves filter fields as zero.
+            is_teensy_native = (nn_type == 0xFE)
+            if is_teensy_native:
+                meta_ok = (
+                    version in (RPI_STATUS_VERSION_LEGACY, RPI_STATUS_VERSION_PER_LEG) and
+                    isfinite(scale)
+                )
+            else:
+                meta_ok = (
+                    version in (RPI_STATUS_VERSION_LEGACY, RPI_STATUS_VERSION_PER_LEG) and
+                    (filter_source in (0, 1)) and
+                    (0 <= filter_type_code <= 3) and
+                    (1 <= filter_order <= 6) and
+                    ((enable_mask & 0xF8) == 0) and
+                    isfinite(cutoff_hz) and
+                    isfinite(scale) and (0.0 <= scale <= 20.0)
+                )
+            if meta_ok:
+                self._rpi_status_version = version
+                self._rpi_nn_type = nn_type
+                self._rpi_filter_source = filter_source
+                self._rpi_filter_type_code = filter_type_code
+                self._rpi_filter_order = filter_order
+                self._rpi_enable_mask = enable_mask
+                self._rpi_cutoff_hz = cutoff_hz
+                self._rpi_scale = scale
+
+            if meta_ok and version >= RPI_STATUS_VERSION_PER_LEG and len(rpi_blob) >= 40:
                 # v3: int16-packed L/R pairs
                 dL = struct.unpack_from('<h', rpi_blob, 16)[0] / 10.0
                 dR = struct.unpack_from('<h', rpi_blob, 18)[0] / 10.0
@@ -6338,7 +6862,7 @@ class MainWindow(QWidget):
                     self._rpi_neg_per_s_R = nR
                     self._rpi_best_delay_ms_L = bL
                     self._rpi_best_delay_ms_R = bR
-            else:
+            elif meta_ok:
                 # v2 legacy: single-leg float32 — mirror to both L/R for display.
                 delay_ms = struct.unpack_from('<f', rpi_blob, 16)[0]
                 auto_flags = rpi_blob[20] if len(rpi_blob) > 20 else 0
@@ -6382,26 +6906,27 @@ class MainWindow(QWidget):
                     self._rpi_best_delay_ms_L = best_d
                     self._rpi_best_delay_ms_R = best_d
 
-            # Legacy aliases for any other code paths: expose averaged/combined.
-            self._rpi_delay_ms = 0.5 * (self._rpi_delay_ms_L + self._rpi_delay_ms_R)
-            self._rpi_auto_motion_valid = (
-                self._rpi_auto_motion_valid_L or self._rpi_auto_motion_valid_R
-            )
-            self._rpi_power_ratio = 0.5 * (self._rpi_power_ratio_L + self._rpi_power_ratio_R)
-            self._rpi_pos_per_s = self._rpi_pos_per_s_L + self._rpi_pos_per_s_R
-            self._rpi_neg_per_s = self._rpi_neg_per_s_L + self._rpi_neg_per_s_R
-            self._rpi_best_delay_ms = 0.5 * (self._rpi_best_delay_ms_L + self._rpi_best_delay_ms_R)
+            if meta_ok:
+                # Legacy aliases for any other code paths: expose averaged/combined.
+                self._rpi_delay_ms = 0.5 * (self._rpi_delay_ms_L + self._rpi_delay_ms_R)
+                self._rpi_auto_motion_valid = (
+                    self._rpi_auto_motion_valid_L or self._rpi_auto_motion_valid_R
+                )
+                self._rpi_power_ratio = 0.5 * (self._rpi_power_ratio_L + self._rpi_power_ratio_R)
+                self._rpi_pos_per_s = self._rpi_pos_per_s_L + self._rpi_pos_per_s_R
+                self._rpi_neg_per_s = self._rpi_neg_per_s_L + self._rpi_neg_per_s_R
+                self._rpi_best_delay_ms = 0.5 * (self._rpi_best_delay_ms_L + self._rpi_best_delay_ms_R)
 
-            self._rpi_last_rx_time = time.time()
-            self._rpi_online = True
-            prev_nn = getattr(self, '_prev_rpi_nn_type', -1)
-            force_rl_status_refresh = False
-            if not self._rpi_status_valid or rpi_blob[3] != prev_nn:
-                self._rpi_status_valid = True
-                self._prev_rpi_nn_type = rpi_blob[3]
-                self._update_rl_panel_for_nn_type()
-                force_rl_status_refresh = True
-            self._maybe_update_rl_filter_state_label(now=now, force=force_rl_status_refresh)
+                self._rpi_last_rx_time = time.time()
+                self._rpi_online = True
+                prev_nn = getattr(self, '_prev_rpi_nn_type', -1)
+                force_rl_status_refresh = False
+                if not self._rpi_status_valid or rpi_blob[3] != prev_nn:
+                    self._rpi_status_valid = True
+                    self._prev_rpi_nn_type = rpi_blob[3]
+                    self._update_rl_panel_for_nn_type()
+                    force_rl_status_refresh = True
+                self._maybe_update_rl_filter_state_label(now=now, force=force_rl_status_refresh)
 
         # === Update UI ===
         self.lbl_imu.setText(f"IMU: {'OK' if imu_ok_flag else 'FAIL'}")
@@ -6504,6 +7029,7 @@ class MainWindow(QWidget):
             pending = ALGO_NAMES.get(self._algo_pending, "?")
             self.badge_algo.setText(f"{algo_name} -> {pending}")
             self.badge_algo.set_color(C.orange)
+        self._update_apply_buttons_state()
 
         # Status
         (L_angle_disp, R_angle_disp, L_vel_disp, R_vel_disp,

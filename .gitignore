@@ -66,3 +66,6 @@ tools/rpi_profiles.conf
 *.swp
 *.swo
 Algorithm Reference/
+
+# [DBG-Phase1] GUI auto-generated debug logs
+GUI_RL_update/debug_logs/
