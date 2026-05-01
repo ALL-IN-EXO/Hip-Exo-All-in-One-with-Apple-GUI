@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [v5.2] - 2026-05-01
+## [v6.0] - 2026-05-01
 
 > **Phase 1 release**：三 bug（Apply Algorithm 多点、Power OFF/ON 力矩不恢复、RL 参数下发不可见）全部上机复测通过。详细诊断过程见 `Docs/PHASE1_DEBUG_PROGRESS.md`。
 
