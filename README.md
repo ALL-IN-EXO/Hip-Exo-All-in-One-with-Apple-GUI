@@ -4,7 +4,7 @@ A multi-component control system for the hip exoskeleton, consisting of Teensy 4
 
 **Current Version:** runtime/build scripts now read latest release directly from `Docs/CHANGELOG.md` | [Full Changelog](Docs/CHANGELOG.md)
 
-**What's new in v4.0:** Introduced the RL synchronized truth pipeline (`AA 59` Pi→Teensy + BLE telemetry extension) so GUI power/signal display can use control-aligned data; unified Teensy-based timestamps across GUI/RPi/SD logs (`teensy_t_cs_u16`, `teensy_t_s_unwrapped`) for cross-file alignment; expanded replay CSV compatibility (GUI/RPi/Teensy schemas), added Pi remote launcher/profile workflow in GUI, and integrated 6-IMU battery reporting to the hardware panel.
+**What's new in v6.1:** Introduced the RL synchronized truth pipeline (`AA 59` Pi→Teensy + BLE telemetry extension) so GUI power/signal display can use control-aligned data; unified Teensy-based timestamps across GUI/RPi/SD logs (`teensy_t_cs_u16`, `teensy_t_s_unwrapped`) for cross-file alignment; expanded replay CSV compatibility (GUI/RPi/Teensy schemas), added Pi remote launcher/profile workflow in GUI, and integrated 6-IMU battery reporting to the hardware panel.
 
 ## System Overview
 
