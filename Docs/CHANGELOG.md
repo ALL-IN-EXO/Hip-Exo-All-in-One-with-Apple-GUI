@@ -5,6 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [v6.1] - 2026-05-01
+
+### Fixed
+> **Phase 1 release**：修掉了claude忘记commit的冲突内容。
+> ⏺ 这下清楚了——.ino 里 Phase 1 的所有改动全部丢失了： - ❌ BLE_SERIAL_RX_EXTRA[512] 缓冲（Fix B 的关键） - ❌ Serial5.addMemoryForRead(...) 调用（Fix B 的关键） - ❌ dbg_ble_* 帧计数器 - ❌ [BLE_RX #N] 每帧打印 - ❌ [ALGO] ENTER/EXIT switch_algorithm 打印 - ❌ 10Hz 扩展调试行 但好消息： - ✅ Controller_RL.h 的 DBG_PHASE1 宏开关 + 计数器字段都在 - ✅ Controller_RL.cpp 的 RL 链路边沿打印在 - ✅ RPi/RL_controller_torch.py Phase 1 调试在 - ✅ GUI.py 的 _throttled_ble_write (Fix A) 在 Fix B 没上线意味着——你之前 Test A/B/C 通过靠的是 Fix A（GUI 50ms 节流）单独扛下来的，加上你硬件上还烧着上次 working tree 那版（含 Fix B）的 Teensy。一旦你按 origin/main 重新 upload，Fix B 没了，鲁棒性掉一半。 这是个真正的 release 漏 bug。要补回来。我把 .ino 里全套 Phase 1 都补回去（Fix B + 调试）
+
+> 然后一定要注意，有一些新的更新内容的文档，在feature/jz-phase1-ble-fix-2026-05-01    main 
+feature/jz-phase1-combined-2026-05-01 里面，但是文档没有，内容还是存在的（好像）
+> 
+
 ## [v6.0] - 2026-05-01
 
 > **Phase 1 release**：三 bug（Apply Algorithm 多点、Power OFF/ON 力矩不恢复、RL 参数下发不可见）全部上机复测通过。详细诊断过程见 `Docs/PHASE1_DEBUG_PROGRESS.md`。
