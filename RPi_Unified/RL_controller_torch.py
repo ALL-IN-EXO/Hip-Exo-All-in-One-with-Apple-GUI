@@ -92,6 +92,24 @@ BAUDRATE      = 115200
 TIMEOUT       = 0.01
 PI_USE_BINARY = 1                     # 1=二进制帧, 0=文本CSV
 
+# ============== [DBG-Phase1 RPi 侧] 调试开关 ==============
+# 用于 Bug 3 取证: GUI → BLE → Teensy → Serial8 → RPi 这条链路, RPi 端
+# 在哪一步丢/拒/静默吞掉了 cfg 包. 默认开 (True), 关掉就改成 False.
+# 环境变量 HIPEXO_DBG=0 同样关掉. 控制逻辑零影响.
+import os as _os_dbg
+DBG_PHASE1_RPI = (_os_dbg.environ.get("HIPEXO_DBG", "1") != "0")
+# 1Hz 心跳: 报告 Serial8 in_waiting 字节数 + 累计 cfg/imu 帧计数,
+# 让用户哪怕没收到任何 cfg 也能看到 RX 链路状况.
+_DBG_RPI_LAST_HEARTBEAT_TS = 0.0
+_DBG_RPI_HEARTBEAT_PERIOD_S = 1.0
+_DBG_RPI_CFG_FRAMES = 0
+_DBG_RPI_IMU_FRAMES = 0
+_DBG_RPI_OTHER_FRAMES = 0
+_DBG_RPI_BAD_CKSUM = 0
+_DBG_RPI_BAD_LEN = 0
+_DBG_RPI_NO_HEADER_BYTES = 0
+_DBG_RPI_PARSE_REJECT = 0   # parse_runtime_cfg 返回 None 的次数
+
 # ---- Delay Buffer ----
 # 统一通路: raw torque -> (主循环统一torque滤波) -> delay -> scale -> send
 USE_FILTERED_FOR_DELAY = True         # 保留兼容标志，当前统一管线始终使用滤波后torque做delay
@@ -912,11 +930,29 @@ def bo_record_sample(state: dict, delay_ms: float, objective: float):
 
 def parse_runtime_cfg(payload: bytes):
     """Parse GUI passthrough payload (40B). Returns dict or None."""
+    global _DBG_RPI_PARSE_REJECT
     if len(payload) < 20:
+        if DBG_PHASE1_RPI:
+            _DBG_RPI_PARSE_REJECT += 1
+            print(f"[RPi DBG parse_cfg] REJECT short payload len={len(payload)} (need >=20)", flush=True)
         return None
     if payload[0] != RPI_PT_MAGIC[0] or payload[1] != RPI_PT_MAGIC[1]:
+        if DBG_PHASE1_RPI:
+            _DBG_RPI_PARSE_REJECT += 1
+            print(
+                f"[RPi DBG parse_cfg] REJECT bad magic {payload[0]:02X}{payload[1]:02X} "
+                f"(need {RPI_PT_MAGIC[0]:02X}{RPI_PT_MAGIC[1]:02X})",
+                flush=True,
+            )
         return None
     if payload[2] != RPI_PT_VERSION or payload[3] != RPI_PT_CMD_APPLY:
+        if DBG_PHASE1_RPI:
+            _DBG_RPI_PARSE_REJECT += 1
+            print(
+                f"[RPi DBG parse_cfg] REJECT bad version/cmd v={payload[2]:02X} cmd={payload[3]:02X} "
+                f"(need v={RPI_PT_VERSION:02X} cmd={RPI_PT_CMD_APPLY:02X})",
+                flush=True,
+            )
         return None
 
     filter_code = int(payload[4])
@@ -928,15 +964,27 @@ def parse_runtime_cfg(payload: bytes):
     auto_flags = int(payload[20]) if len(payload) > 20 else 0
 
     if not math.isfinite(scale) or not math.isfinite(delay_ms) or not math.isfinite(cutoff_hz):
+        if DBG_PHASE1_RPI:
+            _DBG_RPI_PARSE_REJECT += 1
+            print(
+                f"[RPi DBG parse_cfg] REJECT non-finite floats scale={scale} delay={delay_ms} cutoff={cutoff_hz}",
+                flush=True,
+            )
+        return None
+
+    if cutoff_hz <= 0.0:
+        if DBG_PHASE1_RPI:
+            _DBG_RPI_PARSE_REJECT += 1
+            print(f"[RPi DBG parse_cfg] REJECT cutoff<=0: {cutoff_hz}", flush=True)
         return None
 
     scale = max(0.0, min(20.0, scale))
     delay_ms = max(0.0, min(MAX_RUNTIME_DELAY_MS, delay_ms))
-    cutoff_hz = max(0.5, min(CTRL_HZ * 0.45, cutoff_hz))
+    cutoff_hz = float(cutoff_hz)
     filter_order = max(1, min(6, filter_order))
 
     enable_vr = bool(filter_en_mask & (RPI_FILTER_EN_VEL | RPI_FILTER_EN_REF))
-    return {
+    parsed = {
         "filter_code": filter_code,
         "filter_order": filter_order,
         "scale": scale,
@@ -948,6 +996,15 @@ def parse_runtime_cfg(payload: bytes):
         "auto_delay_enable": bool(auto_flags & RPI_AUTO_FLAG_ENABLE),
         "auto_method": "bo" if (auto_flags & RPI_AUTO_FLAG_METHOD_BO) else "grid",
     }
+    if DBG_PHASE1_RPI:
+        print(
+            f"[RPi DBG parse_cfg] ACCEPT scale={parsed['scale']:.3f} delay={parsed['delay_ms']:.1f}ms "
+            f"cutoff={parsed['cutoff_hz']:.2f}Hz code={parsed['filter_code']} order={parsed['filter_order']} "
+            f"vr={int(parsed['enable_vel'])} torque={int(parsed['enable_torque'])} "
+            f"auto={int(parsed['auto_delay_enable'])}/{parsed['auto_method']}",
+            flush=True,
+        )
+    return parsed
 
 
 def apply_runtime_filter_to_dnn(dnn_obj, filter_code, cutoff_hz, filter_order, enable_vel, enable_ref, enable_torque):
@@ -1054,18 +1111,25 @@ def read_packet(ser: serial.Serial):
             return None
 
     # Binary mode
+    global _DBG_RPI_NO_HEADER_BYTES, _DBG_RPI_BAD_LEN, _DBG_RPI_BAD_CKSUM
+    global _DBG_RPI_CFG_FRAMES, _DBG_RPI_IMU_FRAMES, _DBG_RPI_OTHER_FRAMES
     while True:
         h = ser.read(1)
         if not h:
             return None
         if h == b'\xA5' and ser.read(1) == b'\x5A':
             break
+        if DBG_PHASE1_RPI:
+            _DBG_RPI_NO_HEADER_BYTES += 1
 
     ln = ser.read(1)
     if not ln:
         return None
     total_len = int(ln[0])
     if total_len < 1 or total_len > 96:
+        if DBG_PHASE1_RPI:
+            _DBG_RPI_BAD_LEN += 1
+            print(f"[RPi DBG read_packet] BAD LEN {total_len} (must be 1..96)", flush=True)
         return None
 
     typ = ser.read(1)
@@ -1080,9 +1144,14 @@ def read_packet(ser: serial.Serial):
 
     chk = ser.read(1)
     if not chk or chk[0] != cksum8(typ + payload):
+        if DBG_PHASE1_RPI:
+            _DBG_RPI_BAD_CKSUM += 1
+            print(f"[RPi DBG read_packet] BAD CKSUM type=0x{typ_v:02X} len={total_len}", flush=True)
         return None
 
     if typ_v == 0x01:
+        if DBG_PHASE1_RPI:
+            _DBG_RPI_IMU_FRAMES += 1
         # v2: payload_len=29 => t_cs(u16)+4 floats+tag11
         # v1 (legacy): payload_len=27 => 4 floats+tag11
         if payload_len == 29:
@@ -1106,8 +1175,19 @@ def read_packet(ser: serial.Serial):
         return None
 
     if typ_v == 0x02:
+        if DBG_PHASE1_RPI:
+            _DBG_RPI_CFG_FRAMES += 1
+            head = payload[:8].hex() if len(payload) >= 8 else payload.hex()
+            print(
+                f"[RPi DBG read_packet] CFG #{_DBG_RPI_CFG_FRAMES} "
+                f"len={total_len} payload_head={head}",
+                flush=True,
+            )
         return {'type': 'cfg', 'payload': payload}
 
+    if DBG_PHASE1_RPI:
+        _DBG_RPI_OTHER_FRAMES += 1
+        print(f"[RPi DBG read_packet] UNKNOWN type=0x{typ_v:02X} len={total_len}", flush=True)
     return None
 
 
@@ -1270,6 +1350,9 @@ def send_status(ser: serial.Serial, filter_source, filter_type_code,
 
 # ========= 主程序 =========
 def main():
+    # [DBG-Phase1 RPi] 心跳时间戳是模块级变量, 在 main() 里赋值就需要 global 声明.
+    global _DBG_RPI_LAST_HEARTBEAT_TS
+
     ser = serial.Serial(SER_DEV, BAUDRATE, timeout=TIMEOUT)
     ser.reset_input_buffer()
     start = time.time()
@@ -1396,6 +1479,24 @@ def main():
         wr.writeheader()
 
         while True:
+            # [DBG-Phase1 RPi] 1Hz 心跳: 即使没收到 cfg 也能看见 Serial8 RX 状况.
+            if DBG_PHASE1_RPI:
+                _now_dbg = time.time()
+                if _now_dbg - _DBG_RPI_LAST_HEARTBEAT_TS >= _DBG_RPI_HEARTBEAT_PERIOD_S:
+                    _DBG_RPI_LAST_HEARTBEAT_TS = _now_dbg
+                    try:
+                        _avail = ser.in_waiting
+                    except Exception:
+                        _avail = -1
+                    print(
+                        f"[RPi DBG hb] in_waiting={_avail} "
+                        f"imu={_DBG_RPI_IMU_FRAMES} cfg={_DBG_RPI_CFG_FRAMES} "
+                        f"other={_DBG_RPI_OTHER_FRAMES} "
+                        f"bad_len={_DBG_RPI_BAD_LEN} bad_cksum={_DBG_RPI_BAD_CKSUM} "
+                        f"parse_reject={_DBG_RPI_PARSE_REJECT} "
+                        f"no_hdr_bytes={_DBG_RPI_NO_HEADER_BYTES}",
+                        flush=True,
+                    )
             pkt = read_freshest_packet(ser)
             if pkt is None:
                 continue
@@ -1405,6 +1506,15 @@ def main():
                 cfg = parse_runtime_cfg(pkt['payload'])
                 if cfg is None:
                     continue
+                if DBG_PHASE1_RPI:
+                    print(
+                        f"[RPi DBG cfg APPLIED] NN_TYPE={NN_TYPE} -> scale={cfg['scale']:.3f} "
+                        f"delay={cfg['delay_ms']:.1f}ms cutoff={cfg['cutoff_hz']:.2f}Hz "
+                        f"code={cfg['filter_code']} order={cfg['filter_order']} "
+                        f"vr_en={int(cfg['enable_vel'])} torque_en={int(cfg['enable_torque'])} "
+                        f"auto={int(cfg['auto_delay_enable'])}/{cfg['auto_method']}",
+                        flush=True,
+                    )
 
                 runtime_scale = cfg['scale']
                 runtime_delay_ms = cfg['delay_ms']

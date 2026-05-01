@@ -1,6 +1,19 @@
 #ifndef CONTROLLER_RL_H
 #define CONTROLLER_RL_H
 
+// =====================================================================
+// [DBG-Phase1] 调试开关 (Teensy 侧)
+//   1 = 打开所有 Phase1 调试串口打印 (BLE_RX 每帧 / ALGO ENTER-EXIT /
+//       10Hz 扩展状态行 / RL_RX 重连断连等)
+//   0 = 全部静默, 编译期消去, 零运行时开销
+//
+// 默认 1 (调试期). 平时不需要调试时改成 0 重新 upload 即可。
+// 控制逻辑不受此开关影响, 只影响 USB Serial 调试输出。
+// =====================================================================
+#ifndef DBG_PHASE1
+#define DBG_PHASE1 1
+#endif
+
 /************************************************************
  * Controller_RL — 强化学习神经网络算法
  *
@@ -79,6 +92,15 @@ public:
 
   // AA 59 坏帧计数 (sanity check 拒绝的帧数); 用于观察 Serial8 抖动/overrun 频率。
   uint32_t bad_sync_frames;
+  // AA 56 坏帧计数 (status payload sanity reject)
+  uint32_t bad_status_frames;
+
+  // [DBG-Phase1] 公共访问器 + 各类 RPi 帧计数, 用于诊断 Power OFF/ON 后 RPi 链路状态
+  bool is_pi_connected() const { return pi_connected_; }
+  uint32_t dbg_torque_frames_ok = 0;   // AA55 收到的 torque 帧
+  uint32_t dbg_status_frames_ok = 0;   // AA56 收到的 status 帧
+  uint32_t dbg_sync_frames_ok   = 0;   // AA59 收到的 sync 帧
+  uint32_t dbg_pi_disconnects   = 0;   // 进入超时分支的次数
 
 private:
   float tau_pi_L_;   // RPi 返回的左腿扭矩

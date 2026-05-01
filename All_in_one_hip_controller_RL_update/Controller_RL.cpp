@@ -17,6 +17,7 @@ Controller_RL::Controller_RL() {
   memset(rpi_status_buf, 0, sizeof(rpi_status_buf));
   rpi_status_valid = false;
   bad_sync_frames = 0;
+  bad_status_frames = 0;
 }
 
 void Controller_RL::reset() {
@@ -137,7 +138,14 @@ bool Controller_RL::read_torque_from_pi() {
           sync_from_pi = false;
           sync_flags = 0;
           last_rx_ms_ = millis();
+          // [DBG-Phase1] AA55 帧 + 重连边沿打印
+#if DBG_PHASE1
+          if (!pi_connected_) {
+            Serial.printf("[RL_RX] pi RECONNECT via AA55 (torque)\r\n");
+          }
+#endif
           pi_connected_ = true;
+          dbg_torque_frames_ok++;
           got_torque = true;
           rx_state_ = WAIT_HEADER1;
         }
@@ -146,11 +154,42 @@ bool Controller_RL::read_torque_from_pi() {
       case READING_STATUS:
         rx_status_buf_[rx_idx_++] = b;
         if (rx_idx_ == PI_STATUS_SIZE) {
-          // Copy 40-byte payload (after AA 56 header) to rpi_status_buf
-          memcpy(rpi_status_buf, rx_status_buf_ + 2, 40);
-          rpi_status_valid = true;
-          last_rx_ms_ = millis();
-          pi_connected_ = true;
+          // Sanity-check AA56 payload before commit:
+          // [0..1]='R''L', [2]=version(>=2), [4]=source(0/1),
+          // [6]=order(1..6), [8..11]=cutoff(0..30Hz), [12..15]=scale(0..20).
+          const uint8_t* p = rx_status_buf_ + 2;
+          bool sane = (p[0] == 0x52 && p[1] == 0x4C && p[2] >= 2 && p[2] <= 3);
+          if (sane) {
+            const uint8_t src = p[4];
+            const uint8_t ord = p[6];
+            const uint8_t enm = p[7];
+            float cutoff = 0.0f;
+            float scale = 0.0f;
+            memcpy(&cutoff, p + 8, 4);
+            memcpy(&scale, p + 12, 4);
+            sane = (src <= 1) &&
+                   (ord >= 1 && ord <= 6) &&
+                   ((enm & 0xF8) == 0) &&
+                   isfinite(cutoff) && (cutoff >= 0.0f) && (cutoff <= 30.0f) &&
+                   isfinite(scale) && (scale >= 0.0f) && (scale <= 20.0f);
+          }
+
+          if (sane) {
+            // Copy 40-byte payload (after AA 56 header) to rpi_status_buf
+            memcpy(rpi_status_buf, p, 40);
+            rpi_status_valid = true;
+            last_rx_ms_ = millis();
+            // [DBG-Phase1] AA56 + 重连边沿
+#if DBG_PHASE1
+            if (!pi_connected_) {
+              Serial.printf("[RL_RX] pi RECONNECT via AA56 (status)\r\n");
+            }
+#endif
+            pi_connected_ = true;
+            dbg_status_frames_ok++;
+          } else {
+            bad_status_frames++;
+          }
           rx_state_ = WAIT_HEADER1;
         }
         break;
@@ -210,7 +249,14 @@ bool Controller_RL::read_torque_from_pi() {
             sync_valid = true;
             sync_from_pi = true;
             last_rx_ms_ = millis();
+            // [DBG-Phase1] AA59 + 重连边沿
+#if DBG_PHASE1
+            if (!pi_connected_) {
+              Serial.printf("[RL_RX] pi RECONNECT via AA59 (sync)\r\n");
+            }
+#endif
             pi_connected_ = true;
+            dbg_sync_frames_ok++;
             got_torque = true;
           } else {
             bad_sync_frames++;
@@ -242,12 +288,21 @@ void Controller_RL::compute(const CtrlInput& in, CtrlOutput& out) {
 
   // 3) 超时检测 (500ms 没收到就归零)
   if (millis() - last_rx_ms_ > 500) {
+    // [DBG-Phase1] 第一次进入 disconnect 时打印一次, 后续静默直到下一次 reconnect
+    if (pi_connected_) {
+      dbg_pi_disconnects++;
+#if DBG_PHASE1
+      Serial.printf("[RL_RX] pi DISCONNECT (timeout >500ms)\r\n");
+#endif
+    }
     tau_pi_L_ = 0.0f;
     tau_pi_R_ = 0.0f;
     pi_connected_ = false;
     sync_valid = false;
     sync_from_pi = false;
     sync_flags = 0;
+    rpi_status_valid = false;
+    memset(rpi_status_buf, 0, sizeof(rpi_status_buf));
   }
 
   // 4) 限幅输出
