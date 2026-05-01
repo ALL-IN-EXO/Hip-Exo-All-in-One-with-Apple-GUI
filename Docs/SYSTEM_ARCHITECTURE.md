@@ -662,3 +662,31 @@ flowchart LR
 - 有 Pi 且 RL 正常：控制真值与 auto-delay 真值以 Pi 为主，GUI 以 `Sync/Control` 显示。
 - 无 Pi 或非 RL：控制与 auto-delay（EG/Samsung）均在 Teensy 本地闭环，GUI 以 `Raw/Physical` 为主。
 - GUI 本地功率估算仅为兜底显示，不作为控制决策真值源。
+
+### 11.8 电机测量页（Motor Data）链路
+
+新增 GUI 右上角切页按钮后，电机测量链路如下：
+
+```mermaid
+flowchart LR
+    M["Motor driver feedback\n(SIG/TMOTOR)"] --> T["Teensy quantize\ncur: 0.5A/LSB, rpm: 50rpm/LSB"]
+    T --> B["BLE uplink payload\n[21]=curL_q [22]=curR_q\n[58]=rpmL_q [59]=rpmR_q\n[60]=flags"]
+    B --> G["GUI parse payload"]
+    G --> P["Motor Data page\nCurrent(A), RPM plots"]
+    G --> C["GUI CSV columns\nmotor_cur_*, motor_rpm_*, *_valid"]
+```
+
+字节位定义（见 `BleProtocol.h`）：
+- `payload[21]`: `motor_cur_L_q`（int8, A*2）
+- `payload[22]`: `motor_cur_R_q`（int8, A*2）
+- `payload[58]`: `motor_rpm_L_q`（int8, rpm/50）
+- `payload[59]`: `motor_rpm_R_q`（int8, rpm/50）
+- `payload[60]`: `motor_telem_flags`（bit0 valid, bit1 current_valid, bit2 rpm_valid）
+
+GUI 解析换算：
+- `current_A = q * 0.5`
+- `rpm = q * 50`
+
+说明：
+- 该链路与主控制链路解耦，仅用于显示/记录，不参与控制闭环。
+- 主图页与电机页共享同一时间轴缓冲，不额外引入发送频率变化。
