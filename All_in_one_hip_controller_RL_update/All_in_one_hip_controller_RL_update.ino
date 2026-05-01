@@ -193,6 +193,18 @@ static bool  torque_filter_type_prev   = true;
 static uint8_t rpi_uplink_buf[40] = {0};
 static uint8_t rpi_downlink_buf[40] = {0};
 
+// === Serial5 (BLE 下行) RX 扩展缓冲 (Phase 1 修复 B) ===
+// 默认 Teensy HardwareSerial RX = 64B, 单帧 BLE 下行 128B 已超 budget。
+// 主循环只要被 SD/算法拖 >5.5ms 就来不及读, 后半帧字节直接丢, 状态机失同步。
+// 扩到 512B 后, 单次主循环抖到 ~45ms (512/11520s) 仍不会丢字节。
+// 同 Serial8 (RPi) 现成做法 (Controller_RL.cpp:12)。
+static uint8_t BLE_SERIAL_RX_EXTRA[512];
+
+// === DEBUG: BLE 帧计数 (Phase 1 诊断, 由 DBG_PHASE1 宏门控) ===
+static uint32_t dbg_ble_algo_frames   = 0;   // 已解析的算法/参数下行帧数
+static uint32_t dbg_ble_logtag_frames = 0;   // LOGTAG 下行帧数
+static uint32_t dbg_ble_total_bytes   = 0;   // Serial5 累计读到的字节数
+
 /******************** 时间 ********************/
 unsigned long t_0 = 0;
 unsigned long current_time = 0;
@@ -333,7 +345,18 @@ void switch_motor_brand(uint8_t new_brand) {
 
 /******************** 算法切换 ********************/
 void switch_algorithm(uint8_t new_algo) {
-  if (new_algo == active_algo_id) return;
+#if DBG_PHASE1
+  // [DBG-Phase1] 入口日志: 看到任何调用就打, 包括 new==active 的早返回
+  Serial.printf("[ALGO] ENTER switch_algorithm: from_id=%u to_id=%u (active=%s)\r\n",
+    active_algo_id, new_algo, active_ctrl ? active_ctrl->name() : "null");
+#endif
+
+  if (new_algo == active_algo_id) {
+#if DBG_PHASE1
+    Serial.printf("[ALGO] EXIT no-op (already on id=%u)\r\n", active_algo_id);
+#endif
+    return;
+  }
 
   Controller* new_ctrl = nullptr;
   switch (new_algo) {
@@ -362,6 +385,12 @@ void switch_algorithm(uint8_t new_algo) {
   active_ctrl = new_ctrl;
   active_algo_id = new_algo;
   previous_time_ado_us = micros();  // 避免切换后立即触发 1Hz ADO tick
+
+#if DBG_PHASE1
+  // [DBG-Phase1] 出口日志: 确认实际生效的 active_algo_id 和 active_ctrl 一致
+  Serial.printf("[ALGO] EXIT switch_algorithm: active_id=%u name=%s\r\n",
+    active_algo_id, active_ctrl->name());
+#endif
 }
 
 /******************** setup ********************/
@@ -372,6 +401,9 @@ void setup() {
   while (!Serial && millis() < 2000) {}
 
   // BLE 串口
+  // Phase 1 修复 B: 扩 RX 缓冲到 512B (默认 64B 不够装 128B 单帧, 单帧就丢字节)。
+  // 必须在 begin() 之前调 addMemoryForRead。
+  Serial5.addMemoryForRead(BLE_SERIAL_RX_EXTRA, sizeof(BLE_SERIAL_RX_EXTRA));
   Serial5.begin(115200);
   // 128-byte frame takes about 11 ms at 115200 baud; 5 ms causes frequent partial reads.
   Serial5.setTimeout(20);
@@ -675,6 +707,30 @@ void loop() {
   // === 10 Hz 串口调试 ===
   if (current_time - prev_print_us >= PRINT_INTERVAL_US) {
     prev_print_us = current_time;
+#if DBG_PHASE1
+    // [DBG-Phase1] 扩展打印: algo_id / max_torque_cfg / 电机原始电流 / BLE 帧计数 / RPi 连接
+    float cur_L = motor_L->get_motor_current_A();
+    float cur_R = motor_R->get_motor_current_A();
+    Serial.printf(
+      "[%s id=%u] brand=%s maxT=%.2f L_cmd=%.2f R_cmd=%.2f L_meas=%.2f R_meas=%.2f "
+      "iqL=%.2f iqR=%.2f imu_ok=%d ble[algo=%lu lg=%lu B=%lu] rpi_conn=%d\r\n",
+      active_ctrl->name(),
+      (unsigned)active_algo_id,
+      motor_L->brand_name(),
+      (double)max_torque_cfg,
+      (double)M2_torque_command,
+      (double)M1_torque_command,
+      (double)motor_L->get_torque_meas(),
+      (double)motor_R->get_torque_meas(),
+      (double)(isnan(cur_L) ? 0.0f : cur_L),
+      (double)(isnan(cur_R) ? 0.0f : cur_R),
+      imu_init_ok ? 1 : 0,
+      (unsigned long)dbg_ble_algo_frames,
+      (unsigned long)dbg_ble_logtag_frames,
+      (unsigned long)dbg_ble_total_bytes,
+      ctrl_rl.is_pi_connected() ? 1 : 0
+    );
+#else
     Serial.printf("[%s] brand=%s  L_cmd=%.2f  R_cmd=%.2f  L_meas=%.2f  R_meas=%.2f\r\n",
       active_ctrl->name(),
       motor_L->brand_name(),
@@ -683,6 +739,7 @@ void loop() {
       motor_L->get_torque_meas(),
       motor_R->get_torque_meas()
     );
+#endif
   }
 }
 
@@ -742,6 +799,7 @@ void Receive_ble_Data() {
 
   while (Serial5.available()) {
     uint8_t b = (uint8_t)Serial5.read();
+    dbg_ble_total_bytes++;  // [DBG-Phase1] Serial5 byte count
 
     if (!collecting) {
       hdr[0] = hdr[1]; hdr[1] = hdr[2]; hdr[2] = b;
@@ -768,6 +826,7 @@ void Receive_ble_Data() {
       memcpy(logtag, &data_rs232_rx[3], tlen);
       logtag_valid = true;
       logtag_persist = (data_rs232_rx[13] & 0x01);
+      dbg_ble_logtag_frames++;  // [DBG-Phase1] LOGTAG frame count
       Serial.print("LOGTAG received: ");
       Serial.println(logtag);
       // 同步给 RL 控制器
@@ -777,6 +836,27 @@ void Receive_ble_Data() {
 
     // 解析下行数据
     BleDownlinkData dl = ble_parse_downlink(data_rs232_rx);
+
+    dbg_ble_algo_frames++;  // [DBG-Phase1] non-LOGTAG (算法/参数) frame count
+#if DBG_PHASE1
+    // [DBG-Phase1] 每帧下行打印, 看到 GUI 真的发了什么:
+    //   algo_select, max_torque_cfg, has_rpi_data, brand_request, ctrl_flags 重建位
+    {
+      uint8_t f = 0;
+      if (dl.imu_reinit)   f |= 0x01;
+      if (dl.motor_reinit) f |= 0x02;
+      f |= ((uint8_t)(dl.dir_bits & 0x03)) << 2;
+      Serial.printf(
+        "[BLE_RX #%lu] algo=%u maxT=%.2f rpi_data=%d brand_req=%u flags=0x%02X\r\n",
+        (unsigned long)dbg_ble_algo_frames,
+        (unsigned)dl.algo_select,
+        (double)dl.max_torque_cfg,
+        dl.has_rpi_data ? 1 : 0,
+        (unsigned)dl.brand_request,
+        (unsigned)f
+      );
+    }
+#endif
 
 #if GUI_WRITE_ENABLE
     // 通用参数
@@ -837,6 +917,11 @@ void Transmit_ble_Data() {
     if (v < -32768.0f) return -32768;
     return (int16_t)roundf(v);
   };
+  auto sat_i8 = [](float v) -> int8_t {
+    if (v > 127.0f) return 127;
+    if (v < -127.0f) return -127;
+    return (int8_t)lroundf(v);
+  };
 
   BleUplinkData ud;
   ud.t_cs         = (uint16_t)((millis() / 10) & 0xFFFF);
@@ -846,20 +931,41 @@ void Transmit_ble_Data() {
   ud.R_tau100     = (int16_t)roundf(motor_R->get_torque_meas() * 100.0f);
   ud.L_cmd100     = (int16_t)roundf(M2_torque_command * 100.0f);
   ud.R_cmd100     = (int16_t)roundf(M1_torque_command * 100.0f);
-  ud.imu_init_ok  = imu_init_ok ? 1 : 0;
+  // 5 个状态打包成 status0 (bit0=imu_ok bit1=sd_ok bit2=tag_ok bit3..4=brand bit5..7=algo)
+  ud.status0 = 0;
+  if (imu_init_ok)   ud.status0 |= 0x01;
+  if (g_init_status) ud.status0 |= 0x02;
+  if (logtag_valid)  ud.status0 |= 0x04;
+  ud.status0 |= (uint8_t)((current_brand & 0x03u) << 3);
+  ud.status0 |= (uint8_t)((active_algo_id & 0x07u) << 5);
   ud.mt100        = (int16_t)roundf(max_torque_cfg * 100.0f);
-  ud.g_init_status = g_init_status & 0xFF;
   ud.gf100        = (int16_t)roundf(gait_freq * 100.0f);
-  ud.logtag_valid = logtag_valid ? 1 : 0;
   ud.logtag_char  = logtag[0];
   ud.imu_ok_bits  = imu_ok_bits;
-  ud.current_brand = current_brand;
 
   float tL = motor_L->get_temp_C();
   float tR = motor_R->get_temp_C();
   ud.temp_L       = isnan(tL) ? 0 : (int8_t)tL;
   ud.temp_R       = isnan(tR) ? 0 : (int8_t)tR;
-  ud.active_algo  = active_algo_id;
+
+  // Motor telemetry (quantized): current 0.5A/LSB, rpm 50rpm/LSB.
+  // L/R 跟 motor_L/motor_R 物理通道对齐 (M2=左, M1=右)。
+  const float motor_cur_L_A = motor_L->get_motor_current_A();
+  const float motor_cur_R_A = motor_R->get_motor_current_A();
+  const float motor_rpm_L   = motor_L->get_motor_speed_rpm();
+  const float motor_rpm_R   = motor_R->get_motor_speed_rpm();
+  const bool cur_L_v = isfinite(motor_cur_L_A);
+  const bool cur_R_v = isfinite(motor_cur_R_A);
+  const bool rpm_L_v = isfinite(motor_rpm_L);
+  const bool rpm_R_v = isfinite(motor_rpm_R);
+  ud.motor_cur_L_q = cur_L_v ? sat_i8(motor_cur_L_A * 2.0f) : 0;
+  ud.motor_cur_R_q = cur_R_v ? sat_i8(motor_cur_R_A * 2.0f) : 0;
+  ud.motor_rpm_L_q = rpm_L_v ? sat_i8(motor_rpm_L / 50.0f) : 0;
+  ud.motor_rpm_R_q = rpm_R_v ? sat_i8(motor_rpm_R / 50.0f) : 0;
+  ud.motor_telem_flags = 0;
+  if (cur_L_v || cur_R_v || rpm_L_v || rpm_R_v) ud.motor_telem_flags |= 0x01;
+  if (cur_L_v || cur_R_v) ud.motor_telem_flags |= 0x02;
+  if (rpm_L_v || rpm_R_v) ud.motor_telem_flags |= 0x04;
 
   // IMU 1-4 angles
   ud.TX1_100 = (int16_t)roundf(imu.TX1 * 100.0f);
@@ -867,13 +973,9 @@ void Transmit_ble_Data() {
   ud.TX3_100 = (int16_t)roundf(imu.TX3 * 100.0f);
   ud.TX4_100 = (int16_t)roundf(imu.TX4 * 100.0f);
 
-  // IMU left/right + 1~4 angular velocities (deg/s), packed at 0.1 deg/s resolution.
+  // IMU left/right angular velocities (deg/s), packed at 0.1 deg/s resolution.
   ud.LTAVx_10 = (int16_t)roundf(imu.LTAVx * 10.0f);
   ud.RTAVx_10 = (int16_t)roundf(imu.RTAVx * 10.0f);
-  ud.VTX1_10  = (int16_t)roundf(imu.VTX1 * 10.0f);
-  ud.VTX2_10  = (int16_t)roundf(imu.VTX2 * 10.0f);
-  ud.VTX3_10  = (int16_t)roundf(imu.VTX3 * 10.0f);
-  ud.VTX4_10  = (int16_t)roundf(imu.VTX4 * 10.0f);
   ud.battL_pct = imu.BattL;
   ud.battR_pct = imu.BattR;
   ud.batt1_pct = imu.Batt1;

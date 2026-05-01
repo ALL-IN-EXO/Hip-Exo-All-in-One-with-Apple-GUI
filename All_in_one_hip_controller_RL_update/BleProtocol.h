@@ -18,35 +18,37 @@
  * [11..12]   R_tau100     int16   右腿实测扭矩×100
  * [13..14]   L_cmd100     int16   左腿命令扭矩×100
  * [15..16]   R_cmd100     int16   右腿命令扭矩×100
- * [17]       imu_init_ok  uint8   IMU 状态
+ * [17]       status0      uint8   打包状态位:
+ *                          bit0=imu_ok, bit1=sd_ok, bit2=tag_ok,
+ *                          bit3..4=brand(0..3), bit5..7=algo(0..7)
  * [18..19]   mt100        int16   max_torque_cfg×100
- * [20]       g_init_status uint8  SD 状态
- * [21..22]   (reserved)
+ * [20]       reserved     uint8   预留
+ * [21]       motor_cur_L_q int8   左电机电流量化 (A*2, 0.5A/LSB)
+ * [22]       motor_cur_R_q int8   右电机电流量化 (A*2, 0.5A/LSB)
  * [23..24]   gf100        int16   步态频率×100
- * [25]       logtag_valid uint8
+ * [25]       reserved     uint8   预留
  * [26]       logtag_char  uint8   首字母
  * [27]       imu_ok_bits  uint8   6路IMU状态位
- * [28]       current_brand uint8  当前电机品牌
+ * [28]       reserved     uint8   预留
  * [29]       temp_L       int8    左电机温度
  * [30]       temp_R       int8    右电机温度
- * [31]       active_algo  uint8   当前算法 ID
+ * [31]       reserved     uint8   预留
  * [32..33]   TX1_100      int16   IMU1 角度×100
  * [34..35]   TX2_100      int16   IMU2 角度×100
  * [36..37]   TX3_100      int16   IMU3 角度×100
  * [38..39]   TX4_100      int16   IMU4 角度×100
  * [40..41]   LTAVx_10     int16   左腿角速度×10 (deg/s)
  * [42..43]   RTAVx_10     int16   右腿角速度×10 (deg/s)
- * [44..45]   VTX1_10      int16   IMU1角速度×10 (deg/s)
- * [46..47]   VTX2_10      int16   IMU2角速度×10 (deg/s)
- * [48..49]   VTX3_10      int16   IMU3角速度×10 (deg/s)
- * [50..51]   VTX4_10      int16   IMU4角速度×10 (deg/s)
+ * [44..51]   reserved     8 bytes 预留
  * [52]       BATT_L_pct   uint8   左腿 IMU 电量(0-100, 255=未知)
  * [53]       BATT_R_pct   uint8   右腿 IMU 电量(0-100, 255=未知)
  * [54]       BATT1_pct    uint8   IMU1 电量(0-100, 255=未知)
  * [55]       BATT2_pct    uint8   IMU2 电量(0-100, 255=未知)
  * [56]       BATT3_pct    uint8   IMU3 电量(0-100, 255=未知)
  * [57]       BATT4_pct    uint8   IMU4 电量(0-100, 255=未知)
- * [58..60]   (reserved for future Teensy data)
+ * [58]       motor_rpm_L_q int8   左电机转速量化 (rpm/50, 50rpm/LSB)
+ * [59]       motor_rpm_R_q int8   右电机转速量化 (rpm/50, 50rpm/LSB)
+ * [60]       motor_telem_flags uint8 bit0=valid bit1=current_valid bit2=rpm_valid
  * --- RPi 透传区 [61..100] ---
  * [61..100]  rpi_passthru  40 bytes, Teensy 不解析，原样透传
  * --- 同步扩展区 [101..127] ---
@@ -184,20 +186,20 @@ struct BleUplinkData {
   int16_t  L_ang100, R_ang100;
   int16_t  L_tau100, R_tau100;
   int16_t  L_cmd100, R_cmd100;
-  uint8_t  imu_init_ok;
+  uint8_t  status0;          // 打包: bit0=imu_ok bit1=sd_ok bit2=tag_ok bit3..4=brand bit5..7=algo
   int16_t  mt100;
-  uint8_t  g_init_status;
+  int8_t   motor_cur_L_q;    // [21] 0.5A/LSB
+  int8_t   motor_cur_R_q;    // [22] 0.5A/LSB
   int16_t  gf100;
-  uint8_t  logtag_valid;
   uint8_t  logtag_char;
   uint8_t  imu_ok_bits;
-  uint8_t  current_brand;
   int8_t   temp_L, temp_R;
-  uint8_t  active_algo;
   int16_t  TX1_100, TX2_100, TX3_100, TX4_100;  // IMU 1-4 angles
   int16_t  LTAVx_10, RTAVx_10;                  // Left/Right IMU angular velocity
-  int16_t  VTX1_10, VTX2_10, VTX3_10, VTX4_10; // IMU 1-4 angular velocity
   uint8_t  battL_pct, battR_pct, batt1_pct, batt2_pct, batt3_pct, batt4_pct;
+  int8_t   motor_rpm_L_q;    // [58] 50rpm/LSB
+  int8_t   motor_rpm_R_q;    // [59] 50rpm/LSB
+  uint8_t  motor_telem_flags; // [60] bit0=valid bit1=current_valid bit2=rpm_valid
 };
 
 static inline void ble_pack_uplink(uint8_t* data_ble, const BleUplinkData& d) {
@@ -211,38 +213,36 @@ static inline void ble_pack_uplink(uint8_t* data_ble, const BleUplinkData& d) {
   ble_put_i16(data_ble, 11, d.R_tau100);
   ble_put_i16(data_ble, 13, d.L_cmd100);
   ble_put_i16(data_ble, 15, d.R_cmd100);
-  // [17] IMU
-  data_ble[17] = d.imu_init_ok;
+  // [17] packed status bits
+  data_ble[17] = d.status0;
   // [18..19] max torque
   ble_put_i16(data_ble, 18, d.mt100);
-  // [20] SD status
-  data_ble[20] = d.g_init_status;
-  // [21..22] reserved
-  data_ble[21] = 0;
-  data_ble[22] = 0;
+  // [20] reserved
+  data_ble[20] = 0;
+  // [21..22] motor current telemetry (quantized)
+  data_ble[21] = (uint8_t)d.motor_cur_L_q;
+  data_ble[22] = (uint8_t)d.motor_cur_R_q;
   // [23..24] gait freq
   ble_put_i16(data_ble, 23, d.gf100);
   // [25..27]
-  data_ble[25] = d.logtag_valid;
+  data_ble[25] = 0;            // reserved
   data_ble[26] = d.logtag_char;
   data_ble[27] = d.imu_ok_bits;
   // [28..31]
-  data_ble[28] = d.current_brand;
+  data_ble[28] = 0;            // reserved
   data_ble[29] = d.temp_L;
   data_ble[30] = d.temp_R;
-  data_ble[31] = d.active_algo;
+  data_ble[31] = 0;            // reserved
   // [32..39] IMU 1-4 angles
   ble_put_i16(data_ble, 32, d.TX1_100);
   ble_put_i16(data_ble, 34, d.TX2_100);
   ble_put_i16(data_ble, 36, d.TX3_100);
   ble_put_i16(data_ble, 38, d.TX4_100);
-  // [40..51] IMU velocities
+  // [40..43] left/right IMU velocities
   ble_put_i16(data_ble, 40, d.LTAVx_10);
   ble_put_i16(data_ble, 42, d.RTAVx_10);
-  ble_put_i16(data_ble, 44, d.VTX1_10);
-  ble_put_i16(data_ble, 46, d.VTX2_10);
-  ble_put_i16(data_ble, 48, d.VTX3_10);
-  ble_put_i16(data_ble, 50, d.VTX4_10);
+  // [44..51] reserved (8 bytes)
+  for (int i = 44; i <= 51; i++) data_ble[i] = 0;
   // [52..57] IMU battery percentage
   data_ble[52] = d.battL_pct;
   data_ble[53] = d.battR_pct;
@@ -250,6 +250,10 @@ static inline void ble_pack_uplink(uint8_t* data_ble, const BleUplinkData& d) {
   data_ble[55] = d.batt2_pct;
   data_ble[56] = d.batt3_pct;
   data_ble[57] = d.batt4_pct;
+  // [58..60] motor rpm telemetry + flags
+  data_ble[58] = (uint8_t)d.motor_rpm_L_q;
+  data_ble[59] = (uint8_t)d.motor_rpm_R_q;
+  data_ble[60] = d.motor_telem_flags;
 }
 
 // 上行 RPi 透传：Teensy 把从 Serial8 收到的数据放到 [61..100]

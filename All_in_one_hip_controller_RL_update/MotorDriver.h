@@ -63,6 +63,9 @@ public:
   virtual float  get_vel_deg_s()    const = 0;   // 输出轴 °/s
   virtual float  get_temp_C()       const { return NAN; }
   virtual uint32_t get_error()      const { return 0; }
+  // --- 驱动原生遥测 (用于 BLE 上行 motor_cur/rpm 量化字段) ---
+  virtual float  get_motor_current_A() const { return NAN; } // 驱动原生电流 (A)
+  virtual float  get_motor_speed_rpm() const { return NAN; } // 驱动原生转速 (rpm)
 
   // --- 品牌标识 ---
   virtual MotorBrand  brand()      const = 0;
@@ -147,6 +150,15 @@ public:
     return isnan(hw_.vel_rev_s) ? 0.0f : hw_.vel_rev_s * 360.0f;
   }
 
+  // SIG (ODrive) 不直接暴露电机相电流 → 上层量化标志会标无效
+  float get_motor_current_A() const override {
+    return NAN;
+  }
+
+  float get_motor_speed_rpm() const override {
+    return isnan(hw_.vel_rev_s) ? NAN : hw_.vel_rev_s * 60.0f;
+  }
+
   uint32_t get_error() const override {
     return hw_.axis_error;
   }
@@ -223,6 +235,15 @@ public:
     // 输出轴 °/s = servo_spd_rpm / pole_pairs / gear_ratio × 6
     // 简化：这里先返回 rpm 原始值，后续标定再调
     return isnan(hw_.servo_spd_rpm) ? 0.0f : hw_.servo_spd_rpm;
+  }
+
+  // TMOTOR 驱动原生暴露 Iq + 电机转速, 直接透传 (BLE 上行做量化)
+  float get_motor_current_A() const override {
+    return isnan(hw_.servo_cur_A) ? NAN : hw_.servo_cur_A;
+  }
+
+  float get_motor_speed_rpm() const override {
+    return isnan(hw_.servo_spd_rpm) ? NAN : hw_.servo_spd_rpm;
   }
 
   float get_temp_C() const override {
